@@ -93,6 +93,12 @@ class SftpTransport:
         }
         key_file = server.get("key_file", "")
         password = resolve_password(server)
+        # 默认关闭 paramiko 的自动密钥探测：不开则它会在密码登录前，
+        # 把 ssh-agent（如 1Password SSH agent）里挂载的每一把私钥都拿去对服务器试登录，
+        # 表现为对服务器的批量登录尝试（易被当作爆破触发 fail2ban），也会弹出一堆 1Password 授权请求。
+        # 只有配置显式开启 use_ssh_agent 时才允许走 agent/known-keys 探测。
+        kwargs["allow_agent"] = bool(server.get("use_ssh_agent", False))
+        kwargs["look_for_keys"] = bool(server.get("use_ssh_agent", False))
         if key_file:
             kwargs["key_filename"] = str(Path(key_file).expanduser())
             if password:
