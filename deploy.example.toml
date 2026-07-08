@@ -14,7 +14,10 @@ port = 22                  # ftp/ftps 默认 21
 username = "deploy"
 
 # 方式二（仅 sftp）：复用 ~/.ssh/config 里已有的 Host 别名，自动补齐上面几项缺失字段
-# （host/port/username 若在本段显式写了，永远以显式值为准，别名只填补缺失项）：
+# （host/port/username 若在本段显式写了，永远以显式值为准，别名只填补缺失项）。
+# 底层直接调用系统 `ssh -G <alias>` 拿最终生效配置（不建连接、官方推荐的预览方式），
+# 与你直接执行 `ssh prod-master` 时的解析结果完全一致，包括 Include/Match/多个
+# 通配符 Host 块合并等语法——不是脚本自己重新实现一遍 ssh_config 解析：
 # ssh_host_alias = "prod-master"       # 对应 ~/.ssh/config 里的 `Host prod-master` 块
 # ssh_config_file = "~/.ssh/config"    # 默认就是这个路径，一般无需改
 # 注意：暂不支持 ProxyJump/ProxyCommand 跳板机，命中会打印警告并尝试直连
@@ -23,7 +26,8 @@ username = "deploy"
 password_env = "TBT_DEPLOY_PASSWORD"
 # password = ""
 # SFTP 可改用密钥登录（设置后 password/password_env 作为 passphrase，可留空；
-# 未设置 key_file 且开启了 ssh_host_alias 时，会自动取该 Host 块的 IdentityFile）
+# 未设置 key_file 且开启了 ssh_host_alias 时，会自动取该 Host 块解析出的全部
+# IdentityFile，按 ssh 同样的顺序逐一尝试）
 # key_file = "~/.ssh/id_ed25519"
 # SFTP 默认不探测 ssh-agent / ~/.ssh 下的密钥，只用上面显式给出的 password 或 key_file，
 # 避免 paramiko 把 agent（含 1Password SSH agent）里挂载的每把私钥都拿去对服务器试登录

@@ -70,12 +70,16 @@ def resolve_password(server: dict) -> str:
 
 
 def resolve_ssh_config(server: dict) -> dict:
-    """按 ssh_host_alias 从 ~/.ssh/config 补齐 host/port/username/key_file。
+    """按 ssh_host_alias 用系统 `ssh -G` 解析真实生效的连接参数。
 
+    直接调用系统自带的 ssh 客户端做配置解析，而不是自己重新实现一遍
+    ~/.ssh/config 语法——`paramiko.SSHConfig` 对 Match、Include、多个通配符
+    Host 块合并等语法支持不完整，容易和真正执行 `ssh <alias>` 时的解析结果
+    对不上。`ssh -G <alias>` 只打印该别名最终生效的配置、不建立任何网络连接，
+    是 OpenSSH 官方文档推荐的“预览解析结果”方式，天然与 `ssh <alias>` 行为一致。
     只在 protocol=sftp 且设置了 ssh_host_alias 时生效；TOML 中已显式写出的字段
-    始终优先，ssh_config 只用来填补缺失项——这样可以只在 TOML 里写一行别名，
-    复用已有的 Host 配置，同时不会让本机 ssh 配置意外覆盖你在 TOML 里的显式选择。
-    暂不支持 ProxyJump/ProxyCommand 跳板机（命中时打印警告并直连，不静默失败）。
+    始终优先，解析结果只用来补齐缺失项。暂不支持 ProxyJump/ProxyCommand 跳板机
+    （命中时打印警告并尝试直连，不静默失败）。
 
     @param server [server] 配置段（原字典不被修改）
     @return 合并后的新字典；未设置 ssh_host_alias 时原样返回
@@ -83,23 +87,40 @@ def resolve_ssh_config(server: dict) -> dict:
     alias = server.get("ssh_host_alias", "")
     if server.get("protocol", "sftp").lower() != "sftp" or not alias:
         return server
-    try:
-        import paramiko
-    except ModuleNotFoundError:
-        die("ssh_host_alias 需要 paramiko：pip install paramiko")
-        raise  # 不可达，仅供类型收窄
 
     config_path = Path(server.get("ssh_config_file", "~/.ssh/config")).expanduser()
     if not config_path.exists():
         die(f"ssh_host_alias 已设置但配置文件不存在: {config_path}")
-    ssh_config = paramiko.SSHConfig()
-    with open(config_path) as fh:
-        ssh_config.parse(fh)
-    resolved = ssh_config.lookup(alias)
 
-    if "proxyjump" in resolved or "proxycommand" in resolved:
-        log(f"警告: ~/.ssh/config 中 Host {alias} 配置了 ProxyJump/ProxyCommand，"
-            f"本脚本暂不支持跳板机，将尝试直连 {resolved.get('hostname', alias)}")
+    try:
+        proc = subprocess.run(
+            ["ssh", "-G", "-F", str(config_path), alias],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        die("ssh_host_alias 需要系统安装 ssh 客户端（PATH 中找不到 ssh 可执行文件）")
+    if proc.returncode != 0:
+        die(f"ssh -G {alias} 解析失败: {proc.stderr.strip() or '未知错误'}")
+
+    # ssh -G 每行一个 "关键字 值"，identityfile 可能出现多行（对应多条 IdentityFile 指令）
+    resolved: dict[str, str] = {}
+    identity_files: list[str] = []
+    proxy_hint = ""
+    for line in proc.stdout.splitlines():
+        key, sep, value = line.strip().partition(" ")
+        if not sep:
+            continue
+        key = key.lower()
+        if key == "identityfile":
+            identity_files.append(value)
+        elif key in ("proxyjump", "proxycommand") and value not in ("", "none"):
+            proxy_hint = f"{key}={value}"
+        elif key not in resolved:
+            resolved[key] = value
+
+    if proxy_hint:
+        log(f"警告: ssh -G {alias} 命中 {proxy_hint}，本脚本暂不支持跳板机，"
+            f"将尝试直连 {resolved.get('hostname', alias)}")
 
     merged = dict(server)
     merged.setdefault("host", resolved.get("hostname", alias))
@@ -107,8 +128,9 @@ def resolve_ssh_config(server: dict) -> dict:
         merged["port"] = int(resolved["port"])
     if "username" not in server and "user" in resolved:
         merged["username"] = resolved["user"]
-    if "key_file" not in server and resolved.get("identityfile"):
-        merged["key_file"] = resolved["identityfile"][0]
+    if "key_file" not in server and identity_files:
+        # 多条 IdentityFile 时保留完整列表，paramiko 会按顺序逐一尝试，与 ssh 行为一致
+        merged["key_file"] = identity_files if len(identity_files) > 1 else identity_files[0]
     return merged
 
 
@@ -143,7 +165,12 @@ class SftpTransport:
         kwargs["allow_agent"] = bool(server.get("use_ssh_agent", False))
         kwargs["look_for_keys"] = bool(server.get("use_ssh_agent", False))
         if key_file:
-            kwargs["key_filename"] = str(Path(key_file).expanduser())
+            # key_file 可能是单个路径（TOML 显式配置），也可能是 ssh_host_alias
+            # 解析出的多条 IdentityFile 列表——两种形式 paramiko 的 key_filename 均支持
+            if isinstance(key_file, list):
+                kwargs["key_filename"] = [str(Path(f).expanduser()) for f in key_file]
+            else:
+                kwargs["key_filename"] = str(Path(key_file).expanduser())
             if password:
                 kwargs["passphrase"] = password
         else:
