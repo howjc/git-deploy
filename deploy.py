@@ -134,6 +134,61 @@ def resolve_ssh_config(server: dict) -> dict:
     return merged
 
 
+def is_public_key_file(path: Path) -> bool:
+    """判断路径是否是 OpenSSH 公钥格式文件（而非私钥文件）。
+
+    某些 ssh_config 场景（如 1Password SSH agent 托管私钥）里 IdentityFile 只指向
+    公钥 .pub 文件，本地并不存在对应私钥；这类文件不能像普通 key_filename 那样被
+    paramiko 直接加载，需要走 load_agent_key_for_pubkey() 的 agent 精确匹配路径。
+
+    @param path 待判断的文件路径
+    @return 文本以已知公钥算法前缀开头则为 True；文件不存在/不可读则 False
+    """
+    if not path.is_file():
+        return False
+    try:
+        head = path.read_text(errors="ignore")[:20].strip()
+    except OSError:
+        return False
+    return head.startswith(("ssh-", "ecdsa-", "sk-ssh-", "sk-ecdsa-"))
+
+
+def load_agent_key_for_pubkey(pub_path: Path):
+    """按公钥指纹在 ssh-agent 里精确匹配对应私钥，而不是把 agent 里所有 key 都拿去试。
+
+    真正的 ssh 客户端遇到 IdentityFile 指向 .pub 文件（本地无私钥，私钥只存在于
+    ssh-agent 或硬件密钥里，例如 1Password SSH agent）时，会读公钥算出指纹，
+    再去 agent 里只挑这唯一一把匹配的私钥来签名——这里手动复刻同样的精确匹配逻辑，
+    避免退化成 allow_agent 那种对 agent 里全部私钥的批量尝试（后者正是本脚本要避免的
+    "遍历所有 SSH 配置对服务器爆破" 行为的根源）。
+
+    @param pub_path 公钥文件路径（OpenSSH 单行格式：type base64data [comment]）
+    @return 匹配到的 paramiko.agent.AgentKey；无匹配、agent 不可达或公钥格式无法解析则返回 None
+    """
+    import base64
+    import hashlib
+
+    import paramiko
+
+    fields = pub_path.read_text().split()
+    if len(fields) < 2:
+        return None
+    try:
+        target_blob = base64.b64decode(fields[1])
+    except (ValueError, TypeError):
+        return None
+    target_fingerprint = hashlib.md5(target_blob).digest()
+
+    agent = paramiko.Agent()
+    try:
+        for agent_key in agent.get_keys():
+            if agent_key.get_fingerprint() == target_fingerprint:
+                return agent_key
+    finally:
+        agent.close()
+    return None
+
+
 class SftpTransport:
     """SFTP 传输通道（paramiko），支持上传与远程命令执行。"""
 
@@ -162,17 +217,45 @@ class SftpTransport:
         # 把 ssh-agent（如 1Password SSH agent）里挂载的每一把私钥都拿去对服务器试登录，
         # 表现为对服务器的批量登录尝试（易被当作爆破触发 fail2ban），也会弹出一堆 1Password 授权请求。
         # 只有配置显式开启 use_ssh_agent 时才允许走 agent/known-keys 探测。
-        kwargs["allow_agent"] = bool(server.get("use_ssh_agent", False))
-        kwargs["look_for_keys"] = bool(server.get("use_ssh_agent", False))
-        if key_file:
-            # key_file 可能是单个路径（TOML 显式配置），也可能是 ssh_host_alias
-            # 解析出的多条 IdentityFile 列表——两种形式 paramiko 的 key_filename 均支持
-            if isinstance(key_file, list):
-                kwargs["key_filename"] = [str(Path(f).expanduser()) for f in key_file]
+        allow_agent = bool(server.get("use_ssh_agent", False))
+        kwargs["allow_agent"] = allow_agent
+        kwargs["look_for_keys"] = allow_agent
+
+        # key_file 可能是单个路径（TOML 显式配置），也可能是 ssh_host_alias 解析出的
+        # 多条 IdentityFile。其中每一条可能是私钥文件，也可能是私钥不落盘、只在
+        # ssh-agent（如 1Password）里的场景下常见的 .pub 公钥文件——两者需要不同处理：
+        # 私钥文件走 paramiko 原生 key_filename 加载；公钥文件必须按指纹去 agent 里
+        # 精确匹配唯一一把私钥（load_agent_key_for_pubkey），而不是依赖 allow_agent
+        # 对整个 agent 做批量尝试，否则等于放弃了别名/身份限定，退化成遍历。
+        # 简化范围：若列表里既有私钥文件、又有需要 agent 匹配的公钥文件，只用命中的
+        # agent key（真实场景下 IdentityFile 极少混用两种类型；真要混用且顺序敏感，
+        # 请在 TOML 里显式只填其中一种，不依赖本脚本的自动排序重试）。
+        agent_matched_key = None
+        key_filenames: list[str] = []
+        for raw in (key_file if isinstance(key_file, list) else [key_file] if key_file else []):
+            path = Path(raw).expanduser()
+            if is_public_key_file(path):
+                if agent_matched_key is None:
+                    agent_matched_key = load_agent_key_for_pubkey(path)
+                    if agent_matched_key is None:
+                        log(f"  警告: 未在 ssh-agent 中找到与 {path} 匹配的私钥，已跳过该身份")
             else:
-                kwargs["key_filename"] = str(Path(key_file).expanduser())
+                key_filenames.append(str(path))
+
+        if agent_matched_key is not None:
+            kwargs["pkey"] = agent_matched_key
+            # 已经按公钥指纹精确匹配到具体身份，不再需要（也不应该）额外做 agent 批量探测
+            kwargs["allow_agent"] = False
+            kwargs["look_for_keys"] = False
+        elif key_filenames:
+            kwargs["key_filename"] = key_filenames if len(key_filenames) > 1 else key_filenames[0]
             if password:
                 kwargs["passphrase"] = password
+        elif key_file:
+            # 有 key_file 但全部是公钥文件且一把都没在 agent 里配上：不静默回落到密码/
+            # 批量探测，直接报错，避免连接用错误身份悄悄发起
+            die(f"key_file 均为公钥文件但未能在 ssh-agent 中匹配到私钥（{key_file}）；"
+                f"请确认对应私钥已加载到 agent（ssh-add -l 可查看）")
         else:
             kwargs["password"] = password
         self._ssh.connect(**kwargs)

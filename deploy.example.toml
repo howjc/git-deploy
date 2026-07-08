@@ -27,7 +27,10 @@ password_env = "TBT_DEPLOY_PASSWORD"
 # password = ""
 # SFTP 可改用密钥登录（设置后 password/password_env 作为 passphrase，可留空；
 # 未设置 key_file 且开启了 ssh_host_alias 时，会自动取该 Host 块解析出的全部
-# IdentityFile，按 ssh 同样的顺序逐一尝试）
+# IdentityFile，按 ssh 同样的顺序逐一尝试）。
+# 若 key_file / IdentityFile 指向的是 .pub 公钥文件（私钥只在 ssh-agent 里，
+# 例如 1Password SSH agent 托管、本地不落私钥的场景），脚本会按公钥指纹去
+# agent 中精确匹配唯一一把私钥来用，不会因此把 agent 里其他私钥也拿去尝试。
 # key_file = "~/.ssh/id_ed25519"
 # SFTP 默认不探测 ssh-agent / ~/.ssh 下的密钥，只用上面显式给出的 password 或 key_file，
 # 避免 paramiko 把 agent（含 1Password SSH agent）里挂载的每把私钥都拿去对服务器试登录
