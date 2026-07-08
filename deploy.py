@@ -180,12 +180,15 @@ def load_agent_key_for_pubkey(pub_path: Path):
     target_fingerprint = hashlib.md5(target_blob).digest()
 
     agent = paramiko.Agent()
-    try:
-        for agent_key in agent.get_keys():
-            if agent_key.get_fingerprint() == target_fingerprint:
-                return agent_key
-    finally:
-        agent.close()
+    for agent_key in agent.get_keys():
+        if agent_key.get_fingerprint() == target_fingerprint:
+            # 命中后不能在这里 close() agent 连接：finally 会在 return 生效前执行，
+            # 而返回的 AgentKey 后续认证握手阶段还要通过这个连接向 agent 请求签名
+            # （AgentKey.agent 就是这同一个 Agent 对象），提前关闭会导致签名时
+            # self._conn 已经是 None（这正是本函数早期版本触发过的真实 bug）。
+            # 连接跟随进程生命周期，deploy.py 是一次性 CLI，进程退出时由系统回收即可。
+            return agent_key
+    agent.close()
     return None
 
 
