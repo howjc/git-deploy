@@ -69,6 +69,49 @@ def resolve_password(server: dict) -> str:
     return server.get("password", "")
 
 
+def resolve_ssh_config(server: dict) -> dict:
+    """按 ssh_host_alias 从 ~/.ssh/config 补齐 host/port/username/key_file。
+
+    只在 protocol=sftp 且设置了 ssh_host_alias 时生效；TOML 中已显式写出的字段
+    始终优先，ssh_config 只用来填补缺失项——这样可以只在 TOML 里写一行别名，
+    复用已有的 Host 配置，同时不会让本机 ssh 配置意外覆盖你在 TOML 里的显式选择。
+    暂不支持 ProxyJump/ProxyCommand 跳板机（命中时打印警告并直连，不静默失败）。
+
+    @param server [server] 配置段（原字典不被修改）
+    @return 合并后的新字典；未设置 ssh_host_alias 时原样返回
+    """
+    alias = server.get("ssh_host_alias", "")
+    if server.get("protocol", "sftp").lower() != "sftp" or not alias:
+        return server
+    try:
+        import paramiko
+    except ModuleNotFoundError:
+        die("ssh_host_alias 需要 paramiko：pip install paramiko")
+        raise  # 不可达，仅供类型收窄
+
+    config_path = Path(server.get("ssh_config_file", "~/.ssh/config")).expanduser()
+    if not config_path.exists():
+        die(f"ssh_host_alias 已设置但配置文件不存在: {config_path}")
+    ssh_config = paramiko.SSHConfig()
+    with open(config_path) as fh:
+        ssh_config.parse(fh)
+    resolved = ssh_config.lookup(alias)
+
+    if "proxyjump" in resolved or "proxycommand" in resolved:
+        log(f"警告: ~/.ssh/config 中 Host {alias} 配置了 ProxyJump/ProxyCommand，"
+            f"本脚本暂不支持跳板机，将尝试直连 {resolved.get('hostname', alias)}")
+
+    merged = dict(server)
+    merged.setdefault("host", resolved.get("hostname", alias))
+    if "port" not in server and "port" in resolved:
+        merged["port"] = int(resolved["port"])
+    if "username" not in server and "user" in resolved:
+        merged["username"] = resolved["user"]
+    if "key_file" not in server and resolved.get("identityfile"):
+        merged["key_file"] = resolved["identityfile"][0]
+    return merged
+
+
 class SftpTransport:
     """SFTP 传输通道（paramiko），支持上传与远程命令执行。"""
 
@@ -382,6 +425,11 @@ def main() -> None:
         config = tomllib.load(fh)
 
     server = config.get("server") or die("配置缺少 [server] 段")
+    server = resolve_ssh_config(server)
+    if "host" not in server:
+        die("配置缺少 host（或设置 ssh_host_alias 从 ~/.ssh/config 解析 HostName）")
+    if "username" not in server:
+        die("配置缺少 username（或在 ~/.ssh/config 对应 Host 块设置 User）")
     projects: dict = config.get("projects") or die("配置缺少 [projects.*] 段")
 
     names = list(projects) if args.targets == ["all"] else args.targets
