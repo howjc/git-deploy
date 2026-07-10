@@ -319,6 +319,34 @@ def test_missing_remote_delete_is_idempotent_without_force(tmp_path: Path) -> No
     assert remote == {"/srv/demo/keep.txt": b"old\n"}
 
 
+def test_remote_target_state_is_idempotent_and_skips_duplicate_writes(tmp_path: Path) -> None:
+    """Accept files already matching TO and omit every redundant mutation."""
+
+    remote = {
+        "/srv/demo/keep.txt": b"new\n",
+        "/srv/demo/added.txt": b"added\n",
+    }
+    transport = FakeTransport(remote)
+    executor = DeploymentExecutor(
+        _project(tmp_path),
+        {},
+        transport_factory=lambda server: transport,
+    )
+    plan, planner = _plan(tmp_path)
+
+    checks = executor.check_plan(plan)
+    manifest = executor.deploy(plan, planner)  # type: ignore[arg-type]
+
+    assert all(check.matches for check in checks)
+    assert manifest.status == "succeeded"
+    assert manifest.snapshots == []
+    assert transport.write_count == 0
+    assert remote == {
+        "/srv/demo/keep.txt": b"new\n",
+        "/srv/demo/added.txt": b"added\n",
+    }
+
+
 def test_partial_failure_automatically_restores_remote_files(tmp_path: Path) -> None:
     """Restore every touched path when a later upload fails."""
 

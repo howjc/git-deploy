@@ -8,7 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from .errors import GitDeployError, PolicyError, RemoteDriftError
@@ -133,10 +133,18 @@ class DeploymentExecutor:
             checks = _checks_for_plan(plan, observations)
             _reject_drift(checks, force, "remote files differ from the source commit")
 
-            manifest = self._prepare_manifest(plan, observations)
+            effective_plan = replace(
+                plan,
+                files=tuple(
+                    operation
+                    for operation in plan.files
+                    if observations[operation.path].sha256 != operation.target_sha256
+                ),
+            )
+            manifest = self._prepare_manifest(effective_plan, observations)
             self.store.write_manifest(manifest)
             mutation_started = True
-            self._apply_plan(transport, plan, targets)
+            self._apply_plan(transport, effective_plan, targets)
             self._run_post_steps(transport)
             self._verify_snapshots(transport, manifest.snapshots, after=True)
             manifest.status = "succeeded"
@@ -322,7 +330,8 @@ class DeploymentExecutor:
             len(observations[operation.path].data or b"") for operation in plan.files
         )
         bytes_completed = 0
-        self._emit("backup", 0, total, bytes_total=bytes_total)
+        if total:
+            self._emit("backup", 0, total, bytes_total=bytes_total)
         for index, operation in enumerate(plan.files):
             observed = observations[operation.path]
             backup_file = None
@@ -396,7 +405,8 @@ class DeploymentExecutor:
         observations: dict[str, RemoteObservation] = {}
         total = len(plan.files)
         bytes_completed = 0
-        self._emit("check", 0, total)
+        if total:
+            self._emit("check", 0, total)
         for index, operation in enumerate(plan.files):
             if operation.path in observations:
                 raise PolicyError(f"deployment plan touches a path more than once: {operation.path}")
@@ -452,7 +462,8 @@ class DeploymentExecutor:
         observations: dict[str, RemoteObservation] = {}
         total = len(snapshots)
         bytes_completed = 0
-        self._emit(phase, 0, total)
+        if total:
+            self._emit(phase, 0, total)
         for index, snapshot in enumerate(snapshots):
 
             def on_chunk(size: int) -> None:
@@ -575,7 +586,8 @@ class DeploymentExecutor:
         )
         bytes_completed = 0
         completed = 0
-        self._emit("rollback", 0, total, bytes_total=bytes_total)
+        if total:
+            self._emit("rollback", 0, total, bytes_total=bytes_total)
         for snapshot in existing:
             if snapshot.before_exists:
                 if not snapshot.backup_file:
@@ -669,7 +681,8 @@ class DeploymentExecutor:
             bytes_total = sum(len(observed.data or b"") for observed in existing)
             bytes_completed = 0
             completed = 0
-            self._emit("recover", 0, total, bytes_total=bytes_total)
+            if total:
+                self._emit("recover", 0, total, bytes_total=bytes_total)
             for observed in existing:
                 assert observed.data is not None
                 file_bytes = 0
@@ -880,13 +893,13 @@ def _checks_for_plan(
     for operation in plan.files:
         actual = observations[operation.path].sha256
         matches_source = operation.expected_before_sha256 == actual
-        delete_already_satisfied = operation.action == "delete" and actual is None
+        target_already_satisfied = operation.target_sha256 == actual
         checks.append(
             RemoteCheck(
                 path=operation.path,
                 expected_sha256=operation.expected_before_sha256,
                 actual_sha256=actual,
-                matches=matches_source or delete_already_satisfied,
+                matches=matches_source or target_already_satisfied,
             )
         )
     return tuple(checks)
@@ -955,7 +968,7 @@ def _check_health_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise GitDeployError(f"health check URL must use HTTP or HTTPS: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": "git-deploy/0.1.3"})
+    request = urllib.request.Request(url, headers={"User-Agent": "git-deploy/0.1.4"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
