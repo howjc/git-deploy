@@ -74,6 +74,7 @@ class DeploymentPlan:
     to_commit: str
     files: tuple[PlannedFile, ...]
     excluded: tuple[GitChange, ...] = ()
+    revision_specs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -105,6 +106,7 @@ class DeploymentManifest:
     status: str
     snapshots: list[FileSnapshot] = field(default_factory=list)
     error: str | None = None
+    revision_specs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the complete manifest as JSON-compatible primitives."""

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from git_deploy.errors import PolicyError
+from git_deploy.errors import ConfigurationError, PolicyError
 from git_deploy.gitrepo import GitDeploymentPlanner
 from git_deploy.models import ProjectConfig
 
@@ -142,3 +142,187 @@ def test_file_created_and_deleted_inside_range_produces_no_operation(tmp_path: P
     )
 
     assert planner.build(older, newer).files == ()
+
+
+def test_single_revision_selects_only_that_commit(tmp_path: Path) -> None:
+    """Treat one revision as its first-parent-to-commit change."""
+
+    repository = _repository(tmp_path)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    base = _commit(repository, "base")
+    (repository / "single.txt").write_text("single\n", encoding="utf-8")
+    selected = _commit(repository, "single")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    plan = planner.build_revisions([selected])
+
+    assert plan.from_commit == base
+    assert plan.to_commit == selected
+    assert plan.revision_specs == (selected,)
+    assert [(operation.action, operation.path) for operation in plan.files] == [
+        ("upload", "single.txt")
+    ]
+
+
+def test_continuous_revision_range_uses_real_target_commit(tmp_path: Path) -> None:
+    """Keep a continuous range equivalent to the former source/target plan."""
+
+    repository = _repository(tmp_path)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    base = _commit(repository, "base")
+    (repository / "one.txt").write_text("one\n", encoding="utf-8")
+    _commit(repository, "one")
+    (repository / "two.txt").write_text("two\n", encoding="utf-8")
+    target = _commit(repository, "two")
+    selector = f"{base}..{target}"
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    plan = planner.build_revisions([selector])
+
+    assert plan.from_commit == base
+    assert plan.to_commit == target
+    assert {operation.path for operation in plan.files} == {"one.txt", "two.txt"}
+
+
+def test_non_contiguous_revisions_exclude_omitted_commit_files(tmp_path: Path) -> None:
+    """Compose selected patches without leaking files from skipped commits."""
+
+    repository = _repository(tmp_path)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    base = _commit(repository, "base")
+    (repository / "one.txt").write_text("one\n", encoding="utf-8")
+    first = _commit(repository, "one")
+    (repository / "skipped.txt").write_text("skipped\n", encoding="utf-8")
+    _commit(repository, "skipped")
+    (repository / "three.txt").write_text("three\n", encoding="utf-8")
+    third = _commit(repository, "three")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+    object_directory = repository / ".git" / "objects"
+    objects_before = {
+        path.relative_to(object_directory)
+        for path in object_directory.rglob("*")
+        if path.is_file()
+    }
+
+    plan = planner.build_revisions([third, first])
+    objects_after = {
+        path.relative_to(object_directory)
+        for path in object_directory.rglob("*")
+        if path.is_file()
+    }
+
+    assert plan.from_commit == base
+    assert plan.to_commit not in {first, third}
+    assert plan.revision_specs == (third, first)
+    assert {operation.path for operation in plan.files} == {"one.txt", "three.txt"}
+    assert objects_after == objects_before
+    three = next(operation for operation in plan.files if operation.path == "three.txt")
+    assert planner.target_bytes(plan, three) == b"three\n"
+
+
+def test_overlapping_revision_selectors_are_deduplicated(tmp_path: Path) -> None:
+    """Apply a commit once when singleton and range selectors overlap."""
+
+    repository = _repository(tmp_path)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    base = _commit(repository, "base")
+    (repository / "one.txt").write_text("one\n", encoding="utf-8")
+    first = _commit(repository, "one")
+    (repository / "two.txt").write_text("two\n", encoding="utf-8")
+    second = _commit(repository, "two")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    plan = planner.build_revisions([f"{base}..{second}", first, second])
+
+    assert plan.from_commit == base
+    assert plan.to_commit == second
+    assert {operation.path for operation in plan.files} == {"one.txt", "two.txt"}
+
+
+def test_non_contiguous_revisions_do_not_leak_omitted_same_file_changes(
+    tmp_path: Path,
+) -> None:
+    """Replay a later hunk without taking an earlier skipped hunk in that file."""
+
+    repository = _repository(tmp_path)
+    original_lines = [f"line-{number}\n" for number in range(1, 11)]
+    (repository / "value.txt").write_text("".join(original_lines), encoding="utf-8")
+    _commit(repository, "base")
+    (repository / "selected-one.txt").write_text("one\n", encoding="utf-8")
+    first = _commit(repository, "first")
+    skipped_lines = list(original_lines)
+    skipped_lines[1] = "skipped-line-2\n"
+    (repository / "value.txt").write_text("".join(skipped_lines), encoding="utf-8")
+    _commit(repository, "skipped")
+    target_lines = list(skipped_lines)
+    target_lines[8] = "selected-line-9\n"
+    (repository / "value.txt").write_text("".join(target_lines), encoding="utf-8")
+    third = _commit(repository, "third")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    plan = planner.build_revisions([first, third])
+
+    value = next(operation for operation in plan.files if operation.path == "value.txt")
+    composed_lines = list(original_lines)
+    composed_lines[8] = "selected-line-9\n"
+    assert planner.target_bytes(plan, value) == "".join(composed_lines).encode()
+
+
+def test_non_contiguous_revision_dependency_conflict_is_rejected(tmp_path: Path) -> None:
+    """Stop locally when a selected patch requires an omitted same-line change."""
+
+    repository = _repository(tmp_path)
+    (repository / "value.txt").write_text("base\n", encoding="utf-8")
+    _commit(repository, "base")
+    (repository / "value.txt").write_text("first\n", encoding="utf-8")
+    first = _commit(repository, "first")
+    (repository / "value.txt").write_text("skipped\n", encoding="utf-8")
+    _commit(repository, "skipped")
+    (repository / "value.txt").write_text("third\n", encoding="utf-8")
+    third = _commit(repository, "third")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    with pytest.raises(ConfigurationError, match="cannot be combined cleanly"):
+        planner.build_revisions([first, third])
+
+
+def test_root_commit_can_be_selected_without_writing_git_objects(tmp_path: Path) -> None:
+    """Use a temporary empty-tree object when the selected commit is the root."""
+
+    repository = _repository(tmp_path)
+    (repository / "root.txt").write_text("root\n", encoding="utf-8")
+    root = _commit(repository, "root")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+    object_directory = repository / ".git" / "objects"
+    objects_before = {
+        path.relative_to(object_directory)
+        for path in object_directory.rglob("*")
+        if path.is_file()
+    }
+
+    plan = planner.build_revisions([root])
+    objects_after = {
+        path.relative_to(object_directory)
+        for path in object_directory.rglob("*")
+        if path.is_file()
+    }
+
+    assert plan.from_commit == planner.repository.empty_tree()
+    assert [(operation.action, operation.path) for operation in plan.files] == [
+        ("upload", "root.txt")
+    ]
+    assert objects_after == objects_before

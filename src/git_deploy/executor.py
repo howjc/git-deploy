@@ -369,6 +369,7 @@ class DeploymentExecutor:
             created_at=datetime.now(UTC).isoformat(),
             status="prepared",
             snapshots=snapshots,
+            revision_specs=list(plan.revision_specs),
         )
 
     def _new_deployment_id(self, target_commit: str) -> str:

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
+import tempfile
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -77,12 +81,151 @@ class GitRepository:
                 f"source commit {older[:12]} is not an ancestor of target {newer[:12]}"
             )
 
-    def changes(self, older: str, newer: str) -> tuple[GitChange, ...]:
+    def first_parent(self, commit: str) -> str | None:
+        """Return a commit's first parent, or ``None`` for a root commit.
+
+        Args:
+            commit: Resolved commit identifier.
+
+        Returns:
+            Resolved first-parent commit identifier when one exists.
+        """
+
+        fields = self._run_text("rev-list", "--parents", "-n", "1", commit).split()
+        if not fields:
+            raise ConfigurationError(f"cannot inspect Git commit {commit[:12]}")
+        return fields[1] if len(fields) > 1 else None
+
+    def first_parent_chain(self, commit: str) -> tuple[str, ...]:
+        """Return one commit's first-parent chain from newest to root.
+
+        Args:
+            commit: Resolved tip commit identifier.
+
+        Returns:
+            Commit identifiers ordered from the supplied tip toward the root.
+        """
+
+        return tuple(self._run_text("rev-list", "--first-parent", commit).splitlines())
+
+    def first_parent_range(self, older: str, newer: str) -> tuple[str, ...]:
+        """Expand ``older..newer`` along the newer commit's first-parent history.
+
+        Args:
+            older: Resolved baseline commit excluded from the result.
+            newer: Resolved target commit included in the result.
+
+        Returns:
+            Selected commits ordered from oldest to newest.
+        """
+
+        chain = self.first_parent_chain(newer)
+        try:
+            older_index = chain.index(older)
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"range source {older[:12]} is not on target {newer[:12]}'s first-parent history"
+            ) from exc
+        return tuple(reversed(chain[:older_index]))
+
+    def empty_tree(self) -> str:
+        """Calculate the repository-format-specific empty tree identifier.
+
+        Returns:
+            Empty tree object identifier for SHA-1 or SHA-256 repositories.
+        """
+
+        return self._run_text_with_input(
+            "hash-object",
+            "-t",
+            "tree",
+            "--stdin",
+            input_data=b"",
+        ).strip()
+
+    @contextmanager
+    def compose_commits(
+        self,
+        base: str,
+        commits: Sequence[str],
+        base_is_empty: bool = False,
+    ) -> Iterator[tuple[str, dict[str, str]]]:
+        """Replay selected first-parent patches into an isolated Git index.
+
+        Args:
+            base: Commit or empty-tree object supplying the initial snapshot.
+            commits: Resolved commits ordered from oldest to newest.
+            base_is_empty: Initialize an empty index and temporary empty-tree object.
+
+        Yields:
+            Target tree identifier and environment able to read its temporary objects.
+        """
+
+        if not commits:
+            raise ConfigurationError("at least one commit must be selected")
+        with tempfile.TemporaryDirectory(prefix="git-deploy-index-") as directory:
+            temporary_root = Path(directory)
+            object_directory = temporary_root / "objects"
+            object_directory.mkdir()
+            main_objects = Path(self._run_text("rev-parse", "--git-path", "objects").strip())
+            if not main_objects.is_absolute():
+                main_objects = (self.path / main_objects).resolve()
+            environment = os.environ.copy()
+            alternates = [str(main_objects)]
+            inherited_alternates = environment.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            if inherited_alternates:
+                alternates.append(inherited_alternates)
+            environment["GIT_INDEX_FILE"] = str(temporary_root / "index")
+            environment["GIT_OBJECT_DIRECTORY"] = str(object_directory)
+            environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(alternates)
+            if base_is_empty:
+                self._run("read-tree", "--empty", env=environment)
+                temporary_base = self._run_text_with_input(
+                    "mktree",
+                    input_data=b"",
+                    env=environment,
+                ).strip()
+                if temporary_base != base:
+                    raise ConfigurationError("Git empty-tree identifier changed unexpectedly")
+            else:
+                self._run("read-tree", base, env=environment)
+            for commit in commits:
+                patch = self._first_parent_patch(commit)
+                if not patch:
+                    continue
+                applied = self._run(
+                    "apply",
+                    "--cached",
+                    "--3way",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    "-",
+                    check=False,
+                    input_data=patch,
+                    env=environment,
+                )
+                if applied.returncode != 0:
+                    detail = applied.stderr.decode("utf-8", errors="replace").strip()
+                    suffix = f": {detail}" if detail else ""
+                    raise ConfigurationError(
+                        "selected revisions cannot be combined cleanly at "
+                        f"{commit[:12]}; include the missing dependency commit{suffix}"
+                    )
+            tree = self._run_text_env("write-tree", env=environment).strip()
+            yield tree, environment
+
+    def changes(
+        self,
+        older: str,
+        newer: str,
+        env: dict[str, str] | None = None,
+    ) -> tuple[GitChange, ...]:
         """Parse a NUL-delimited Git name-status diff.
 
         Args:
             older: Resolved source commit.
             newer: Resolved target commit.
+            env: Optional environment for temporary Git objects.
 
         Returns:
             Ordered normalized changes with rename/copy metadata.
@@ -98,6 +241,7 @@ class GitRepository:
             older,
             newer,
             "--",
+            env=env,
         ).stdout
         return _parse_name_status(output)
 
@@ -131,19 +275,26 @@ class GitRepository:
             if raw
         )
         return (*tracked, *untracked)
-    def blob(self, commit: str, path: str) -> GitBlob | None:
+
+    def blob(
+        self,
+        commit: str,
+        path: str,
+        env: dict[str, str] | None = None,
+    ) -> GitBlob | None:
         """Read a regular file exactly as stored in a commit.
 
         Args:
             commit: Resolved commit ID.
             path: Repository-relative POSIX path.
+            env: Optional environment for temporary Git objects.
 
         Returns:
             Blob metadata, or ``None`` when the path is absent.
         """
 
         _validate_repo_path(path)
-        tree = self._run("ls-tree", "-z", commit, "--", path).stdout
+        tree = self._run("ls-tree", "-z", commit, "--", path, env=env).stdout
         if not tree:
             return None
         header, separator, listed_path = tree.partition(b"\t")
@@ -159,7 +310,7 @@ class GitRepository:
             raise PolicyError(f"Git symlink changes are not supported: {path}")
         if object_type != "blob" or mode not in {"100644", "100755"}:
             raise PolicyError(f"unsupported Git object mode {mode} for {path}")
-        data = self._run("cat-file", "blob", object_id).stdout
+        data = self._run("cat-file", "blob", object_id, env=env).stdout
         return GitBlob(path=path, mode=mode, data=data)
 
     def _run_text(self, *args: str) -> str:
@@ -174,12 +325,79 @@ class GitRepository:
 
         return self._run(*args).stdout.decode("utf-8", errors="replace")
 
-    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    def _run_text_env(self, *args: str, env: dict[str, str]) -> str:
+        """Run Git with an explicit environment and decode UTF-8 output.
+
+        Args:
+            args: Arguments following the ``git`` executable.
+            env: Complete subprocess environment mapping.
+
+        Returns:
+            Decoded standard output.
+        """
+
+        return self._run(*args, env=env).stdout.decode("utf-8", errors="replace")
+
+    def _run_text_with_input(
+        self,
+        *args: str,
+        input_data: bytes,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        """Run Git with standard input and decode UTF-8 output.
+
+        Args:
+            args: Arguments following the ``git`` executable.
+            input_data: Bytes supplied on standard input.
+            env: Optional complete subprocess environment mapping.
+
+        Returns:
+            Decoded standard output.
+        """
+
+        return self._run(*args, input_data=input_data, env=env).stdout.decode(
+            "utf-8", errors="replace"
+        )
+
+    def _first_parent_patch(self, commit: str) -> bytes:
+        """Return one commit's binary patch against its first parent.
+
+        Args:
+            commit: Resolved commit identifier.
+
+        Returns:
+            Binary-safe Git patch bytes.
+        """
+
+        parent = self.first_parent(commit)
+        arguments = [
+            "diff-tree",
+            "--no-commit-id",
+            "-p",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+        ]
+        if parent is None:
+            arguments.extend(("--root", commit, "--"))
+        else:
+            arguments.extend((parent, commit, "--"))
+        return self._run(*arguments).stdout
+
+    def _run(
+        self,
+        *args: str,
+        check: bool = True,
+        input_data: bytes | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
         """Run a Git subprocess without invoking a shell.
 
         Args:
             args: Arguments following the ``git`` executable.
             check: Raise a configuration error for non-zero exit status.
+            input_data: Optional bytes supplied on standard input.
+            env: Optional complete subprocess environment mapping.
 
         Returns:
             Completed binary subprocess result.
@@ -190,6 +408,8 @@ class GitRepository:
                 ["git", "-C", str(self.path), *args],
                 capture_output=True,
                 check=False,
+                input=input_data,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise ConfigurationError("git executable not found") from exc
@@ -266,6 +486,7 @@ class GitDeploymentPlanner:
 
         self.project = project
         self.repository = GitRepository(project.repository)
+        self._composed_target_bytes: dict[tuple[str, str], bytes] = {}
 
     def build(self, from_revision: str, to_revision: str) -> DeploymentPlan:
         """Build a deterministic deployment plan between two revisions.
@@ -281,10 +502,132 @@ class GitDeploymentPlanner:
         older = self.repository.resolve_commit(from_revision)
         newer = self.repository.resolve_commit(to_revision)
         self.repository.require_ancestor(older, newer)
+        return self._build_resolved(older, newer)
+
+    def build_revisions(self, revisions: Sequence[str]) -> DeploymentPlan:
+        """Build a plan from single commits and commit-range selectors.
+
+        A singleton selects its first-parent patch. A range ``A..B`` selects the
+        first-parent commits after ``A`` through ``B``. Multiple selectors are
+        deduplicated and replayed in repository order before the net file plan
+        is calculated.
+
+        Args:
+            revisions: Revision selectors supplied by the CLI.
+
+        Returns:
+            Filtered immutable file operation plan.
+        """
+
+        requested = tuple(revision.strip() for revision in revisions)
+        if not requested or any(not revision for revision in requested):
+            raise ConfigurationError("--revisions requires at least one non-empty selector")
+
+        selected: set[str] = set()
+        for revision in requested:
+            selected.update(self._expand_revision(revision))
+        ordered = self._order_selected_commits(selected)
+        oldest_parent = self.repository.first_parent(ordered[0])
+        base = oldest_parent if oldest_parent is not None else self.repository.empty_tree()
+
+        if oldest_parent is None:
+            complete = tuple(reversed(self.repository.first_parent_chain(ordered[-1])))
+        else:
+            complete = self.repository.first_parent_range(base, ordered[-1])
+        if oldest_parent is not None and ordered == complete:
+            return self._build_resolved(base, ordered[-1], revision_specs=requested)
+        with self.repository.compose_commits(
+            base,
+            ordered,
+            base_is_empty=oldest_parent is None,
+        ) as (target, environment):
+            return self._build_resolved(
+                base,
+                target,
+                revision_specs=requested,
+                git_env=environment,
+            )
+
+    def _expand_revision(self, revision: str) -> tuple[str, ...]:
+        """Resolve one singleton or ``A..B`` selector into commits.
+
+        Args:
+            revision: User-provided revision selector.
+
+        Returns:
+            Resolved commits ordered from oldest to newest.
+        """
+
+        if "..." in revision or revision.count("..") > 1:
+            raise ConfigurationError(
+                f"invalid revision selector {revision!r}; expected COMMIT or FROM..TO"
+            )
+        if ".." not in revision:
+            return (self.repository.resolve_commit(revision),)
+
+        older_revision, newer_revision = revision.split("..", maxsplit=1)
+        if not older_revision or not newer_revision:
+            raise ConfigurationError(
+                f"invalid revision selector {revision!r}; expected COMMIT or FROM..TO"
+            )
+        older = self.repository.resolve_commit(older_revision)
+        newer = self.repository.resolve_commit(newer_revision)
+        commits = self.repository.first_parent_range(older, newer)
+        if not commits:
+            raise ConfigurationError(f"revision range {revision!r} selects no commits")
+        return commits
+
+    def _order_selected_commits(self, selected: set[str]) -> tuple[str, ...]:
+        """Order selected commits on one shared first-parent history.
+
+        Args:
+            selected: Resolved unique commit identifiers.
+
+        Returns:
+            Selected commits ordered from oldest to newest.
+        """
+
+        if not selected:
+            raise ConfigurationError("--revisions selects no commits")
+        iterator = iter(selected)
+        newest = next(iterator)
+        newest_chain = self.repository.first_parent_chain(newest)
+        for commit in iterator:
+            if commit in newest_chain:
+                continue
+            candidate_chain = self.repository.first_parent_chain(commit)
+            if newest not in candidate_chain:
+                raise ConfigurationError(
+                    "selected revisions must belong to one first-parent history; "
+                    f"{newest[:12]} and {commit[:12]} diverge"
+                )
+            newest = commit
+            newest_chain = candidate_chain
+        return tuple(commit for commit in reversed(newest_chain) if commit in selected)
+
+    def _build_resolved(
+        self,
+        older: str,
+        newer: str,
+        revision_specs: tuple[str, ...] = (),
+        git_env: dict[str, str] | None = None,
+    ) -> DeploymentPlan:
+        """Build a plan between already resolved commit or tree objects.
+
+        Args:
+            older: Baseline commit or empty-tree object identifier.
+            newer: Real or synthetic target commit identifier.
+            revision_specs: Original selectors used to construct the target.
+            git_env: Optional environment able to read temporary target objects.
+
+        Returns:
+            Filtered immutable file operation plan.
+        """
+
         operations: list[PlannedFile] = []
         excluded: list[GitChange] = []
 
-        for change in self.repository.changes(older, newer):
+        for change in self.repository.changes(older, newer, env=git_env):
             selected_paths = [change.path]
             if change.old_path:
                 selected_paths.append(change.old_path)
@@ -294,7 +637,7 @@ class GitDeploymentPlanner:
             for path in selected_paths:
                 if self._selected(path):
                     self._assert_not_protected(path)
-            operations.extend(self._operations(change, older, newer))
+            operations.extend(self._operations(change, older, newer, git_env=git_env))
 
         return DeploymentPlan(
             project=self.project.name,
@@ -304,6 +647,7 @@ class GitDeploymentPlanner:
             to_commit=newer,
             files=tuple(operations),
             excluded=tuple(excluded),
+            revision_specs=revision_specs,
         )
 
     def target_bytes(self, plan: DeploymentPlan, operation: PlannedFile) -> bytes:
@@ -319,18 +663,28 @@ class GitDeploymentPlanner:
 
         if operation.source_path is None:
             raise ConfigurationError(f"operation {operation.action} has no source path")
+        cached = self._composed_target_bytes.get((plan.to_commit, operation.source_path))
+        if cached is not None:
+            return cached
         blob = self.repository.blob(plan.to_commit, operation.source_path)
         if blob is None:
             raise ConfigurationError(f"target blob disappeared: {operation.source_path}")
         return blob.data
 
-    def _operations(self, change: GitChange, older: str, newer: str) -> list[PlannedFile]:
+    def _operations(
+        self,
+        change: GitChange,
+        older: str,
+        newer: str,
+        git_env: dict[str, str] | None = None,
+    ) -> list[PlannedFile]:
         """Expand one Git status into upload/delete operations.
 
         Args:
             change: Parsed Git name-status record.
             older: Resolved source commit.
             newer: Resolved target commit.
+            git_env: Optional environment able to read temporary target objects.
 
         Returns:
             One or two remote file operations.
@@ -338,24 +692,31 @@ class GitDeploymentPlanner:
 
         kind = change.status
         if kind in {"A", "M"}:
-            return [self._upload(change.path, change.path, older, newer)]
+            return [self._upload(change.path, change.path, older, newer, git_env)]
         if kind == "D":
             return [self._delete(change.path, older)]
         if kind == "R":
             assert change.old_path is not None
             result: list[PlannedFile] = []
             if self._selected(change.path):
-                result.append(self._upload(change.path, change.path, older, newer))
+                result.append(self._upload(change.path, change.path, older, newer, git_env))
             if self._selected(change.old_path):
                 result.append(self._delete(change.old_path, older))
             return result
         if kind == "C":
             if not self._selected(change.path):
                 return []
-            return [self._upload(change.path, change.path, older, newer)]
+            return [self._upload(change.path, change.path, older, newer, git_env)]
         raise PolicyError(f"unsupported Git change status {kind} for {change.path}")
 
-    def _upload(self, path: str, source_path: str, older: str, newer: str) -> PlannedFile:
+    def _upload(
+        self,
+        path: str,
+        source_path: str,
+        older: str,
+        newer: str,
+        git_env: dict[str, str] | None = None,
+    ) -> PlannedFile:
         """Create an upload operation with source and target hashes.
 
         Args:
@@ -363,14 +724,17 @@ class GitDeploymentPlanner:
             source_path: Target commit path supplying bytes.
             older: Source commit.
             newer: Target commit.
+            git_env: Optional environment able to read temporary target objects.
 
         Returns:
             Planned upload operation.
         """
 
-        target = self.repository.blob(newer, source_path)
+        target = self.repository.blob(newer, source_path, env=git_env)
         if target is None:
             raise ConfigurationError(f"missing target file {source_path}")
+        if git_env is not None:
+            self._composed_target_bytes[(newer, source_path)] = target.data
         before = self.repository.blob(older, path)
         return PlannedFile(
             action="upload",

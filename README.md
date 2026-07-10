@@ -1,8 +1,10 @@
 # git-deploy
 
-Deploy the tracked file delta between two Git commits over SFTP, FTP, or FTPS.
-The tool creates an exact pre-deployment backup and can restore it later by
-deployment ID. Existing `deploy.py` remains the legacy full-upload command.
+Deploy tracked file changes selected from Git commits over SFTP, FTP, or FTPS.
+The tool accepts single commits, continuous ranges, and non-contiguous
+combinations. It creates an exact pre-deployment backup and can restore it
+later by deployment ID. Existing `deploy.py` remains the legacy full-upload
+command.
 
 The new package lives under `src/git_deploy`; neither `deploy.py` nor its
 `deploy.example.toml` configuration is imported or modified by the new CLI.
@@ -78,18 +80,24 @@ public-key fingerprint to one agent key instead of trying every loaded key.
 ## Usage
 
 ```bash
-# Local-only preview; no server connection and no writes.
-git-deploy deploy official --from COMMIT_A --to COMMIT_B --dry-run
+# Deploy one commit. Its first parent is the expected remote baseline.
+git-deploy deploy official --revisions COMMIT --dry-run
+
+# Deploy a continuous range. COMMIT_A is the baseline and is not reapplied.
+git-deploy deploy official --revisions COMMIT_A..COMMIT_B --dry-run
+
+# Combine multiple continuous and non-contiguous selections.
+git-deploy deploy official --revisions COMMIT_1 COMMIT_3 COMMIT_5..COMMIT_8 --dry-run
 
 # Equivalent dedicated preview command.
-git-deploy plan official --from COMMIT_A --to COMMIT_B
+git-deploy plan official --revisions COMMIT_A..COMMIT_B
 
 # Read-only remote drift check; still performs no writes.
-git-deploy deploy official --from COMMIT_A --to COMMIT_B \
+git-deploy deploy official --revisions COMMIT_A..COMMIT_B \
   --dry-run --check-remote
 
 # Apply a deployment.
-git-deploy deploy official --from COMMIT_A --to COMMIT_B --yes
+git-deploy deploy official --revisions COMMIT_A..COMMIT_B --yes
 
 # Show local deployment history and restore the latest successful deployment.
 git-deploy history official
@@ -98,15 +106,28 @@ git-deploy rollback official --latest --dry-run
 git-deploy rollback official --latest --yes
 ```
 
-`all` selects every configured project. Different repositories require one
-range per project:
+`--revisions` uses these rules:
+
+- `COMMIT` selects that commit's change against its first parent.
+- `FROM..TO` selects first-parent commits after `FROM` through `TO`.
+- Multiple selectors are deduplicated and applied in Git history order, not
+  command-line order.
+- All selections must belong to one first-parent history. A merge commit is
+  interpreted against its first parent.
+- The parent of the oldest selected commit is the expected remote baseline.
+- If omitted commits make a selected patch impossible to apply cleanly,
+  planning fails before any remote connection.
+
+`all` still selects every configured project. The same selectors are resolved
+independently in each repository, so symbolic expressions are convenient when
+their histories differ:
 
 ```bash
-git-deploy deploy all \
-  --range official=COMMIT_A..COMMIT_B \
-  --range backend=COMMIT_C..COMMIT_D \
-  --dry-run
+git-deploy deploy all --revisions HEAD~1..HEAD --dry-run
 ```
+
+Run separate commands when projects require different revision selections.
+The former `--from`, `--to`, and `--range` options are intentionally removed.
 
 `--deployment` is the local deployment record ID printed after a successful
 deployment. A unique prefix is accepted. `--latest` selects the newest record
@@ -115,7 +136,11 @@ whose status is still `succeeded`; `rollback all` therefore requires
 
 ## Safety model
 
-- Target bytes are read from the target commit, never from the working tree.
+- Target bytes are read from a real or locally composed Git snapshot, never
+  from the working tree.
+- Non-contiguous selections are replayed in an isolated temporary Git index
+  and object directory; the working tree, current branch, normal Git index,
+  and repository object database are not modified.
 - Uncommitted working-tree changes are ignored and reported before deployment.
 - Modified and deleted remote files must match the source commit by SHA-256.
 - A delete is idempotent when the remote path is already absent; no `--force` is needed.

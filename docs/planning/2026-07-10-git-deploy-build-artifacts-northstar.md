@@ -1,11 +1,11 @@
 # git-deploy 构建产物部署北极星
 
 > 状态：下一迭代，待实施（目标版本 v0.2）。
-> 依据：用户要求把 Composer `vendor/`、前端 `dist/`、Go 二进制等构建产物纳入下一迭代；当前 v0.1 实现核查：`gitrepo.py` 直接通过 `git cat-file` 读取目标提交中的已跟踪文件，不创建临时工作区，也不执行构建。
+> 依据：用户要求把 Composer `vendor/`、前端 `dist/`、Go 二进制等构建产物纳入下一迭代；当前 v0.1.5 实现核查：`gitrepo.py` 直接读取真实提交或临时 Git index 合成快照中的已跟踪文件，不创建临时工作区，也不执行构建。
 
 ## 北极星目标
 
-在不读取当前脏工作区、不改变既有 commit-range 部署和精确回滚语义的前提下，为每个待部署提交创建隔离的 detached Git worktree，在其中执行受配置约束的本地构建，收集 Git 未跟踪的生成产物，并将“源码差量 + 构建产物差量”作为一个可校验、可备份、可回滚的部署事务。
+在不读取当前脏工作区、不改变既有 revision-selection 部署和精确回滚语义的前提下，为每个待部署目标 tree 物化隔离的 detached Git worktree，在其中执行受配置约束的本地构建，收集 Git 未跟踪的生成产物，并将“源码差量 + 构建产物差量”作为一个可校验、可备份、可回滚的部署事务。连续范围的目标 tree 通常来自真实 commit；不连续选择的目标 tree 可能仅存在于本次规划的临时 object directory，不能假设它有可长期解析的 commit ID。
 
 目标完成后，以下场景应成为一等能力：
 
@@ -19,8 +19,8 @@
 
 v0.1 的部署链路是：
 
-1. 解析 `FROM..TO` 并读取 Git name-status diff。
-2. 通过 Git object database 直接读取目标文件 bytes，不 checkout。
+1. 解析一个或多个 `COMMIT` / `FROM..TO` 选择器；不连续选择在临时 Git index 和临时 object directory 中合成目标树。
+2. 通过 Git object database 直接读取目标文件 bytes，不 checkout，也不修改主工作区、分支、暂存区或仓库对象库。
 3. 校验远端文件与 FROM commit 的 SHA-256 基线。
 4. 备份远端原文件。
 5. 上传远端临时文件并 rename，最后处理删除。
@@ -33,16 +33,17 @@ v0.1 的部署链路是：
 - 不能安全执行目标提交自己的 Composer、npm、Go 构建流程。
 - 生成产物不属于 Git blob，无法直接得到 FROM 侧远端漂移校验基线。
 - 当前上传前会把目标文件读入内存；大规模依赖目录不适合继续沿用全量内存模型。
-- 同一 range 的远端文件已全部等于 TO 时，v0.1 仍会生成一个 `snapshots=[]` 的 deployment ID，并继续执行 post commands/health，造成无效历史记录和无必要副作用。
+- 同一 revision selection 的远端文件已全部等于目标快照时，v0.1.5 仍会生成一个 `snapshots=[]` 的 deployment ID，并继续执行 post commands/health，造成无效历史记录和无必要副作用。
 
 ## 核心原则
 
-### 1. 提交是唯一源码输入
+### 1. Git tree 是唯一源码输入
 
-- 构建目录必须来自 `git worktree add --detach <path> <commit>`。
+- 连续选择可通过 `git worktree add --detach <path> <target-commit>` 创建构建目录。
+- 不连续选择必须在隔离 worktree/object directory 中，从推导出的 baseline 重放同一组已选补丁，并校验最终 tree ID 与部署计划的 target tree ID 完全一致。
 - 不复制当前 working tree，不读取其中的未提交文件、ignored 文件或本地 `.env`。
 - 构建产物必须位于该 detached worktree 内，并受路径边界检查。
-- FROM 与 TO 构建使用各自提交内容，禁止用当前分支文件替代。
+- baseline 与 target 构建使用各自 tree 内容，禁止用当前分支文件替代。
 
 ### 2. 构建与远端部署解耦
 
@@ -53,7 +54,7 @@ v0.1 的部署链路是：
 
 ### 3. 产物也必须有基线
 
-- 每次构建生成 artifact manifest，至少记录相对路径、SHA-256、字节数、可执行位、来源提交和 build fingerprint。
+- 每次构建生成 artifact manifest，至少记录相对路径、SHA-256、字节数、可执行位、来源 tree、revision selectors 和 build fingerprint。
 - TO manifest 决定上传后的目标状态。
 - FROM manifest 决定远端预期基线和产物删除集合。
 - 优先复用本地缓存中与 `FROM commit + build fingerprint` 完全匹配的 manifest；缓存缺失时，在独立 worktree 中补建 FROM。
@@ -73,15 +74,15 @@ v0.1 的部署链路是：
 - 普通 `deploy --dry-run` 只解析配置、Git diff 和预期构建步骤。
 - 普通 dry-run 不创建 worktree、不执行包管理器、不连接远端、不写 deployment state。
 - `--dry-run --check-remote` 只检查已有可用基线；不得为了远端检查隐式执行构建。
-- 新增显式本地构建验证入口，例如 `git-deploy build PROJECT --to COMMIT`；它可以创建临时 worktree和产物 manifest，但绝不连接或修改远端。
+- 新增显式本地构建验证入口，例如 `git-deploy build PROJECT --revisions COMMIT`；它可以创建临时 worktree 和产物 manifest，但绝不连接或修改远端。
 - CLI 的最终命名可在原子 TODO 的配置契约任务中固定，但不得改变上述副作用边界。
 
-### 6. 目标状态去重，不按 range 字符串去重
+### 6. 目标状态去重，不按 revision selection 字符串去重
 
 - 是否重复部署必须在远端基线检查后，根据每个源码和 artifact 路径是否已经等于 TO 判断。
-- 同一个 `FROM..TO` 再次执行时，如果全部路径都已处于 TO 状态，返回明确的 `already deployed` 结果。
+- 同一组 revision selectors 再次执行时，如果全部路径都已处于目标状态，返回明确的 `already deployed` 结果。
 - `already deployed` 不创建 deployment ID、不创建 state 目录、不保存空 manifest、不执行 post commands、不执行 health checks。
-- 同一个 range 如果远端被回滚、人工修改或只完成部分文件，不得仅因历史中存在相同 range 而跳过。
+- 同一组 selectors 如果远端被回滚、人工修改或只完成部分文件，不得仅因历史中存在相同选择记录而跳过。
 - 部分路径已等于 TO 时，仅把剩余需要修改或删除的路径纳入 effective plan、before snapshot 和 deployment manifest；已满足路径不重复上传，也不进入回滚快照。
 - `DELETE + 远端已不存在` 与 `UPLOAD + 远端哈希已等于 TO` 都属于目标状态已满足。
 - 远端内容既不等于 FROM、也不等于 TO 时仍是 drift，默认阻断；去重不得弱化漂移保护。
@@ -125,7 +126,7 @@ kind = "tree"
 
 | 组件 | 责任 |
 |------|------|
-| `WorktreeManager` | 创建 detached worktree、处理并发锁、捕获中断并可靠清理、执行 `git worktree prune` 兼容恢复 |
+| `WorktreeManager` | 从真实 commit 或合成 target tree 物化 detached worktree、校验 tree ID、处理并发锁、捕获中断并可靠清理 |
 | `BuildRunner` | 在 worktree 根目录执行 argv 命令、控制 timeout、环境变量白名单、日志脱敏和退出码 |
 | `ArtifactCollector` | 校验 artifact 边界，拒绝 symlink/submodule/特殊文件，生成文件级 manifest |
 | `BuildCache` | 以 commit + build fingerprint 缓存 manifest；缓存只用于优化，不改变正确性 |
@@ -137,7 +138,7 @@ kind = "tree"
 
 build fingerprint 至少覆盖：
 
-- 完整 FROM/TO commit ID。
+- 完整 baseline/target tree ID，以及原始 revision selectors 和解析后的提交序列。
 - 构建命令 argv、工作目录、timeout 配置。
 - artifact source/destination/kind 配置。
 - 允许继承的环境变量名称，不记录敏感值。
@@ -167,7 +168,7 @@ build fingerprint 至少覆盖：
 
 ## 安全要求
 
-- 构建目标提交等同于执行该提交中的代码，实际执行前必须显示项目、提交和命令摘要。
+- 构建目标 tree 等同于执行所选提交组合中的代码，实际执行前必须显示项目、selectors、target tree ID 和命令摘要。
 - 构建进程默认使用最小环境，不继承生产数据库密码、FTP 密码、SSH Agent socket或其他无关敏感变量。
 - 允许的 registry token 仅按变量名透传，任何日志和异常消息都不得输出值。
 - 不把项目 `.env`、用户 home 下凭据或现有 working tree ignored 文件复制进 worktree。
@@ -196,7 +197,7 @@ build fingerprint 至少覆盖：
 | M3 | 本地构建与产物采集 | Composer/npm/Go fixture 至少覆盖两类；生成文件、目录和可执行位进入 artifact manifest |
 | M4 | 产物基线与统一计划 | FROM/TO artifact diff 与 Git diff 合并；新增、修改、删除、冲突、漂移均有测试 |
 | M5 | 流式部署与事务回滚 | 大文件和多文件不全量驻留内存；任一步失败可恢复源码和 artifact 的 before snapshot |
-| M6 | CLI、dry-run 与目标状态去重 | `all`、项目独立 range、普通 dry-run、远端只读检查、本地 build 验证边界稳定；重复 range 全部达到 TO 时返回 `already deployed` 且零 state/hook/health 副作用 |
+| M6 | CLI、dry-run 与目标状态去重 | `all`、多 revision selectors、普通 dry-run、远端只读检查、本地 build 验证边界稳定；重复目标全部达到预期状态时返回 `already deployed` 且零 state/hook/health 副作用 |
 | M7 | official-v2 首个真实配置样例 | `vendor/` 构建映射可在 fixture/临时 FTP transport 中完整演练；真实生产 FTP 联调独立由用户代验 |
 | M8 | 发布门禁 | 单元/集成测试、Ruff、类型检查、uv build、隔离 uv tool install 全部通过，v0.1 无构建项目行为不回归 |
 
@@ -206,7 +207,7 @@ build fingerprint 至少覆盖：
 
 1. 未配置 build/artifacts 的现有项目，其 plan、deploy、verify、rollback 行为与 v0.1 兼容。
 2. 普通 `--dry-run` 不创建 worktree、不执行构建、不连接远端、不写本地 deployment state。
-3. detached worktree 始终对应请求的完整 commit ID；主工作区脏文件无法进入源码或 artifact。
+3. detached worktree 计算出的 tree ID 始终等于计划中的完整 target tree ID；主工作区脏文件无法进入源码或 artifact。
 4. 构建失败、超时和用户中断均发生在远端写入前，并可靠清理临时 worktree。
 5. 构建命令默认不经 shell，环境变量按名称白名单继承，敏感值不进入日志和 manifest。
 6. artifact collector 拒绝绝对路径、父目录穿越、symlink 和特殊文件。
@@ -218,14 +219,14 @@ build fingerprint 至少覆盖：
 12. 部署中途失败时，已修改的源码和 artifact 均恢复；新增文件删除；原有删除文件恢复。
 13. deployment ID 回滚不需要重新构建 FROM/TO，完全依赖部署前保存的快照。
 14. FTP/FTPS 构建产物部署不依赖远程 shell；SFTP `post_commands` 保持可选。
-15. `all` 中各项目使用独立 worktree、构建指纹和提交范围；一个项目失败后不得误用另一项目产物。
+15. `all` 中各项目使用独立 worktree、构建指纹和 revision selection；一个项目失败后不得误用另一项目产物。
 16. official-v2 fixture 使用锁定依赖执行 Composer 构建，验证 `vendor/` 文件新增、修改、删除、漂移和回滚。
 17. 自动测试只使用临时仓库、fixture 和内存/本地 mock transport；生产 FTP 账号和密码不进入自动验证。
 18. 真实 FTP/FTPS 联调作为独立用户代验项，需明确测试目录、最小权限账号、无生产覆盖风险和清理步骤。
-19. 同一 range 部署成功后再次执行，若全部源码和 artifact 路径均等于 TO，CLI 返回 `already deployed`，不创建新的 deployment ID 或任何本地 state 文件。
+19. 同一 revision selection 部署成功后再次执行，若全部源码和 artifact 路径均等于目标状态，CLI 返回 `already deployed`，不创建新的 deployment ID 或任何本地 state 文件。
 20. `already deployed` 不执行远端写入、post commands 或 health checks；测试分别断言文件写入数、命令调用数、健康检查调用数均为 0。
-21. 同一 range 只有部分路径等于 TO 时，仅部署未满足路径，manifest snapshots 只包含实际发生远端变更的路径，回滚后恢复本次执行前的真实状态。
-22. 历史中存在相同 range、但远端当前不等于 TO 时不得误判 no-op；匹配 FROM 时正常部署，既不匹配 FROM 也不匹配 TO 时按 drift 阻断。
+21. 同一 revision selection 只有部分路径等于目标状态时，仅部署未满足路径，manifest snapshots 只包含实际发生远端变更的路径，回滚后恢复本次执行前的真实状态。
+22. 历史中存在相同 revision selection、但远端当前不等于目标状态时不得误判 no-op；匹配基线时正常部署，既不匹配基线也不匹配目标时按 drift 阻断。
 
 ## 真实联调边界
 
@@ -249,5 +250,6 @@ build fingerprint 至少覆盖：
 | 2026-07-10 | 普通 dry-run 继续保持零连接、零构建、零写入 | `--dry-run` 是现有工具的重要安全能力，不能因 build 功能改变语义 |
 | 2026-07-10 | v0.2 改为流式或 spool 上传 | `vendor/`、`dist/` 等目录可能很大，不能继续把所有目标 bytes 同时驻留内存 |
 | 2026-07-10 | 数据库迁移保持人工独立流程 | 文件回滚无法可靠逆转 schema 和业务数据变更 |
-| 2026-07-10 | 重复部署按远端 TO 状态去重，不按 commit range 或历史记录去重 | 相同 range 可能对应已部署、已回滚、部分部署或人工漂移；只有远端完整达到目标状态才是真正 no-op |
+| 2026-07-10 | 重复部署按远端目标状态去重，不按 revision selection 或历史记录去重 | 相同 selectors 可能对应已部署、已回滚、部分部署或人工漂移；只有远端完整达到目标状态才是真正 no-op |
 | 2026-07-10 | no-op 不创建空版本，也不运行 post commands/health | 空 deployment ID 无回滚价值，钩子和健康检查可能产生无必要副作用 |
+| 2026-07-10 | 构建输入以 target tree ID 为准，不假设每个目标都有真实 commit | 不连续 revision selection 会产生合成 tree；构建必须与实际部署源码快照完全一致 |

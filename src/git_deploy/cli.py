@@ -1,4 +1,4 @@
-"""Command-line interface for commit-range deployment and rollback."""
+"""Command-line interface for revision selection, deployment, and rollback."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="git-deploy",
-        description="Deploy exact tracked-file changes between two Git commits.",
+        description="Deploy exact tracked-file changes selected from Git revisions.",
     )
     parser.add_argument("--config", help="deployment TOML path")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan", help="build a local-only deployment preview")
     _add_plan_arguments(plan, include_dry_run=False)
 
-    deploy = subparsers.add_parser("deploy", help="deploy a commit range")
+    deploy = subparsers.add_parser("deploy", help="deploy selected commits and ranges")
     _add_plan_arguments(deploy, include_dry_run=True)
     deploy.add_argument("--yes", action="store_true", help="skip the mutation confirmation")
 
@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_plan_arguments(parser: argparse.ArgumentParser, include_dry_run: bool) -> None:
-    """Add shared commit-range planning arguments.
+    """Add shared revision-selection planning arguments.
 
     Args:
         parser: Subcommand parser receiving the options.
@@ -80,20 +80,17 @@ def _add_plan_arguments(parser: argparse.ArgumentParser, include_dry_run: bool) 
     """
 
     parser.add_argument("targets", nargs="+", help="project names or all")
-    parser.add_argument("--from", dest="from_revision", help="source commit expected remotely")
-    parser.add_argument("--to", dest="to_revision", help="target commit to deploy")
     parser.add_argument(
-        "--range",
-        dest="ranges",
-        action="append",
-        default=[],
-        metavar="PROJECT=FROM..TO",
-        help="project-specific range; repeat when selecting multiple projects",
+        "--revisions",
+        nargs="+",
+        required=True,
+        metavar="COMMIT_OR_FROM..TO",
+        help="single commits or continuous ranges; separate multiple selectors with spaces",
     )
     parser.add_argument(
         "--check-remote",
         action="store_true",
-        help="connect read-only and verify the source-commit baseline",
+        help="connect read-only and verify the inferred Git baseline",
     )
     parser.add_argument("--force", action="store_true", help="allow remote hash drift")
     if include_dry_run:
@@ -162,12 +159,12 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     """
 
     projects = _select_projects(config, args.targets)
-    revisions = _resolve_ranges(projects, args.from_revision, args.to_revision, args.ranges)
     planned: list[ProjectPlan] = []
     for project in projects:
         planner = GitDeploymentPlanner(project)
-        older, newer = revisions[project.name]
-        planned.append(ProjectPlan(project, planner, planner.build(older, newer)))
+        planned.append(
+            ProjectPlan(project, planner, planner.build_revisions(args.revisions))
+        )
 
     print(f"Config: {config.path}")
     for item in planned:
@@ -219,9 +216,12 @@ def _run_history(config: AppConfig, args: argparse.Namespace) -> int:
         manifests = DeploymentStore(project).list_manifests()[: args.limit]
         print(f"[{project.name}] {len(manifests)} deployment record(s)")
         for manifest in manifests:
+            selection = " ".join(manifest.revision_specs) or (
+                f"{manifest.from_commit[:12]}..{manifest.to_commit[:12]}"
+            )
             print(
                 f"  {manifest.deployment_id}  {manifest.status:<18}  "
-                f"{manifest.from_commit[:12]}..{manifest.to_commit[:12]}  "
+                f"{selection}  "
                 f"{len(manifest.snapshots)} file(s)"
             )
     return 0
@@ -344,53 +344,6 @@ def _select_projects(config: AppConfig, targets: Sequence[str]) -> list[ProjectC
     return selected
 
 
-def _resolve_ranges(
-    projects: list[ProjectConfig],
-    from_revision: str | None,
-    to_revision: str | None,
-    values: Sequence[str],
-) -> dict[str, tuple[str, str]]:
-    """Resolve common or per-project commit ranges.
-
-    Args:
-        projects: Selected project configurations.
-        from_revision: Optional common source revision.
-        to_revision: Optional common target revision.
-        values: Repeated ``PROJECT=FROM..TO`` values.
-
-    Returns:
-        Source and target revisions keyed by project name.
-    """
-
-    if bool(from_revision) != bool(to_revision):
-        raise ConfigurationError("--from and --to must be provided together")
-    if values and (from_revision or to_revision):
-        raise ConfigurationError("use either --from/--to or --range, not both")
-    if from_revision and to_revision:
-        if len(projects) != 1:
-            raise ConfigurationError("multiple projects require one --range per project")
-        return {projects[0].name: (from_revision, to_revision)}
-
-    parsed: dict[str, tuple[str, str]] = {}
-    for value in values:
-        name, separator, revision_range = value.partition("=")
-        older, range_separator, newer = revision_range.partition("..")
-        if not separator or not range_separator or not name or not older or not newer:
-            raise ConfigurationError(f"invalid --range {value!r}; expected PROJECT=FROM..TO")
-        if name in parsed:
-            raise ConfigurationError(f"duplicate --range for project {name}")
-        parsed[name] = (older, newer)
-
-    selected_names = {project.name for project in projects}
-    extras = set(parsed) - selected_names
-    missing = selected_names - set(parsed)
-    if extras:
-        raise ConfigurationError(f"--range supplied for unselected project(s): {', '.join(sorted(extras))}")
-    if missing:
-        raise ConfigurationError(f"missing --range for project(s): {', '.join(sorted(missing))}")
-    return parsed
-
-
 def _select_manifest(
     project: ProjectConfig,
     deployment_id: str | None,
@@ -442,7 +395,9 @@ def _print_plan(plan: DeploymentPlan) -> None:
         plan: Plan to render.
     """
 
-    print(f"[{plan.project}] {plan.from_commit[:12]}..{plan.to_commit[:12]}")
+    selection = " ".join(plan.revision_specs) or f"{plan.from_commit}..{plan.to_commit}"
+    print(f"[{plan.project}] revisions: {selection}")
+    print(f"  baseline {plan.from_commit[:12]} -> target {plan.to_commit[:12]}")
     if not plan.files:
         print("  no selected tracked-file changes")
     for operation in plan.files:

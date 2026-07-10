@@ -1,3 +1,3 @@
-"""Git commit-range deployment tool."""
+"""Git revision-selection deployment tool."""
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"

@@ -1,4 +1,4 @@
-"""CLI safety and multi-project range tests."""
+"""CLI safety and multi-project revision-selection tests."""
 
 from __future__ import annotations
 
@@ -58,8 +58,8 @@ def test_deploy_all_dry_run_is_local_only(tmp_path: Path, monkeypatch: pytest.Mo
 
     first = tmp_path / "first"
     second = tmp_path / "second"
-    first_range = _two_commit_repository(first, "one.txt")
-    second_range = _two_commit_repository(second, "two.txt")
+    _two_commit_repository(first, "one.txt")
+    _two_commit_repository(second, "two.txt")
     config = tmp_path / "deploy.toml"
     config.write_text(
         f"""
@@ -84,10 +84,8 @@ remote_root = "/srv/second"
         [
             "deploy",
             "all",
-            "--range",
-            f"first={first_range[0]}..{first_range[1]}",
-            "--range",
-            f"second={second_range[0]}..{second_range[1]}",
+            "--revisions",
+            "HEAD~1..HEAD",
             "--dry-run",
         ]
     )
@@ -96,8 +94,11 @@ remote_root = "/srv/second"
     assert not (tmp_path / "state").exists()
 
 
-def test_multiple_projects_reject_common_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Require explicit project-to-range mapping for an ``all`` deployment."""
+def test_removed_from_and_to_options_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expose the intentional CLI break instead of silently accepting old syntax."""
 
     repository = tmp_path / "repo"
     older, newer = _two_commit_repository(repository, "file.txt")
@@ -107,19 +108,18 @@ def test_multiple_projects_reject_common_range(tmp_path: Path, monkeypatch: pyte
 [server]
 protocol = "sftp"
 
-[projects.first]
+[projects.demo]
 repository = "{repository}"
-remote_root = "/srv/first"
-
-[projects.second]
-repository = "{repository}"
-remote_root = "/srv/second"
+remote_root = "/srv/demo"
 """.strip(),
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
 
-    assert run(["plan", "all", "--from", older, "--to", newer]) == 4
+    with pytest.raises(SystemExit) as error:
+        run(["plan", "demo", "--from", older, "--to", newer])
+
+    assert error.value.code == 2
 
 
 def test_dry_run_warns_when_worktree_deletion_is_still_present_in_target_commit(
@@ -150,10 +150,8 @@ remote_root = "/srv/demo"
         [
             "deploy",
             "demo",
-            "--from",
-            older,
-            "--to",
-            newer,
+            "--revisions",
+            f"{older}..{newer}",
             "--dry-run",
         ]
     )
@@ -163,3 +161,52 @@ remote_root = "/srv/demo"
     assert "UPLOAD file.txt" in output
     assert "uncommitted working-tree change(s) are ignored" in output
     assert "WORKTREE D file.txt (commit plan: UPLOAD)" in output
+
+
+def test_cli_accepts_space_separated_non_contiguous_revisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Pass multiple selectors through argparse into the composite planner."""
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "tests@example.invalid")
+    _git(repository, "config", "user.name", "Tests")
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", "base.txt")
+    _git(repository, "commit", "-m", "base")
+    (repository / "one.txt").write_text("one\n", encoding="utf-8")
+    _git(repository, "add", "one.txt")
+    _git(repository, "commit", "-m", "one")
+    first = _git(repository, "rev-parse", "HEAD")
+    (repository / "skipped.txt").write_text("skipped\n", encoding="utf-8")
+    _git(repository, "add", "skipped.txt")
+    _git(repository, "commit", "-m", "skipped")
+    (repository / "three.txt").write_text("three\n", encoding="utf-8")
+    _git(repository, "add", "three.txt")
+    _git(repository, "commit", "-m", "three")
+    third = _git(repository, "rev-parse", "HEAD")
+    config = tmp_path / "deploy.toml"
+    config.write_text(
+        f"""
+[server]
+protocol = "sftp"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(["plan", "demo", "--revisions", third, first])
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "UPLOAD one.txt" in output
+    assert "UPLOAD three.txt" in output
+    assert "skipped.txt" not in output
