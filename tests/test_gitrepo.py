@@ -125,3 +125,20 @@ def test_symlink_change_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(PolicyError, match="symlink"):
         planner.build(older, newer)
+
+
+def test_file_created_and_deleted_inside_range_produces_no_operation(tmp_path: Path) -> None:
+    """Ignore a transient path absent from both range endpoint commits."""
+
+    repository = _repository(tmp_path)
+    _git(repository, "commit", "--allow-empty", "-m", "base")
+    older = _git(repository, "rev-parse", "HEAD")
+    (repository / "transient.txt").write_text("temporary\n", encoding="utf-8")
+    _commit(repository, "add transient")
+    (repository / "transient.txt").unlink()
+    newer = _commit(repository, "remove transient")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    assert planner.build(older, newer).files == ()

@@ -118,6 +118,7 @@ whose status is still `succeeded`; `rollback all` therefore requires
 - Target bytes are read from the target commit, never from the working tree.
 - Uncommitted working-tree changes are ignored and reported before deployment.
 - Modified and deleted remote files must match the source commit by SHA-256.
+- A delete is idempotent when the remote path is already absent; no `--force` is needed.
 - Added files must be absent remotely unless `--force` is supplied.
 - `.env`, private keys, runtime data, and configured protected paths are blocked.
 - Uploads use temporary names followed by rename; deletes run last.

@@ -294,6 +294,31 @@ def test_remote_drift_blocks_deployment_without_writes(tmp_path: Path) -> None:
     assert not (project.local_state_dir / "deployments").exists()  # type: ignore[operator]
 
 
+def test_missing_remote_delete_is_idempotent_without_force(tmp_path: Path) -> None:
+    """Accept a delete whose target state is already absent on the remote."""
+
+    remote = {
+        "/srv/demo/keep.txt": b"old\n",
+    }
+    transport = FakeTransport(remote)
+    executor = DeploymentExecutor(
+        _project(tmp_path),
+        {},
+        transport_factory=lambda server: transport,
+    )
+    plan, planner = _plan(tmp_path)
+
+    manifest = executor.deploy(plan, planner)  # type: ignore[arg-type]
+
+    assert manifest.status == "succeeded"
+    assert remote == {
+        "/srv/demo/keep.txt": b"new\n",
+        "/srv/demo/added.txt": b"added\n",
+    }
+    executor.rollback(executor.store.load(manifest.deployment_id))
+    assert remote == {"/srv/demo/keep.txt": b"old\n"}
+
+
 def test_partial_failure_automatically_restores_remote_files(tmp_path: Path) -> None:
     """Restore every touched path when a later upload fails."""
 

@@ -876,15 +876,20 @@ def _checks_for_plan(
         Hash check results.
     """
 
-    return tuple(
-        RemoteCheck(
-            path=operation.path,
-            expected_sha256=operation.expected_before_sha256,
-            actual_sha256=observations[operation.path].sha256,
-            matches=operation.expected_before_sha256 == observations[operation.path].sha256,
+    checks: list[RemoteCheck] = []
+    for operation in plan.files:
+        actual = observations[operation.path].sha256
+        matches_source = operation.expected_before_sha256 == actual
+        delete_already_satisfied = operation.action == "delete" and actual is None
+        checks.append(
+            RemoteCheck(
+                path=operation.path,
+                expected_sha256=operation.expected_before_sha256,
+                actual_sha256=actual,
+                matches=matches_source or delete_already_satisfied,
+            )
         )
-        for operation in plan.files
-    )
+    return tuple(checks)
 
 
 def _checks_for_snapshots(
@@ -950,7 +955,7 @@ def _check_health_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise GitDeployError(f"health check URL must use HTTP or HTTPS: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": "git-deploy/0.1.2"})
+    request = urllib.request.Request(url, headers={"User-Agent": "git-deploy/0.1.3"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
