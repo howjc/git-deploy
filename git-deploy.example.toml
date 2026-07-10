@@ -1,0 +1,17 @@
+[server]
+protocol = "sftp"
+ssh_host_alias = "production"
+ssh_config_file = "~/.ssh/config"
+strict_host_key_checking = true
+timeout = 15
+
+[projects.application]
+repository = "."
+remote_root = "/srv/application"
+include = ["src/**", "public/**", "config/**"]
+exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**"]
+protected = [".env", "runtime/**", "storage/cert/**"]
+post_commands = [
+  "cd /srv/application && ./bin/clear-cache",
+]
+health_urls = ["https://example.com/health"]

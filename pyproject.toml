@@ -1,0 +1,21 @@
+[project]
+name = "git-deploy"
+version = "0.1.0"
+description = "Commit-range based deployment and rollback for Git projects"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "paramiko>=5.0.0",
+]
+
+[project.scripts]
+git-deploy = "git_deploy.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
