@@ -1,3 +1,3 @@
 """Git commit-range deployment tool."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

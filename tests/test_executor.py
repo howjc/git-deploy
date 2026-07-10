@@ -10,6 +10,8 @@ import pytest
 from git_deploy.errors import GitDeployError, RemoteDriftError
 from git_deploy.executor import DeploymentExecutor
 from git_deploy.models import DeploymentPlan, PlannedFile, ProjectConfig
+from git_deploy.progress import ProgressEvent
+from git_deploy.transport import ByteProgress
 
 
 def _hash(data: bytes) -> str:
@@ -44,7 +46,11 @@ class FakeTransport:
         self.write_count = 0
         self.closed = False
 
-    def read_file(self, remote_path: str) -> bytes | None:
+    def read_file(
+        self,
+        remote_path: str,
+        progress: ByteProgress | None = None,
+    ) -> bytes | None:
         """Return current test bytes or ``None``.
 
         Args:
@@ -54,7 +60,10 @@ class FakeTransport:
             Stored bytes or ``None``.
         """
 
-        return self.files.get(remote_path)
+        data = self.files.get(remote_path)
+        if data is not None and progress is not None:
+            progress(len(data))
+        return data
 
     def is_executable(self, remote_path: str) -> bool | None:
         """Return the stored executable bit when a file exists.
@@ -68,19 +77,28 @@ class FakeTransport:
 
         return self.modes.get(remote_path, False) if remote_path in self.files else None
 
-    def replace_file(self, remote_path: str, data: bytes, executable: bool = False) -> None:
+    def replace_file(
+        self,
+        remote_path: str,
+        data: bytes,
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
         """Replace bytes or trigger the configured one-shot failure.
 
         Args:
             remote_path: Remote destination.
             data: New bytes.
             executable: New executable state.
+            progress: Optional uploaded-byte callback.
         """
 
         self.write_count += 1
         if self.fail_path == remote_path:
             self.fail_path = None
             raise GitDeployError(f"injected failure for {remote_path}")
+        if progress is not None:
+            progress(len(data))
         self.files[remote_path] = data
         self.modes[remote_path] = executable
 
@@ -222,11 +240,13 @@ def test_deploy_and_rollback_restore_exact_remote_bytes(tmp_path: Path) -> None:
         "/srv/demo/remove.txt": b"remove\n",
     }
     transport = FakeTransport(remote)
+    progress: list[ProgressEvent] = []
     executor = DeploymentExecutor(
         _project(tmp_path),
         {},
         transport_factory=lambda server: transport,
         health_checker=lambda url: None,
+        progress_callback=progress.append,
     )
     plan, planner = _plan(tmp_path)
 
@@ -244,6 +264,15 @@ def test_deploy_and_rollback_restore_exact_remote_bytes(tmp_path: Path) -> None:
         "/srv/demo/remove.txt": b"remove\n",
     }
     assert executor.store.load(manifest.deployment_id).status == "rolled_back"
+    assert any(event.phase == "check" and event.completed == 3 for event in progress)
+    assert any(
+        event.phase == "upload"
+        and event.completed == 2
+        and event.bytes_completed == len(b"new\n") + len(b"added\n")
+        for event in progress
+    )
+    assert any(event.phase == "delete" and event.completed == 1 for event in progress)
+    assert any(event.phase == "rollback" and event.completed == 3 for event in progress)
 
 
 def test_remote_drift_blocks_deployment_without_writes(tmp_path: Path) -> None:

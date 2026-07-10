@@ -121,5 +121,6 @@ whose status is still `succeeded`; `rollback all` therefore requires
 - Added files must be absent remotely unless `--force` is supplied.
 - `.env`, private keys, runtime data, and configured protected paths are blocked.
 - Uploads use temporary names followed by rename; deletes run last.
+- Remote checks, backups, uploads, deletes, verification, and rollback report progress.
 - Rollback restores the exact remote bytes captured before deployment.
 - Rollback is code/file rollback only and does not reverse database migrations.

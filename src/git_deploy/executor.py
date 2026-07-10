@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from .errors import GitDeployError, PolicyError, RemoteDriftError
 from .gitrepo import GitDeploymentPlanner
 from .models import DeploymentManifest, DeploymentPlan, FileSnapshot, ProjectConfig
+from .progress import ProgressEvent
 from .state import DeploymentStore
 from .transport import RemoteTransport, open_transport
 
@@ -46,6 +47,7 @@ class RemoteCheck:
 
 TransportFactory = Callable[[dict[str, object]], RemoteTransport]
 HealthChecker = Callable[[str], None]
+ProgressCallback = Callable[[ProgressEvent], None]
 
 
 class DeploymentExecutor:
@@ -57,6 +59,7 @@ class DeploymentExecutor:
         server: dict[str, object],
         transport_factory: TransportFactory = open_transport,
         health_checker: HealthChecker | None = None,
+        progress_callback: ProgressCallback | None = None,
     ):
         """Bind project policy, server settings, and injectable side effects.
 
@@ -65,6 +68,7 @@ class DeploymentExecutor:
             server: Raw ``[server]`` values.
             transport_factory: Function opening a connected remote transport.
             health_checker: Optional URL checker used by tests or integrations.
+            progress_callback: Optional receiver for structured progress events.
         """
 
         self.project = project
@@ -72,6 +76,7 @@ class DeploymentExecutor:
         self.store = DeploymentStore(project)
         self._transport_factory = transport_factory
         self._health_checker = health_checker or _check_health_url
+        self._progress_callback = progress_callback
 
     def check_plan(self, plan: DeploymentPlan, force: bool = False) -> tuple[RemoteCheck, ...]:
         """Read remotely and verify a plan's source-commit baseline.
@@ -84,7 +89,7 @@ class DeploymentExecutor:
             One check result per planned path.
         """
 
-        transport = self._transport_factory(self.server)
+        transport = self._open_transport()
         try:
             observations = self._observe_plan(transport, plan)
             checks = _checks_for_plan(plan, observations)
@@ -119,7 +124,7 @@ class DeploymentExecutor:
             if operation.action == "upload" and _sha256(targets[operation.path]) != operation.target_sha256:
                 raise GitDeployError(f"target Git blob hash changed unexpectedly: {operation.path}")
 
-        transport = self._transport_factory(self.server)
+        transport = self._open_transport()
         mutation_started = False
         manifest: DeploymentManifest | None = None
         try:
@@ -161,7 +166,7 @@ class DeploymentExecutor:
         """
 
         after = manifest.status not in {"rolled_back", "auto_rolled_back"}
-        transport = self._transport_factory(self.server)
+        transport = self._open_transport()
         try:
             return self._verify_snapshots(transport, manifest.snapshots, after=after)
         finally:
@@ -183,9 +188,14 @@ class DeploymentExecutor:
         """
 
         self._require_rollback_status(manifest)
-        transport = self._transport_factory(self.server)
+        transport = self._open_transport()
         try:
-            checks = self._snapshot_checks(transport, manifest.snapshots, after=True)
+            checks = self._snapshot_checks(
+                transport,
+                manifest.snapshots,
+                after=True,
+                phase="check",
+            )
             _reject_drift(checks, force, "remote files changed after this deployment")
             return checks
         finally:
@@ -207,12 +217,12 @@ class DeploymentExecutor:
         """
 
         self._require_rollback_status(manifest)
-        transport = self._transport_factory(self.server)
+        transport = self._open_transport()
         current: dict[str, RemoteObservation] = {}
         mutation_started = False
         try:
             self._require_command_support(transport)
-            current = self._observe_snapshots(transport, manifest.snapshots)
+            current = self._observe_snapshots(transport, manifest.snapshots, phase="check")
             checks = _checks_for_snapshots(manifest.snapshots, current, after=True)
             _reject_drift(checks, force, "remote files changed after this deployment")
 
@@ -245,6 +255,51 @@ class DeploymentExecutor:
         finally:
             _close_transport(transport)
 
+    def _open_transport(self) -> RemoteTransport:
+        """Open a remote transport while reporting connection progress.
+
+        Returns:
+            Connected transport instance.
+        """
+
+        self._emit("connect", 0, 1)
+        transport = self._transport_factory(self.server)
+        self._emit("connect", 1, 1)
+        return transport
+
+    def _emit(
+        self,
+        phase: str,
+        completed: int,
+        total: int,
+        path: str = "",
+        bytes_completed: int = 0,
+        bytes_total: int = 0,
+    ) -> None:
+        """Send one progress event when a callback is configured.
+
+        Args:
+            phase: Stable operation phase identifier.
+            completed: Completed file or step count.
+            total: Total file or step count.
+            path: Current repository-relative path or command target.
+            bytes_completed: Bytes transferred in this phase.
+            bytes_total: Known total bytes for this phase, or zero when unknown.
+        """
+
+        if self._progress_callback is None:
+            return
+        self._progress_callback(
+            ProgressEvent(
+                phase=phase,
+                completed=completed,
+                total=total,
+                path=path,
+                bytes_completed=bytes_completed,
+                bytes_total=bytes_total,
+            )
+        )
+
     def _prepare_manifest(
         self,
         plan: DeploymentPlan,
@@ -262,11 +317,18 @@ class DeploymentExecutor:
 
         deployment_id = self._new_deployment_id(plan.to_commit)
         snapshots: list[FileSnapshot] = []
+        total = len(plan.files)
+        bytes_total = sum(
+            len(observations[operation.path].data or b"") for operation in plan.files
+        )
+        bytes_completed = 0
+        self._emit("backup", 0, total, bytes_total=bytes_total)
         for index, operation in enumerate(plan.files):
             observed = observations[operation.path]
             backup_file = None
             if observed.data is not None:
                 backup_file = self.store.write_backup(deployment_id, index, observed.data)
+                bytes_completed += len(observed.data)
             snapshots.append(
                 FileSnapshot(
                     path=operation.path,
@@ -279,6 +341,14 @@ class DeploymentExecutor:
                     before_executable=observed.executable,
                     after_executable=operation.executable if operation.action == "upload" else None,
                 )
+            )
+            self._emit(
+                "backup",
+                index + 1,
+                total,
+                operation.path,
+                bytes_completed,
+                bytes_total,
             )
         return DeploymentManifest(
             deployment_id=deployment_id,
@@ -324,10 +394,32 @@ class DeploymentExecutor:
         """
 
         observations: dict[str, RemoteObservation] = {}
-        for operation in plan.files:
+        total = len(plan.files)
+        bytes_completed = 0
+        self._emit("check", 0, total)
+        for index, operation in enumerate(plan.files):
             if operation.path in observations:
                 raise PolicyError(f"deployment plan touches a path more than once: {operation.path}")
-            data = transport.read_file(operation.remote_path)
+
+            def on_chunk(size: int) -> None:
+                """Report one downloaded baseline chunk.
+
+                Args:
+                    size: Downloaded byte count.
+                """
+
+                nonlocal bytes_completed
+                bytes_completed += size
+                self._emit(
+                    "check",
+                    index,
+                    total,
+                    operation.path,
+                    bytes_completed,
+                )
+
+            self._emit("check", index, total, operation.path, bytes_completed)
+            data = transport.read_file(operation.remote_path, progress=on_chunk)
             executable = transport.is_executable(operation.remote_path) if data is not None else None
             if executable is None and data is not None:
                 executable = operation.expected_before_executable
@@ -337,26 +429,51 @@ class DeploymentExecutor:
                 data=data,
                 executable=executable,
             )
+            self._emit("check", index + 1, total, operation.path, bytes_completed)
         return observations
 
     def _observe_snapshots(
         self,
         transport: RemoteTransport,
         snapshots: list[FileSnapshot],
+        phase: str = "verify",
     ) -> dict[str, RemoteObservation]:
         """Capture each path represented by stored snapshots.
 
         Args:
             transport: Connected remote transport.
             snapshots: Manifest snapshots to inspect.
+            phase: Progress phase identifier.
 
         Returns:
             Observations keyed by repository path.
         """
 
         observations: dict[str, RemoteObservation] = {}
-        for snapshot in snapshots:
-            data = transport.read_file(snapshot.remote_path)
+        total = len(snapshots)
+        bytes_completed = 0
+        self._emit(phase, 0, total)
+        for index, snapshot in enumerate(snapshots):
+
+            def on_chunk(size: int) -> None:
+                """Report one downloaded verification chunk.
+
+                Args:
+                    size: Downloaded byte count.
+                """
+
+                nonlocal bytes_completed
+                bytes_completed += size
+                self._emit(
+                    phase,
+                    index,
+                    total,
+                    snapshot.path,
+                    bytes_completed,
+                )
+
+            self._emit(phase, index, total, snapshot.path, bytes_completed)
+            data = transport.read_file(snapshot.remote_path, progress=on_chunk)
             executable = transport.is_executable(snapshot.remote_path) if data is not None else None
             observations[snapshot.path] = RemoteObservation(
                 path=snapshot.path,
@@ -364,6 +481,7 @@ class DeploymentExecutor:
                 data=data,
                 executable=executable,
             )
+            self._emit(phase, index + 1, total, snapshot.path, bytes_completed)
         return observations
 
     def _apply_plan(
@@ -380,12 +498,64 @@ class DeploymentExecutor:
             targets: Exact target-commit bytes keyed by path.
         """
 
-        for operation in plan.files:
-            if operation.action == "upload":
-                transport.replace_file(operation.remote_path, targets[operation.path], operation.executable)
-        for operation in plan.files:
-            if operation.action == "delete":
-                transport.delete_file(operation.remote_path)
+        uploads = [operation for operation in plan.files if operation.action == "upload"]
+        deletes = [operation for operation in plan.files if operation.action == "delete"]
+        bytes_total = sum(len(targets[operation.path]) for operation in uploads)
+        bytes_completed = 0
+        if uploads:
+            self._emit("upload", 0, len(uploads), bytes_total=bytes_total)
+        for index, operation in enumerate(uploads):
+            data = targets[operation.path]
+            file_bytes = 0
+
+            def on_chunk(size: int) -> None:
+                """Report one uploaded target chunk.
+
+                Args:
+                    size: Uploaded byte count.
+                """
+
+                nonlocal file_bytes
+                file_bytes += size
+                self._emit(
+                    "upload",
+                    index,
+                    len(uploads),
+                    operation.path,
+                    bytes_completed + file_bytes,
+                    bytes_total,
+                )
+
+            self._emit(
+                "upload",
+                index,
+                len(uploads),
+                operation.path,
+                bytes_completed,
+                bytes_total,
+            )
+            transport.replace_file(
+                operation.remote_path,
+                data,
+                operation.executable,
+                progress=on_chunk,
+            )
+            bytes_completed += len(data)
+            self._emit(
+                "upload",
+                index + 1,
+                len(uploads),
+                operation.path,
+                bytes_completed,
+                bytes_total,
+            )
+
+        if deletes:
+            self._emit("delete", 0, len(deletes))
+        for index, operation in enumerate(deletes):
+            self._emit("delete", index, len(deletes), operation.path)
+            transport.delete_file(operation.remote_path)
+            self._emit("delete", index + 1, len(deletes), operation.path)
 
     def _restore_before(self, transport: RemoteTransport, manifest: DeploymentManifest) -> None:
         """Restore pre-deployment files, deleting paths that were originally absent.
@@ -395,17 +565,87 @@ class DeploymentExecutor:
             manifest: Deployment whose backups are restored.
         """
 
-        for snapshot in manifest.snapshots:
+        existing = [snapshot for snapshot in manifest.snapshots if snapshot.before_exists]
+        absent = [snapshot for snapshot in manifest.snapshots if not snapshot.before_exists]
+        total = len(manifest.snapshots)
+        bytes_total = sum(
+            len(self.store.read_backup(manifest.deployment_id, snapshot.backup_file))
+            for snapshot in existing
+            if snapshot.backup_file
+        )
+        bytes_completed = 0
+        completed = 0
+        self._emit("rollback", 0, total, bytes_total=bytes_total)
+        for snapshot in existing:
             if snapshot.before_exists:
                 if not snapshot.backup_file:
                     raise GitDeployError(f"manifest has no backup for {snapshot.path}")
                 data = self.store.read_backup(manifest.deployment_id, snapshot.backup_file)
                 if _sha256(data) != snapshot.before_sha256:
                     raise GitDeployError(f"local backup hash mismatch for {snapshot.path}")
-                transport.replace_file(snapshot.remote_path, data, bool(snapshot.before_executable))
-        for snapshot in manifest.snapshots:
-            if not snapshot.before_exists:
-                transport.delete_file(snapshot.remote_path)
+                file_bytes = 0
+
+                def on_chunk(size: int) -> None:
+                    """Report one rollback upload chunk.
+
+                    Args:
+                        size: Uploaded byte count.
+                    """
+
+                    nonlocal file_bytes
+                    file_bytes += size
+                    self._emit(
+                        "rollback",
+                        completed,
+                        total,
+                        snapshot.path,
+                        bytes_completed + file_bytes,
+                        bytes_total,
+                    )
+
+                self._emit(
+                    "rollback",
+                    completed,
+                    total,
+                    snapshot.path,
+                    bytes_completed,
+                    bytes_total,
+                )
+                transport.replace_file(
+                    snapshot.remote_path,
+                    data,
+                    bool(snapshot.before_executable),
+                    progress=on_chunk,
+                )
+                bytes_completed += len(data)
+                completed += 1
+                self._emit(
+                    "rollback",
+                    completed,
+                    total,
+                    snapshot.path,
+                    bytes_completed,
+                    bytes_total,
+                )
+        for snapshot in absent:
+            self._emit(
+                "rollback",
+                completed,
+                total,
+                snapshot.path,
+                bytes_completed,
+                bytes_total,
+            )
+            transport.delete_file(snapshot.remote_path)
+            completed += 1
+            self._emit(
+                "rollback",
+                completed,
+                total,
+                snapshot.path,
+                bytes_completed,
+                bytes_total,
+            )
 
     def _restore_observations(
         self,
@@ -423,16 +663,78 @@ class DeploymentExecutor:
         """
 
         try:
-            for observed in observations.values():
-                if observed.data is not None:
-                    transport.replace_file(
-                        observed.remote_path,
-                        observed.data,
-                        bool(observed.executable),
+            existing = [observed for observed in observations.values() if observed.data is not None]
+            absent = [observed for observed in observations.values() if observed.data is None]
+            total = len(observations)
+            bytes_total = sum(len(observed.data or b"") for observed in existing)
+            bytes_completed = 0
+            completed = 0
+            self._emit("recover", 0, total, bytes_total=bytes_total)
+            for observed in existing:
+                assert observed.data is not None
+                file_bytes = 0
+
+                def on_chunk(size: int) -> None:
+                    """Report one forward-recovery upload chunk.
+
+                    Args:
+                        size: Uploaded byte count.
+                    """
+
+                    nonlocal file_bytes
+                    file_bytes += size
+                    self._emit(
+                        "recover",
+                        completed,
+                        total,
+                        observed.path,
+                        bytes_completed + file_bytes,
+                        bytes_total,
                     )
-            for observed in observations.values():
-                if observed.data is None:
-                    transport.delete_file(observed.remote_path)
+
+                self._emit(
+                    "recover",
+                    completed,
+                    total,
+                    observed.path,
+                    bytes_completed,
+                    bytes_total,
+                )
+                transport.replace_file(
+                    observed.remote_path,
+                    observed.data,
+                    bool(observed.executable),
+                    progress=on_chunk,
+                )
+                bytes_completed += len(observed.data)
+                completed += 1
+                self._emit(
+                    "recover",
+                    completed,
+                    total,
+                    observed.path,
+                    bytes_completed,
+                    bytes_total,
+                )
+            for observed in absent:
+                self._emit(
+                    "recover",
+                    completed,
+                    total,
+                    observed.path,
+                    bytes_completed,
+                    bytes_total,
+                )
+                transport.delete_file(observed.remote_path)
+                completed += 1
+                self._emit(
+                    "recover",
+                    completed,
+                    total,
+                    observed.path,
+                    bytes_completed,
+                    bytes_total,
+                )
             return None
         except Exception as exc:  # Recovery must retain the original failure as primary context.
             return exc
@@ -493,6 +795,7 @@ class DeploymentExecutor:
         transport: RemoteTransport,
         snapshots: list[FileSnapshot],
         after: bool,
+        phase: str = "verify",
     ) -> tuple[RemoteCheck, ...]:
         """Build hash checks for one side of stored snapshots.
 
@@ -500,12 +803,13 @@ class DeploymentExecutor:
             transport: Connected remote transport.
             snapshots: Manifest snapshots to inspect.
             after: Select after-state hashes when true.
+            phase: Progress phase identifier.
 
         Returns:
             Check results without enforcing them.
         """
 
-        observations = self._observe_snapshots(transport, snapshots)
+        observations = self._observe_snapshots(transport, snapshots, phase=phase)
         return _checks_for_snapshots(snapshots, observations, after)
 
     def _require_command_support(self, transport: RemoteTransport) -> None:
@@ -525,13 +829,23 @@ class DeploymentExecutor:
             transport: Connected remote transport.
         """
 
-        for command in self.project.post_commands:
+        command_total = len(self.project.post_commands)
+        if command_total:
+            self._emit("hooks", 0, command_total)
+        for index, command in enumerate(self.project.post_commands):
+            self._emit("hooks", index, command_total, command)
             code, stdout, stderr = transport.execute(command)
             if code != 0:
                 detail = stderr.strip() or stdout.strip() or f"exit code {code}"
                 raise GitDeployError(f"post command failed: {command}: {detail}")
-        for url in self.project.health_urls:
+            self._emit("hooks", index + 1, command_total, command)
+        health_total = len(self.project.health_urls)
+        if health_total:
+            self._emit("health", 0, health_total)
+        for index, url in enumerate(self.project.health_urls):
+            self._emit("health", index, health_total, url)
             self._health_checker(url)
+            self._emit("health", index + 1, health_total, url)
 
     @staticmethod
     def _require_rollback_status(manifest: DeploymentManifest) -> None:
@@ -636,7 +950,7 @@ def _check_health_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise GitDeployError(f"health check URL must use HTTP or HTTPS: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": "git-deploy/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "git-deploy/0.1.2"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status

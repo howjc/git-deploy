@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from . import __version__
@@ -13,6 +14,7 @@ from .errors import ConfigurationError, GitDeployError, PolicyError
 from .executor import DeploymentExecutor, RemoteCheck
 from .gitrepo import GitDeploymentPlanner
 from .models import AppConfig, DeploymentManifest, DeploymentPlan, ProjectConfig
+from .progress import TerminalProgress
 from .state import DeploymentStore
 
 
@@ -181,11 +183,8 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
             for item in planned:
                 if not item.plan.files:
                     continue
-                executor = DeploymentExecutor(
-                    item.project,
-                    dict(config.server.values),
-                )
-                checks = executor.check_plan(item.plan, force=args.force)
+                with _progress_executor(config, item.project) as executor:
+                    checks = executor.check_plan(item.plan, force=args.force)
                 _print_checks(item.project.name, checks)
         else:
             print("Remote: not connected (local-only dry run)")
@@ -197,8 +196,8 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         return 0
     _confirm(args.yes, f"Deploy {len(actionable)} project(s)?")
     for item in actionable:
-        executor = DeploymentExecutor(item.project, dict(config.server.values))
-        manifest = executor.deploy(item.plan, item.planner, force=args.force)
+        with _progress_executor(config, item.project) as executor:
+            manifest = executor.deploy(item.plan, item.planner, force=args.force)
         print(f"[{item.project.name}] deployed: {manifest.deployment_id}")
     return 0
 
@@ -242,8 +241,8 @@ def _run_verify(config: AppConfig, args: argparse.Namespace) -> int:
     projects = _select_projects(config, [args.target])
     for project in projects:
         manifest = _select_manifest(project, args.deployment, args.latest, len(projects) > 1)
-        executor = DeploymentExecutor(project, dict(config.server.values))
-        checks = executor.verify(manifest)
+        with _progress_executor(config, project) as executor:
+            checks = executor.verify(manifest)
         _print_checks(project.name, checks)
     return 0
 
@@ -275,8 +274,8 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
     if args.dry_run:
         if args.check_remote:
             for project, manifest in selected:
-                executor = DeploymentExecutor(project, dict(config.server.values))
-                checks = executor.check_rollback(manifest, force=args.force)
+                with _progress_executor(config, project) as executor:
+                    checks = executor.check_rollback(manifest, force=args.force)
                 _print_checks(project.name, checks)
         else:
             print("Remote: not connected (local-only dry run)")
@@ -284,10 +283,36 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
 
     _confirm(args.yes, f"Rollback {len(selected)} project(s)?")
     for project, manifest in selected:
-        executor = DeploymentExecutor(project, dict(config.server.values))
-        result = executor.rollback(manifest, force=args.force)
+        with _progress_executor(config, project) as executor:
+            result = executor.rollback(manifest, force=args.force)
         print(f"[{project.name}] rolled back: {result.deployment_id}")
     return 0
+
+
+@contextmanager
+def _progress_executor(
+    config: AppConfig,
+    project: ProjectConfig,
+) -> Iterator[DeploymentExecutor]:
+    """Create an executor whose progress line is always finalized.
+
+    Args:
+        config: Loaded server configuration.
+        project: Project being checked, deployed, verified, or rolled back.
+
+    Yields:
+        Progress-enabled deployment executor.
+    """
+
+    renderer = TerminalProgress(project.name)
+    try:
+        yield DeploymentExecutor(
+            project,
+            dict(config.server.values),
+            progress_callback=renderer.update,
+        )
+    finally:
+        renderer.finish()
 
 
 def _select_projects(config: AppConfig, targets: Sequence[str]) -> list[ProjectConfig]:

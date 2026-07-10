@@ -9,10 +9,15 @@ import io
 import os
 import posixpath
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
 from .errors import ConfigurationError, GitDeployError
+
+
+ByteProgress = Callable[[int], None]
+TRANSFER_BLOCK_SIZE = 256 * 1024
 
 
 class RemoteTransport(Protocol):
@@ -20,13 +25,23 @@ class RemoteTransport(Protocol):
 
     supports_commands: bool
 
-    def read_file(self, remote_path: str) -> bytes | None:
+    def read_file(
+        self,
+        remote_path: str,
+        progress: ByteProgress | None = None,
+    ) -> bytes | None:
         """Return remote bytes or ``None`` when the file does not exist."""
 
     def is_executable(self, remote_path: str) -> bool | None:
         """Return executable state when the protocol can inspect file modes."""
 
-    def replace_file(self, remote_path: str, data: bytes, executable: bool = False) -> None:
+    def replace_file(
+        self,
+        remote_path: str,
+        data: bytes,
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
         """Upload bytes through a temporary name and replace the destination."""
 
     def delete_file(self, remote_path: str) -> None:
@@ -207,19 +222,29 @@ class SftpTransport:
             raise GitDeployError(f"SFTP connection failed for {username}@{host}: {exc}") from exc
         self._directories: set[str] = set()
 
-    def read_file(self, remote_path: str) -> bytes | None:
+    def read_file(
+        self,
+        remote_path: str,
+        progress: ByteProgress | None = None,
+    ) -> bytes | None:
         """Read one SFTP file without changing remote state.
 
         Args:
             remote_path: Absolute remote POSIX path.
+            progress: Optional callback receiving each downloaded chunk size.
 
         Returns:
             File bytes, or ``None`` when absent.
         """
 
         try:
+            chunks: list[bytes] = []
             with self._sftp.open(remote_path, "rb") as handle:
-                return handle.read()
+                while chunk := handle.read(TRANSFER_BLOCK_SIZE):
+                    chunks.append(chunk)
+                    if progress is not None:
+                        progress(len(chunk))
+            return b"".join(chunks)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -246,20 +271,31 @@ class SftpTransport:
                 return None
             raise GitDeployError(f"cannot stat remote file {remote_path}: {exc}") from exc
 
-    def replace_file(self, remote_path: str, data: bytes, executable: bool = False) -> None:
+    def replace_file(
+        self,
+        remote_path: str,
+        data: bytes,
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
         """Upload and replace one SFTP file through a temporary sibling.
 
         Args:
             remote_path: Absolute destination path.
             data: Target bytes.
             executable: Preserve an executable Git mode when true.
+            progress: Optional callback receiving each uploaded chunk size.
         """
 
         self._ensure_dir(posixpath.dirname(remote_path))
         temporary = remote_path + f".git-deploy-{os.getpid()}.tmp"
         try:
             with self._sftp.open(temporary, "wb") as handle:
-                handle.write(data)
+                for offset in range(0, len(data), TRANSFER_BLOCK_SIZE):
+                    chunk = data[offset : offset + TRANSFER_BLOCK_SIZE]
+                    handle.write(chunk)
+                    if progress is not None:
+                        progress(len(chunk))
             self._sftp.chmod(temporary, 0o755 if executable else 0o644)
             try:
                 self._sftp.posix_rename(temporary, remote_path)
@@ -369,19 +405,40 @@ class FtpTransport:
             raise GitDeployError(f"FTP connection failed for {username}@{host}: {exc}") from exc
         self._directories: set[str] = set()
 
-    def read_file(self, remote_path: str) -> bytes | None:
+    def read_file(
+        self,
+        remote_path: str,
+        progress: ByteProgress | None = None,
+    ) -> bytes | None:
         """Download one FTP file into memory.
 
         Args:
             remote_path: Remote FTP path.
+            progress: Optional callback receiving each downloaded chunk size.
 
         Returns:
             File bytes, or ``None`` for a 550 not-found response.
         """
 
         output = io.BytesIO()
+
+        def consume(chunk: bytes) -> None:
+            """Store a downloaded FTP chunk and report its size.
+
+            Args:
+                chunk: Downloaded data block.
+            """
+
+            output.write(chunk)
+            if progress is not None:
+                progress(len(chunk))
+
         try:
-            self._ftp.retrbinary(f"RETR {remote_path}", output.write)
+            self._ftp.retrbinary(
+                f"RETR {remote_path}",
+                consume,
+                blocksize=TRANSFER_BLOCK_SIZE,
+            )
         except ftplib.error_perm as exc:
             if str(exc).startswith("550"):
                 return None
@@ -401,20 +458,33 @@ class FtpTransport:
         del remote_path
         return None
 
-    def replace_file(self, remote_path: str, data: bytes, executable: bool = False) -> None:
+    def replace_file(
+        self,
+        remote_path: str,
+        data: bytes,
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
         """Upload and rename one FTP file.
 
         Args:
             remote_path: Destination FTP path.
             data: Target bytes.
             executable: Ignored because standard FTP has no portable chmod.
+            progress: Optional callback receiving each uploaded chunk size.
         """
 
         del executable
         self._ensure_dir(posixpath.dirname(remote_path))
         temporary = remote_path + f".git-deploy-{os.getpid()}.tmp"
         try:
-            self._ftp.storbinary(f"STOR {temporary}", io.BytesIO(data))
+            callback = (lambda chunk: progress(len(chunk))) if progress is not None else None
+            self._ftp.storbinary(
+                f"STOR {temporary}",
+                io.BytesIO(data),
+                blocksize=TRANSFER_BLOCK_SIZE,
+                callback=callback,
+            )
             try:
                 self._ftp.delete(remote_path)
             except ftplib.error_perm as exc:
