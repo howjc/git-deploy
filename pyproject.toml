@@ -1,6 +1,6 @@
 [project]
 name = "git-deploy"
-version = "0.1.0"
+version = "0.1.1"
 description = "Commit-range based deployment and rollback for Git projects"
 readme = "README.md"
 requires-python = ">=3.11"

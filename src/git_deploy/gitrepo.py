@@ -99,32 +99,38 @@ class GitRepository:
             newer,
             "--",
         ).stdout
-        fields = output.split(b"\0")
-        if fields and fields[-1] == b"":
-            fields.pop()
+        return _parse_name_status(output)
 
-        result: list[GitChange] = []
-        index = 0
-        while index < len(fields):
-            token = fields[index].decode("ascii", errors="strict")
-            index += 1
-            kind = token[:1]
-            score = int(token[1:]) if token[1:].isdigit() else None
-            if kind in {"R", "C"}:
-                if index + 1 >= len(fields):
-                    raise ConfigurationError("malformed rename/copy record from git diff")
-                old_path = fields[index].decode("utf-8", errors="surrogateescape")
-                path = fields[index + 1].decode("utf-8", errors="surrogateescape")
-                index += 2
-                result.append(GitChange(status=kind, path=path, old_path=old_path, score=score))
-                continue
-            if index >= len(fields):
-                raise ConfigurationError("malformed path record from git diff")
-            path = fields[index].decode("utf-8", errors="surrogateescape")
-            index += 1
-            result.append(GitChange(status=kind, path=path, score=score))
-        return tuple(result)
+    def working_tree_changes(self) -> tuple[GitChange, ...]:
+        """Return tracked and untracked changes omitted from commit deployments.
 
+        Returns:
+            Net changes between ``HEAD`` and the current working tree plus untracked files.
+        """
+
+        tracked = _parse_name_status(
+            self._run(
+                "diff",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                "--find-copies",
+                "HEAD",
+                "--",
+            ).stdout
+        )
+        untracked_output = self._run(
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ).stdout
+        untracked = tuple(
+            GitChange(status="?", path=raw.decode("utf-8", errors="surrogateescape"))
+            for raw in untracked_output.split(b"\0")
+            if raw
+        )
+        return (*tracked, *untracked)
     def blob(self, commit: str, path: str) -> GitBlob | None:
         """Read a regular file exactly as stored in a commit.
 
@@ -191,6 +197,43 @@ class GitRepository:
             detail = proc.stderr.decode("utf-8", errors="replace").strip()
             raise ConfigurationError(f"git {' '.join(args)} failed: {detail}")
         return proc
+
+
+def _parse_name_status(output: bytes) -> tuple[GitChange, ...]:
+    """Parse NUL-delimited output from ``git diff --name-status``.
+
+    Args:
+        output: Raw Git subprocess output.
+
+    Returns:
+        Ordered normalized changes with rename/copy metadata.
+    """
+
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+
+    result: list[GitChange] = []
+    index = 0
+    while index < len(fields):
+        token = fields[index].decode("ascii", errors="strict")
+        index += 1
+        kind = token[:1]
+        score = int(token[1:]) if token[1:].isdigit() else None
+        if kind in {"R", "C"}:
+            if index + 1 >= len(fields):
+                raise ConfigurationError("malformed rename/copy record from git diff")
+            old_path = fields[index].decode("utf-8", errors="surrogateescape")
+            path = fields[index + 1].decode("utf-8", errors="surrogateescape")
+            index += 2
+            result.append(GitChange(status=kind, path=path, old_path=old_path, score=score))
+            continue
+        if index >= len(fields):
+            raise ConfigurationError("malformed path record from git diff")
+        path = fields[index].decode("utf-8", errors="surrogateescape")
+        index += 1
+        result.append(GitChange(status=kind, path=path, score=score))
+    return tuple(result)
 
 
 class GitDeploymentPlanner:

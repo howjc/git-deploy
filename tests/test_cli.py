@@ -120,3 +120,46 @@ remote_root = "/srv/second"
     monkeypatch.chdir(tmp_path)
 
     assert run(["plan", "all", "--from", older, "--to", newer]) == 4
+
+
+def test_dry_run_warns_when_worktree_deletion_is_still_present_in_target_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Expose that an uncommitted deletion cannot affect a commit-range upload."""
+
+    repository = tmp_path / "repo"
+    older, newer = _two_commit_repository(repository, "file.txt")
+    (repository / "file.txt").unlink()
+    config = tmp_path / "deploy.toml"
+    config.write_text(
+        f"""
+[server]
+protocol = "sftp"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        [
+            "deploy",
+            "demo",
+            "--from",
+            older,
+            "--to",
+            newer,
+            "--dry-run",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "UPLOAD file.txt" in output
+    assert "uncommitted working-tree change(s) are ignored" in output
+    assert "WORKTREE D file.txt (commit plan: UPLOAD)" in output

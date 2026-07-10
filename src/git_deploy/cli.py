@@ -170,6 +170,7 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     print(f"Config: {config.path}")
     for item in planned:
         _print_plan(item.plan)
+        _print_working_tree_warning(item)
 
     is_plan = args.command == "plan"
     is_dry_run = is_plan or args.dry_run
@@ -426,6 +427,38 @@ def _print_plan(plan: DeploymentPlan) -> None:
             print(f"  DELETE {operation.path}")
     if plan.excluded:
         print(f"  excluded changes: {len(plan.excluded)}")
+
+
+def _print_working_tree_warning(item: ProjectPlan) -> None:
+    """Warn when uncommitted paths are absent from the commit-based plan.
+
+    Args:
+        item: Project, planner, and plan being displayed.
+    """
+
+    changes = item.planner.repository.working_tree_changes()
+    if not changes:
+        return
+    print(
+        f"[{item.project.name}] WARNING: {len(changes)} uncommitted working-tree "
+        "change(s) are ignored; deployment reads commits only."
+    )
+    planned_actions = {operation.path: operation.action.upper() for operation in item.plan.files}
+    overlaps: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for change in changes:
+        candidates = [change.path]
+        if change.old_path:
+            candidates.append(change.old_path)
+        for path in candidates:
+            action = planned_actions.get(path)
+            if action and path not in seen:
+                overlaps.append((change.status, path, action))
+                seen.add(path)
+    for status, path, action in overlaps[:8]:
+        print(f"  WORKTREE {status} {path} (commit plan: {action})")
+    if len(overlaps) > 8:
+        print(f"  ... and {len(overlaps) - 8} more overlapping path(s)")
 
 
 def _print_checks(project: str, checks: tuple[RemoteCheck, ...]) -> None:
