@@ -9,16 +9,24 @@ The new package lives under `src/git_deploy`; neither `deploy.py` nor its
 
 ## Install
 
+From a standalone `git-deploy` clone:
+
 ```bash
-uv tool install --editable ./scripts/deploy
+uv tool install --editable .
 git-deploy --help
 ```
 
-For a non-editable installation:
+From the `baota-official` monorepo root:
 
 ```bash
-uv build ./scripts/deploy
-uv tool install ./scripts/deploy
+uv tool install --editable ./scripts/deploy
+```
+
+For a non-editable standalone installation:
+
+```bash
+uv build
+uv tool install .
 ```
 
 ## Configuration
