@@ -33,6 +33,7 @@ v0.1 的部署链路是：
 - 不能安全执行目标提交自己的 Composer、npm、Go 构建流程。
 - 生成产物不属于 Git blob，无法直接得到 FROM 侧远端漂移校验基线。
 - 当前上传前会把目标文件读入内存；大规模依赖目录不适合继续沿用全量内存模型。
+- 同一 range 的远端文件已全部等于 TO 时，v0.1 仍会生成一个 `snapshots=[]` 的 deployment ID，并继续执行 post commands/health，造成无效历史记录和无必要副作用。
 
 ## 核心原则
 
@@ -74,6 +75,17 @@ v0.1 的部署链路是：
 - `--dry-run --check-remote` 只检查已有可用基线；不得为了远端检查隐式执行构建。
 - 新增显式本地构建验证入口，例如 `git-deploy build PROJECT --to COMMIT`；它可以创建临时 worktree和产物 manifest，但绝不连接或修改远端。
 - CLI 的最终命名可在原子 TODO 的配置契约任务中固定，但不得改变上述副作用边界。
+
+### 6. 目标状态去重，不按 range 字符串去重
+
+- 是否重复部署必须在远端基线检查后，根据每个源码和 artifact 路径是否已经等于 TO 判断。
+- 同一个 `FROM..TO` 再次执行时，如果全部路径都已处于 TO 状态，返回明确的 `already deployed` 结果。
+- `already deployed` 不创建 deployment ID、不创建 state 目录、不保存空 manifest、不执行 post commands、不执行 health checks。
+- 同一个 range 如果远端被回滚、人工修改或只完成部分文件，不得仅因历史中存在相同 range 而跳过。
+- 部分路径已等于 TO 时，仅把剩余需要修改或删除的路径纳入 effective plan、before snapshot 和 deployment manifest；已满足路径不重复上传，也不进入回滚快照。
+- `DELETE + 远端已不存在` 与 `UPLOAD + 远端哈希已等于 TO` 都属于目标状态已满足。
+- 远端内容既不等于 FROM、也不等于 TO 时仍是 drift，默认阻断；去重不得弱化漂移保护。
+- 普通本地 dry-run 因不连接远端，只能显示静态计划，不能宣称 `already deployed`；只读远端检查可以报告目标状态，但不得写部署记录。
 
 ## 目标配置契约
 
@@ -118,7 +130,7 @@ kind = "tree"
 | `ArtifactCollector` | 校验 artifact 边界，拒绝 symlink/submodule/特殊文件，生成文件级 manifest |
 | `BuildCache` | 以 commit + build fingerprint 缓存 manifest；缓存只用于优化，不改变正确性 |
 | `CombinedPlanner` | 合并 Git diff 与 FROM/TO artifact diff，检测远端路径冲突并生成统一操作序列 |
-| `DeploymentExecutor` | 以流式或磁盘 spool 方式上传，避免把大型 artifact tree 全部加载进内存 |
+| `DeploymentExecutor` | 将远端已满足 TO 的操作过滤出 effective plan；全量满足时返回 no-op，否则以流式或磁盘 spool 方式部署剩余路径 |
 | `DeploymentStore` | 在现有 manifest 中记录 artifact provenance、构建指纹和统一 before/after 快照 |
 
 ## 构建指纹
@@ -184,7 +196,7 @@ build fingerprint 至少覆盖：
 | M3 | 本地构建与产物采集 | Composer/npm/Go fixture 至少覆盖两类；生成文件、目录和可执行位进入 artifact manifest |
 | M4 | 产物基线与统一计划 | FROM/TO artifact diff 与 Git diff 合并；新增、修改、删除、冲突、漂移均有测试 |
 | M5 | 流式部署与事务回滚 | 大文件和多文件不全量驻留内存；任一步失败可恢复源码和 artifact 的 before snapshot |
-| M6 | CLI 与 dry-run 兼容 | `all`、项目独立 range、普通 dry-run、远端只读检查、本地 build 验证边界稳定 |
+| M6 | CLI、dry-run 与目标状态去重 | `all`、项目独立 range、普通 dry-run、远端只读检查、本地 build 验证边界稳定；重复 range 全部达到 TO 时返回 `already deployed` 且零 state/hook/health 副作用 |
 | M7 | official-v2 首个真实配置样例 | `vendor/` 构建映射可在 fixture/临时 FTP transport 中完整演练；真实生产 FTP 联调独立由用户代验 |
 | M8 | 发布门禁 | 单元/集成测试、Ruff、类型检查、uv build、隔离 uv tool install 全部通过，v0.1 无构建项目行为不回归 |
 
@@ -210,6 +222,10 @@ build fingerprint 至少覆盖：
 16. official-v2 fixture 使用锁定依赖执行 Composer 构建，验证 `vendor/` 文件新增、修改、删除、漂移和回滚。
 17. 自动测试只使用临时仓库、fixture 和内存/本地 mock transport；生产 FTP 账号和密码不进入自动验证。
 18. 真实 FTP/FTPS 联调作为独立用户代验项，需明确测试目录、最小权限账号、无生产覆盖风险和清理步骤。
+19. 同一 range 部署成功后再次执行，若全部源码和 artifact 路径均等于 TO，CLI 返回 `already deployed`，不创建新的 deployment ID 或任何本地 state 文件。
+20. `already deployed` 不执行远端写入、post commands 或 health checks；测试分别断言文件写入数、命令调用数、健康检查调用数均为 0。
+21. 同一 range 只有部分路径等于 TO 时，仅部署未满足路径，manifest snapshots 只包含实际发生远端变更的路径，回滚后恢复本次执行前的真实状态。
+22. 历史中存在相同 range、但远端当前不等于 TO 时不得误判 no-op；匹配 FROM 时正常部署，既不匹配 FROM 也不匹配 TO 时按 drift 阻断。
 
 ## 真实联调边界
 
@@ -233,3 +249,5 @@ build fingerprint 至少覆盖：
 | 2026-07-10 | 普通 dry-run 继续保持零连接、零构建、零写入 | `--dry-run` 是现有工具的重要安全能力，不能因 build 功能改变语义 |
 | 2026-07-10 | v0.2 改为流式或 spool 上传 | `vendor/`、`dist/` 等目录可能很大，不能继续把所有目标 bytes 同时驻留内存 |
 | 2026-07-10 | 数据库迁移保持人工独立流程 | 文件回滚无法可靠逆转 schema 和业务数据变更 |
+| 2026-07-10 | 重复部署按远端 TO 状态去重，不按 commit range 或历史记录去重 | 相同 range 可能对应已部署、已回滚、部分部署或人工漂移；只有远端完整达到目标状态才是真正 no-op |
+| 2026-07-10 | no-op 不创建空版本，也不运行 post commands/health | 空 deployment ID 无回滚价值，钩子和健康检查可能产生无必要副作用 |
