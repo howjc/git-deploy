@@ -122,6 +122,33 @@ remote_root = "/srv/demo"
     assert error.value.code == 2
 
 
+def test_v02_cli_help_navigation_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep the documented v0.2 command and safety flags visible in CLI help."""
+
+    cases = (
+        (["--help"], ("build", "state")),
+        (["deploy", "--help"], ("--revisions", "--remote", "--dry-run", "--check-remote")),
+        (["build", "--help"], ("--revisions", "--remote")),
+        (["state", "migrate", "--help"], ("--stage", "--yes", "--remote")),
+        (
+            ["state", "bootstrap", "--help"],
+            ("--revision", "--empty", "--dry-run", "--yes", "--remote"),
+        ),
+        (["state", "policy-migrate", "--help"], ("--execute", "--yes", "--remote")),
+        (["state", "recover", "--help"], ("--execute", "--yes", "--remote")),
+        (["state", "verify", "--help"], ("--check-remote", "--remote")),
+    )
+    for argv, expected in cases:
+        with pytest.raises(SystemExit) as stopped:
+            run(argv)
+        assert stopped.value.code == 0
+        output = capsys.readouterr().out
+        for token in expected:
+            assert token in output
+
+
 def test_dry_run_warns_when_worktree_deletion_is_still_present_in_target_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -257,6 +284,170 @@ remote_root = "/srv/prod/demo"
     assert selected_code == 0
     assert "Remote: dev" in selected_output
     assert "UPLOAD file.txt" in selected_output
+
+
+def test_remote_state_isolation_across_named_environments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep alias locks shared while isolating remote state, build, and failures."""
+
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.errors import ConfigurationError
+    from git_deploy.expected_state import ExpectedStateStore, build_expected_state
+    from git_deploy.target_identity import default_state_base, policy_fingerprint_for_project
+    from git_deploy.target_lock import TargetLock
+    from git_deploy.transaction import TransactionStore
+
+    alpha = tmp_path / "alpha"
+    beta = tmp_path / "beta"
+    _two_commit_repository(alpha, "alpha.txt")
+    _two_commit_repository(beta, "beta.txt")
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f'''
+default_remote = "dev"
+
+[remotes.dev]
+protocol = "sftp"
+host = "app.example.invalid"
+username = "dev"
+
+[remotes.dev_alias]
+protocol = "sftp"
+host = "APP.EXAMPLE.INVALID."
+username = "alias"
+
+[remotes.prod]
+protocol = "sftp"
+host = "prod.example.invalid"
+username = "prod"
+
+[projects.alpha]
+repository = "{alpha}"
+local_state_dir = ".state/alpha"
+
+[projects.alpha.remotes.dev]
+remote_root = "/srv/dev/alpha"
+
+[projects.alpha.remotes.dev_alias]
+remote_root = "/srv/dev/alpha/"
+
+[projects.alpha.remotes.prod]
+remote_root = "/srv/prod/alpha"
+
+[projects.alpha.remotes.prod.build]
+commands = [["release-tool", "build"]]
+env_allowlist = ["RELEASE_TOKEN"]
+
+[projects.alpha.remotes.prod.build.onepassword.env]
+RELEASE_TOKEN = "op://example/item/token"
+
+[projects.beta]
+repository = "{beta}"
+local_state_dir = ".state/beta"
+
+[projects.beta.remotes.dev]
+remote_root = "/srv/dev/beta"
+
+[projects.beta.remotes.dev_alias]
+remote_root = "/srv/dev/beta/"
+
+[projects.beta.remotes.prod]
+remote_root = "/srv/prod/beta"
+'''.strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _dev_name, dev_server, dev_projects = select_remote(config, "dev")
+    _alias_name, alias_server, alias_projects = select_remote(config, "dev_alias")
+    _prod_name, prod_server, prod_projects = select_remote(config, "prod")
+
+    dev_ids = {
+        name: resolve_project_target(dev_server, project, config=config)
+        for name, project in dev_projects.items()
+    }
+    alias_ids = {
+        name: resolve_project_target(alias_server, project, config=config)
+        for name, project in alias_projects.items()
+    }
+    prod_ids = {
+        name: resolve_project_target(prod_server, project, config=config)
+        for name, project in prod_projects.items()
+    }
+    for name in ("alpha", "beta"):
+        assert dev_ids[name].target_id == alias_ids[name].target_id
+        assert dev_ids[name].physical_fingerprint == alias_ids[name].physical_fingerprint
+        assert dev_ids[name].target_id != prod_ids[name].target_id
+
+    assert dev_projects["alpha"].build is None
+    prod_build = prod_projects["alpha"].build
+    assert prod_build is not None and prod_build.onepassword is not None
+    assert tuple(name for name, _reference in prod_build.onepassword.env) == (
+        "RELEASE_TOKEN",
+    )
+
+    dev_alpha_root = dev_ids["alpha"].state_root(
+        default_state_base("alpha", dev_projects["alpha"].local_state_dir)
+    )
+    alias_alpha_root = alias_ids["alpha"].state_root(
+        default_state_base("alpha", alias_projects["alpha"].local_state_dir)
+    )
+    prod_alpha_root = prod_ids["alpha"].state_root(
+        default_state_base("alpha", prod_projects["alpha"].local_state_dir)
+    )
+    assert dev_alpha_root == alias_alpha_root
+    with TargetLock(dev_alpha_root):
+        with pytest.raises(ConfigurationError, match="target lock unavailable"):
+            TargetLock(alias_alpha_root).acquire()
+        with TargetLock(prod_alpha_root):
+            pass
+
+    assert run(["plan", "all", "--revisions", "HEAD", "--remote", "dev"]) == 0
+    all_output = capsys.readouterr().out
+    assert "Remote: dev" in all_output
+    assert f"[alpha] target_id={dev_ids['alpha'].target_id}" in all_output
+    assert f"[beta] target_id={dev_ids['beta'].target_id}" in all_output
+    assert prod_ids["alpha"].target_id not in all_output
+    assert prod_ids["beta"].target_id not in all_output
+    assert "provider=1password" not in all_output
+
+    tree = _git(alpha, "rev-parse", "HEAD^{tree}")
+    current = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=(),
+        physical_fingerprint=dev_ids["alpha"].physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(dev_projects["alpha"]),
+        files=(),
+    )
+    ExpectedStateStore(dev_alpha_root, dev_ids["alpha"]).cas_advance(
+        expected_generation=None, state=current
+    )
+    TransactionStore(dev_alpha_root).create(target_id=dev_ids["alpha"].target_id)
+    prod_before = sorted(
+        path.relative_to(prod_alpha_root).as_posix()
+        for path in prod_alpha_root.rglob("*")
+        if path.is_file()
+    )
+
+    assert run(["plan", "alpha", "--revisions", "HEAD", "--remote", "dev"]) != 0
+    failed = capsys.readouterr()
+    assert "unfinished transaction" in failed.err
+    assert run(["plan", "alpha", "--revisions", "HEAD", "--remote", "prod"]) == 0
+    prod_output = capsys.readouterr().out
+    assert "Remote: prod" in prod_output
+    assert "provider=1password" in prod_output
+    assert "op://" not in prod_output
+    prod_after = sorted(
+        path.relative_to(prod_alpha_root).as_posix()
+        for path in prod_alpha_root.rglob("*")
+        if path.is_file()
+    )
+    assert prod_after == prod_before == ["target.lock"]
 
 
 def _seed_state_for_cli(tmp_path: Path, repository: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -2810,3 +3001,615 @@ local_state_dir = ".state/demo"
         assert TransactionStore(root).list_open() == []
     finally:
         set_cli_transport_factory(None)
+
+
+def test_host_build_command_is_local_only_and_cacheable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Explicit host build materializes an exact tree, caches artifacts, and never connects."""
+
+    import sys
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.target_identity import default_state_base
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "build.py").write_text(
+        "from pathlib import Path\n"
+        "Path('dist').mkdir(exist_ok=True)\n"
+        "Path('dist/app.txt').write_text('artifact')\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "build.py")
+    _git(repository, "commit", "-qm", "build")
+    head = _git(repository, "rev-parse", "HEAD")
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+commands = [["{sys.executable}", "build.py"]]
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    calls = {"count": 0}
+
+    def forbid_remote(_server: dict[str, object]):
+        calls["count"] += 1
+        raise AssertionError("build command must not open remote transport")
+
+    set_cli_transport_factory(forbid_remote)
+    try:
+        assert run(["build", "demo", "--revisions", head]) == 0
+        first = capsys.readouterr().out
+        assert "build completed" in first
+        assert "not connected" in first
+        assert run(["build", "demo", "--revisions", head]) == 0
+        second = capsys.readouterr().out
+        assert "cache hit" in second
+    finally:
+        set_cli_transport_factory(None)
+    assert calls["count"] == 0
+    assert not (repository / "dist").exists()
+
+    config = load_config(config_path)
+    _name, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    target_root = identity.state_root(
+        default_state_base(project.name, project.local_state_dir)
+    )
+    assert list((target_root / "build-cache/entries").glob("*.json"))
+    assert list((target_root / "build/worktrees").iterdir()) == []
+
+
+def test_host_build_dry_run_does_not_create_worktree_or_run_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ordinary deploy --dry-run renders build policy but has zero build/state effects."""
+
+    import sys
+
+    from git_deploy.cli import run
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "app.txt").write_text("app")
+    _git(repository, "add", "app.txt")
+    _git(repository, "commit", "-qm", "app")
+    head = _git(repository, "rev-parse", "HEAD")
+    marker = tmp_path / "build-ran"
+    (tmp_path / "deploy.toml").write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+commands = [["{sys.executable}", "-c", "from pathlib import Path; Path(r'{marker}').write_text('ran')"]]
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    assert run(["deploy", "demo", "--revisions", head, "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "build runner=host" in output
+    assert "warning:" in output
+    assert not marker.exists()
+    assert not (tmp_path / ".state").exists()
+
+
+def test_docker_build_command_and_dry_run_zero_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Explicit Docker build resolves/runs; deploy dry-run performs zero Docker calls."""
+
+    from git_deploy.build_runner import BuildExecutionError, BuildResult
+    from git_deploy.cli import run
+    from git_deploy.docker_runner import DockerImageIdentity
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "app.txt").write_text("app")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "app")
+    head = _git(repository, "rev-parse", "HEAD")
+    (tmp_path / "deploy.toml").write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+runner = "docker"
+commands = [["tool", "build"]]
+[projects.demo.build.docker]
+image = "tool@sha256:configured"
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    class FakeRunner:
+        """Fake Docker runner that materializes one artifact."""
+
+        daemon_warning = "daemon warning"
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def resolve_image(self, _config):
+            calls.append("inspect")
+            return DockerImageIdentity("tool", "sha256:immutable")
+
+        def run(self, worktree, _config, *, image=None):
+            assert image is not None
+            calls.append("run")
+            (worktree / "dist").mkdir()
+            (worktree / "dist/app.txt").write_text("artifact")
+            return BuildResult("docker", ())
+
+    monkeypatch.setattr("git_deploy.docker_runner.DockerBuildRunner", FakeRunner)
+    monkeypatch.chdir(tmp_path)
+    assert run(["build", "demo", "--revisions", head]) == 0
+    assert calls == ["inspect", "run"]
+    capsys.readouterr()
+    assert run(["deploy", "demo", "--revisions", head, "--dry-run"]) == 0
+    assert calls == ["inspect", "run"]
+
+    class MissingRunner(FakeRunner):
+        """Model a missing Docker daemon without host fallback."""
+
+        def resolve_image(self, _config):
+            calls.append("missing")
+            raise BuildExecutionError("daemon unavailable", phase="image")
+
+    monkeypatch.setattr("git_deploy.docker_runner.DockerBuildRunner", MissingRunner)
+    assert run(["build", "demo", "--revisions", head]) != 0
+    assert calls[-1] == "missing"
+
+
+def test_docker_build_deploy_runs_before_remote_and_updates_artifact_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real deploy invokes Docker locally first, then mutates artifacts in one state."""
+
+    import hashlib
+
+    from git_deploy.build_runner import BuildResult
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.docker_runner import DockerImageIdentity
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.target_identity import default_state_base, policy_fingerprint_for_project
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "app").write_text("app")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "app")
+    head = _git(repository, "rev-parse", "HEAD")
+    tree = _git(repository, "rev-parse", "HEAD^{tree}")
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "docker.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+runner = "docker"
+commands = [["tool"]]
+[projects.demo.build.docker]
+image = "tool@sha256:configured"
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _name, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    git_store = PersistentGitStore(root, repository)
+    git_store.ensure_layout()
+    git_store._publish_repository_identity()
+    old = b"old-artifact"
+    ContentAddressedStore(root).put(old)
+    current = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=(StateComposer(repository).transition_id_for_commit(head).as_str(),),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(FileEntry("public/app.txt", "artifact:public", hashlib.sha256(old).hexdigest()),),
+        artifacts=({"build_fingerprint": "old"},),
+    )
+    store = ExpectedStateStore(root, identity)
+    store.cas_advance(expected_generation=None, state=current)
+    events: list[str] = []
+
+    class FakeRunner:
+        daemon_warning = "daemon warning"
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def resolve_image(self, _config):
+            events.append("inspect")
+            return DockerImageIdentity("tool", "sha256:immutable")
+
+        def run(self, worktree, _config, *, image=None):
+            assert image is not None
+            events.append("run")
+            (worktree / "dist").mkdir()
+            (worktree / "dist/app.txt").write_bytes(b"new-artifact")
+            return BuildResult("docker", ())
+
+    monkeypatch.setattr("git_deploy.docker_runner.DockerBuildRunner", FakeRunner)
+    remote = InMemoryTransport()
+    remote.files["/srv/public/app.txt"] = FakeRemotePath(old)
+
+    def factory(_server):
+        events.append("connect")
+        return remote
+
+    set_cli_transport_factory(factory)
+    try:
+        assert run(["deploy", "demo", "--revisions", head, "--yes"]) == 0
+    finally:
+        set_cli_transport_factory(None)
+    assert events == ["inspect", "run", "connect"]
+    assert remote.files["/srv/public/app.txt"].data == b"new-artifact"
+    loaded = store.load_current_state()
+    assert loaded is not None and loaded[1].generation == 2
+    assert loaded[1].files[0].owner == "artifact:public"
+
+
+def test_onepassword_build_command_and_dry_run_secret_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Real build invokes fake op with cache bypass; dry-run invokes it zero times."""
+
+    import os
+    import sys
+
+    from git_deploy.cli import run
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "build.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "assert os.environ['TOKEN']\n"
+        "assert not any(k.startswith('OP_') for k in os.environ)\n"
+        "Path('dist').mkdir(exist_ok=True)\n"
+        "Path('dist/app.txt').write_text(os.environ['TOKEN'])\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "build")
+    head = _git(repository, "rev-parse", "HEAD")
+    calls = tmp_path / "op-calls"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    op = fake_bin / "op"
+    op.write_text(
+        f"#!{sys.executable}\n"
+        "import os,subprocess,sys\n"
+        f"open({str(calls)!r},'a').write('run\\n')\n"
+        "args=sys.argv[1:]; assert args[:2]==['run','--']\n"
+        "env=os.environ.copy()\n"
+        "for k,v in list(env.items()):\n"
+        "    if v.startswith('op://'): env[k]='CLI-SENTINEL'\n"
+        "r=subprocess.run(args[2:],env=env,capture_output=True)\n"
+        "sys.stdout.buffer.write(r.stdout.replace(b'CLI-SENTINEL',b'***'))\n"
+        "sys.stderr.buffer.write(r.stderr.replace(b'CLI-SENTINEL',b'***'))\n"
+        "raise SystemExit(r.returncode)\n",
+        encoding="utf-8",
+    )
+    op.chmod(0o755)
+    (tmp_path / "deploy.toml").write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+commands = [["{sys.executable}", "build.py"]]
+env_allowlist = ["TOKEN"]
+[projects.demo.build.onepassword.env]
+TOKEN = "op://vault/item/token"
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "AUTH-SENTINEL")
+    monkeypatch.chdir(tmp_path)
+    assert run(["build", "demo", "--revisions", head]) == 0
+    output = capsys.readouterr().out
+    assert "provider=1password" in output
+    assert "cache bypass" in output
+    assert "op://" not in output
+    assert "CLI-SENTINEL" not in output
+    assert calls.read_text().splitlines() == ["run"]
+
+    assert run(["deploy", "demo", "--revisions", head, "--dry-run"]) == 0
+    dry_output = capsys.readouterr().out
+    assert "provider=1password" in dry_output
+    assert "env_names=['TOKEN']" in dry_output
+    assert "op://" not in dry_output
+    assert calls.read_text().splitlines() == ["run"]
+
+    # Establish a trusted artifact current, then prove deploy builds before connect.
+    import hashlib
+
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.target_identity import default_state_base, policy_fingerprint_for_project
+
+    config = load_config(tmp_path / "deploy.toml")
+    _name, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    tree = _git(repository, "rev-parse", "HEAD^{tree}")
+    git_store = PersistentGitStore(root, repository)
+    git_store.ensure_layout()
+    git_store._publish_repository_identity()
+    old = b"old-secret-artifact"
+    ContentAddressedStore(root).put(old)
+    current = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=(StateComposer(repository).transition_id_for_commit(head).as_str(),),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(FileEntry("public/app.txt", "artifact:public", hashlib.sha256(old).hexdigest()),),
+        artifacts=({"build_fingerprint": "old"},),
+    )
+    store = ExpectedStateStore(root, identity)
+    store.cas_advance(expected_generation=None, state=current)
+    remote = InMemoryTransport()
+    remote.files["/srv/demo/public/app.txt"] = FakeRemotePath(old)
+    connection_calls = {"count": 0}
+
+    def factory(_server):
+        connection_calls["count"] += 1
+        with calls.open("a", encoding="utf-8") as handle:
+            handle.write("connect\n")
+        return remote
+
+    set_cli_transport_factory(factory)
+    try:
+        assert run(["deploy", "demo", "--revisions", head, "--yes"]) == 0
+    finally:
+        set_cli_transport_factory(None)
+    deploy_output = capsys.readouterr().out
+    assert "op://" not in deploy_output
+    assert "CLI-SENTINEL" not in deploy_output
+    assert calls.read_text().splitlines() == ["run", "run", "connect"]
+    assert connection_calls["count"] == 1
+    assert remote.files["/srv/demo/public/app.txt"].data == b"CLI-SENTINEL"
+    loaded = store.load_current_state()
+    assert loaded is not None and loaded[1].generation == 2
+    state_json = "".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in root.rglob("*.json")
+    )
+    for sensitive in ("op://vault/item/token", "AUTH-SENTINEL", "CLI-SENTINEL"):
+        assert sensitive not in state_json
+
+    # A later op failure must happen before another transport factory call.
+    op.write_text(
+        f"#!{sys.executable}\n"
+        f"open({str(calls)!r},'a').write('fail\\n')\n"
+        "raise SystemExit(19)\n",
+        encoding="utf-8",
+    )
+    op.chmod(0o755)
+    set_cli_transport_factory(factory)
+    try:
+        assert run(["deploy", "demo", "--revisions", head, "--yes"]) != 0
+    finally:
+        set_cli_transport_factory(None)
+    assert connection_calls["count"] == 1
+    assert calls.read_text().splitlines()[-1] == "fail"
+
+
+def test_host_build_deploy_bootstraps_artifacts_and_rolls_back_unified_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Product CLI builds before connect, baselines known artifacts, deploys, and rolls back."""
+
+    import hashlib
+    import sys
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.state_rollback import StateRollbackService
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.target_identity import default_state_base, policy_fingerprint_for_project
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "build.py").write_text(
+        "from pathlib import Path\n"
+        "Path('dist').mkdir(exist_ok=True)\n"
+        "Path('dist/app.txt').write_text('artifact-' + Path('app.txt').read_text())\n",
+        encoding="utf-8",
+    )
+    (repository / "app.txt").write_text("old", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "old")
+    old_commit = _git(repository, "rev-parse", "HEAD")
+    old_tree = _git(repository, "rev-parse", "HEAD^{tree}")
+    (repository / "app.txt").write_text("new", encoding="utf-8")
+    _git(repository, "add", "app.txt")
+    _git(repository, "commit", "-qm", "new")
+    new_commit = _git(repository, "rev-parse", "HEAD")
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "deploy.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+commands = [["{sys.executable}", "build.py"]]
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote_name, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    git_store = PersistentGitStore(root, repository)
+    git_store.ensure_layout()
+    git_store._publish_repository_identity()
+    old_source = b"old"
+    old_artifact = b"artifact-old"
+    cas = ContentAddressedStore(root)
+    cas.put(old_source)
+    cas.put(old_artifact)
+    applied = (StateComposer(repository).transition_id_for_commit(old_commit).as_str(),)
+    current = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=old_tree,
+        applied_transition_ids=applied,
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(
+            FileEntry("app.txt", "source", hashlib.sha256(old_source).hexdigest()),
+        ),
+        artifacts=(),
+    )
+    store = ExpectedStateStore(root, identity)
+    store.cas_advance(expected_generation=None, state=current)
+    remote = InMemoryTransport()
+    remote.files["/srv/app.txt"] = FakeRemotePath(old_source)
+    remote.files["/srv/public/app.txt"] = FakeRemotePath(old_artifact)
+    factory_calls = {"count": 0}
+
+    def factory(_server: dict[str, object]):
+        factory_calls["count"] += 1
+        return remote
+
+    set_cli_transport_factory(factory)
+    try:
+        assert run(["deploy", "demo", "--revisions", new_commit, "--yes"]) == 0
+    finally:
+        set_cli_transport_factory(None)
+    output = capsys.readouterr().out
+    assert "build completed" in output
+    assert factory_calls["count"] == 1
+    assert remote.files["/srv/app.txt"].data == b"new"
+    assert remote.files["/srv/public/app.txt"].data == b"artifact-new"
+    loaded = store.load_current_state()
+    assert loaded is not None and loaded[1].generation == 3
+    assert loaded[1].artifacts[0]["mode"] == "build"
+    assert {entry.owner for entry in loaded[1].files} == {"source", "artifact:public"}
+
+    rolled = StateRollbackService(project, identity, root, transport=remote).rollback_latest()
+    assert rolled.status == "succeeded"
+    assert remote.files["/srv/app.txt"].data == old_source
+    assert remote.files["/srv/public/app.txt"].data == old_artifact
+    after_rollback = store.load_current_state()
+    assert after_rollback is not None and after_rollback[1].generation == 4
+    assert after_rollback[1].artifacts[0]["mode"] == "known_source"

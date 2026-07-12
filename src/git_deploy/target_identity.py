@@ -386,14 +386,14 @@ def policy_fingerprint_for_project(
     project: ProjectConfig,
     *,
     repository_identity: str | None = None,
-    artifact_destinations: Sequence[str] = (),
+    artifact_destinations: Sequence[str] | None = None,
 ) -> str:
     """Compute managed policy fingerprint from a project configuration.
 
     Args:
         project: Resolved project configuration.
         repository_identity: Optional override identity; defaults to repository path.
-        artifact_destinations: Artifact destinations (empty until Gate B).
+        artifact_destinations: Optional override; defaults to configured mappings.
 
     Returns:
         Policy fingerprint hex digest.
@@ -402,12 +402,17 @@ def policy_fingerprint_for_project(
     identity = repository_identity
     if identity is None:
         identity = str(project.repository.resolve())
+    destinations = (
+        tuple(artifact_destinations)
+        if artifact_destinations is not None
+        else tuple(item.destination for item in project.artifacts)
+    )
     return managed_policy_fingerprint(
         repository_identity=identity,
         include=project.include,
         exclude=project.exclude,
         protected=project.protected,
-        artifact_destinations=artifact_destinations,
+        artifact_destinations=destinations,
     )
 
 

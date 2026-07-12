@@ -162,3 +162,75 @@ def test_public_identity_selects_only_matching_agent_key(
     assert key is matching
     assert agent is not None
     assert not agent.closed
+
+
+@pytest.mark.parametrize("protocol", ["sftp", "ftp", "ftps"])
+def test_fake_transport_state_and_rollback_semantics_match(
+    tmp_path: Path, protocol: str
+) -> None:
+    """All protocol facades share identical transaction/state/latest-rollback behavior."""
+
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.models import PlannedFile, ProjectConfig
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport, StateDeploymentExecutor
+    from git_deploy.state_planner import SourceDiffPlan
+    from git_deploy.state_rollback import StateRollbackService
+    from git_deploy.target_identity import policy_fingerprint_for_project, resolve_target_identity
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "app.txt").write_bytes(b"old")
+    subprocess.run(["git", "-C", str(repo), "add", "app.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "old"], check=True)
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    project = ProjectConfig("demo", repo, "/srv")
+    identity = resolve_target_identity({"protocol": protocol, "host": "fake"}, project)
+    root = tmp_path / "target"
+    git_store = PersistentGitStore(root, repo)
+    git_store.ensure_layout()
+    git_store._publish_repository_identity()
+    old_hash = hashlib.sha256(b"old").hexdigest()
+    new_hash = hashlib.sha256(b"new").hexdigest()
+    ContentAddressedStore(root).put(b"old")
+    state = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=("t0",),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(FileEntry("app.txt", "source", old_hash),),
+    )
+    store = ExpectedStateStore(root, identity)
+    store.cas_advance(expected_generation=None, state=state)
+    remote = InMemoryTransport()
+    remote.files["/srv/app.txt"] = FakeRemotePath(b"old")
+    operation = PlannedFile(
+        "upload", "app.txt", "/srv/app.txt", "app.txt", old_hash, new_hash, 3
+    )
+    plan = SourceDiffPlan(tree, tree, (operation,), (), ("t1",), ("t0", "t1"))
+    executor = StateDeploymentExecutor(
+        project,
+        identity,
+        root,
+        transport=remote,
+        content_provider=lambda _path: b"new",
+    )
+    result = executor.deploy(plan, (operation,))
+    assert result["status"] == "succeeded"
+    assert remote.files["/srv/app.txt"].data == b"new"
+    rolled = StateRollbackService(project, identity, root, transport=remote).rollback_latest()
+    assert rolled.status == "succeeded"
+    assert remote.files["/srv/app.txt"].data == b"old"
+    current = store.load_current_state()
+    assert current is not None and current[1].generation == 3

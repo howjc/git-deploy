@@ -231,6 +231,7 @@ class StateRollbackService:
                     policy_fingerprint=self.policy_fp,
                     files=before_snap.files,
                     deployment_id=manifest.deployment_id,
+                    artifacts=before_snap.artifacts,
                 )
             else:
                 # Legacy/no-lineage only: reconstruct from manifest snapshots.
@@ -250,6 +251,7 @@ class StateRollbackService:
                     policy_fingerprint=self.policy_fp,
                     files=before_entries or current_state.files,
                     deployment_id=manifest.deployment_id,
+                    artifacts=current_state.artifacts,
                 )
 
             after_id = self.state_store.write_state(after)

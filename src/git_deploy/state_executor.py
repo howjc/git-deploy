@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from collections.abc import Iterator
+from typing import Any, Mapping, Sequence
 
 from .errors import ConfigurationError, PolicyError, RemoteDriftError
 from .expected_state import ExpectedState, ExpectedStateStore, FileEntry, build_expected_state
@@ -72,6 +73,16 @@ class InMemoryTransport:
         self.write_calls += 1
         self.files[remote_path] = FakeRemotePath(data=data, executable=executable)
 
+    def write_file_stream(
+        self,
+        remote_path: str,
+        chunks: Any,
+        executable: bool = False,
+    ) -> None:
+        """Consume bounded chunks into one fake remote file."""
+
+        self.write_file(remote_path, b"".join(chunks), executable=executable)
+
     def delete_file(self, remote_path: str) -> None:
         """Delete one remote path if present.
 
@@ -112,6 +123,18 @@ class InMemoryTransport:
         if item is None or item.data is None:
             return None
         return item.executable
+
+    def list_files(self, remote_prefix: str) -> tuple[str, ...]:
+        """Return sorted fake regular files below a remote path prefix."""
+
+        prefix = remote_prefix.rstrip("/") + "/"
+        return tuple(
+            sorted(
+                path
+                for path, item in self.files.items()
+                if item.data is not None and (path == remote_prefix or path.startswith(prefix))
+            )
+        )
 
     def close(self) -> None:
         """Close the fake transport.
@@ -177,7 +200,7 @@ class StateDeploymentExecutor:
         target_root: Path,
         *,
         transport: Any | None = None,
-        content_provider: Callable[[str], bytes] | None = None,
+        content_provider: Any | None = None,
     ):
         """Bind project, identity, and optional transport.
 
@@ -186,14 +209,14 @@ class StateDeploymentExecutor:
             identity: Physical target identity.
             target_root: Target state root.
             transport: Injected transport (in-memory tests or real adapter).
-            content_provider: Maps path → target bytes for uploads.
+            content_provider: Callable bytes provider or chunked provider object.
         """
 
         self.project = project
         self.identity = identity
         self.target_root = target_root
         self.transport: Any = transport if transport is not None else InMemoryTransport()
-        self.content_provider = content_provider or (lambda path: b"")
+        self.content_provider: Any = content_provider or (lambda path: b"")
         self.state_store = ExpectedStateStore(target_root, identity)
         self.tx_store = TransactionStore(target_root)
         self.cas = ContentAddressedStore(target_root)
@@ -325,22 +348,7 @@ class StateDeploymentExecutor:
             if self.cas.contains(entry.content_sha256):
                 self.cas.get(entry.content_sha256)
                 continue
-            try:
-                data = self.content_provider(entry.path)
-            except Exception as exc:
-                raise ConfigurationError(
-                    f"CAS missing and content provider failed for {entry.path}: {exc}"
-                ) from exc
-            # Legitimate empty files are b""; only None means unavailable when typed so.
-            if data is None:  # type: ignore[comparison-overlap]
-                raise ConfigurationError(
-                    f"CAS missing and content provider returned None for {entry.path}"
-                )
-            if not isinstance(data, (bytes, bytearray)):
-                raise ConfigurationError(
-                    f"content provider must return bytes for {entry.path}"
-                )
-            digest = self.cas.put(bytes(data))
+            digest = self._stage_content(entry.path, entry.content_sha256)
             if digest != entry.content_sha256:
                 raise ConfigurationError(
                     f"content digest mismatch for {entry.path}: "
@@ -364,21 +372,7 @@ class StateDeploymentExecutor:
                 entry["backup_file"] = rel
                 self.cas.put(data)
             if item.action != "delete" and item.target_sha256 is not None:
-                try:
-                    target_data = self.content_provider(item.path)
-                except Exception as exc:
-                    raise ConfigurationError(
-                        f"content provider failed for {item.path}: {exc}"
-                    ) from exc
-                if target_data is None:  # type: ignore[comparison-overlap]
-                    raise ConfigurationError(
-                        f"content provider returned None for {item.path}"
-                    )
-                if not isinstance(target_data, (bytes, bytearray)):
-                    raise ConfigurationError(
-                        f"content provider must return bytes for {item.path}"
-                    )
-                digest = self.cas.put(bytes(target_data))
+                digest = self._stage_content(item.path, item.target_sha256)
                 if digest != item.target_sha256:
                     raise ConfigurationError(
                         f"content digest mismatch for {item.path}: "
@@ -440,12 +434,19 @@ class StateDeploymentExecutor:
                 if item.action == "delete":
                     self.transport.delete_file(item.remote_path)
                 else:
-                    data = self.content_provider(item.path)
-                    self.transport.write_file(
-                        item.remote_path,
-                        data,
-                        executable=item.executable,
-                    )
+                    stream_writer = getattr(self.transport, "write_file_stream", None)
+                    if callable(stream_writer):
+                        stream_writer(
+                            item.remote_path,
+                            self._iter_content(item.path),
+                            executable=item.executable,
+                        )
+                    else:
+                        self.transport.write_file(
+                            item.remote_path,
+                            self._content_bytes(item.path),
+                            executable=item.executable,
+                        )
                 # Immediate post-write read-back verify before next mutation.
                 self._verify_remote_path(item)
                 writes_done += 1
@@ -611,6 +612,8 @@ class StateDeploymentExecutor:
         *,
         force: bool = False,
         fail_at: str | None = None,
+        target_entries: Sequence[FileEntry] | None = None,
+        artifact_provenance: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Run a full stateful deploy with prepare→mutate→commit.
 
@@ -619,6 +622,8 @@ class StateDeploymentExecutor:
             files: Planned files (pre-filter).
             force: Allow confirmed content drift.
             fail_at: Test hook: ``upload``, ``delete``, ``hook``, ``health``.
+            target_entries: Optional complete combined source/artifact target table.
+            artifact_provenance: Trusted target artifact manifest metadata.
 
         Returns:
             Result summary dict.
@@ -632,13 +637,13 @@ class StateDeploymentExecutor:
             self.reject_third_content(decisions, force=force)
 
             # Repeated no-op: all ok and no introduced transitions with matching current.
-            if plan.static_noop or (
+            if (plan.static_noop and not files) or (
                 not plan.introduced_transition_ids
                 and all(item.status in {"ok", "satisfied"} for item in decisions)
                 and not any(item.status == "ok" and item.actual_sha256 != item.target_sha256 for item in decisions)
                 and all(item.status == "satisfied" or item.target_sha256 == item.actual_sha256 for item in decisions)
             ):
-                if plan.static_noop or all(
+                if (plan.static_noop and not files) or all(
                     d.status == "satisfied" or d.actual_sha256 == d.target_sha256 for d in decisions
                 ):
                     if any(d.status == "drift" for d in decisions):
@@ -663,7 +668,13 @@ class StateDeploymentExecutor:
                     "generation": before_gen,
                 }
 
-            after_state = self._build_after_state(plan, before_state, files)
+            after_state = self._build_after_state(
+                plan,
+                before_state,
+                files,
+                target_entries=target_entries,
+                artifact_provenance=artifact_provenance,
+            )
             deployment_id = _new_deployment_id()
             journal = self.prepare(
                 plan=plan,
@@ -787,11 +798,67 @@ class StateDeploymentExecutor:
             "transaction_id": journal.transaction_id,
         }
 
+    def commit_artifact_baseline(
+        self,
+        baseline_files: Sequence[FileEntry],
+        provenance: Sequence[Mapping[str, Any]],
+    ) -> ExpectedState:
+        """CAS a read-verified artifact baseline with zero remote mutations.
+
+        Args:
+            baseline_files: Artifact entries proven against known-source/empty remote.
+            provenance: Trusted baseline construction metadata.
+
+        Returns:
+            New current state generation containing source plus artifact entries.
+        """
+
+        with TargetLock(self.target_root):
+            if self.tx_store.list_open():
+                raise PolicyError("unfinished transaction blocks artifact baseline")
+            loaded = self.state_store.load_current_state()
+            if loaded is None:
+                raise PolicyError("artifact baseline requires an established current state")
+            pointer, current = loaded
+            source_entries = tuple(
+                entry for entry in current.files if not entry.owner.startswith("artifact:")
+            )
+            files = tuple(sorted(source_entries + tuple(baseline_files), key=lambda item: item.path))
+            after = build_expected_state(
+                generation=current.generation + 1,
+                parent_state_id=pointer.state_id,
+                source_tree_id=current.source_tree_id,
+                applied_transition_ids=current.applied_transition_ids,
+                physical_fingerprint=self.identity.physical_fingerprint,
+                policy_fingerprint=self.policy_fp,
+                files=files,
+                artifacts=provenance,
+            )
+            after_id = self.state_store.write_state(after)
+            journal = self.tx_store.create(
+                target_id=self.identity.target_id,
+                stage="prepared",
+                before_state_id=pointer.state_id,
+                after_state_id=after_id,
+                before_generation=current.generation,
+                after_generation=after.generation,
+                meta={"kind": "state_only", "subtype": "artifact_baseline"},
+            )
+            self.state_store.cas_advance(
+                expected_generation=current.generation,
+                state=after,
+            )
+            self.tx_store.advance(journal, "recovered")
+            return after
+
     def _build_after_state(
         self,
         plan: SourceDiffPlan,
         before_state: ExpectedState | None,
         files: Sequence[PlannedFile],
+        *,
+        target_entries: Sequence[FileEntry] | None = None,
+        artifact_provenance: Sequence[Mapping[str, Any]] | None = None,
     ) -> ExpectedState:
         """Construct the full after expected state from before + planned mutations.
 
@@ -803,6 +870,8 @@ class StateDeploymentExecutor:
             plan: Source plan.
             before_state: Previous state.
             files: Full planned file set for this deploy (not only effective).
+            target_entries: Optional authoritative combined target file table.
+            artifact_provenance: Optional authoritative artifact provenance.
 
         Returns:
             After state with generation+1.
@@ -810,22 +879,30 @@ class StateDeploymentExecutor:
 
         generation = 1 if before_state is None else before_state.generation + 1
         parent = before_state.state_id() if before_state else None
-        by_path: dict[str, FileEntry] = {}
-        if before_state is not None:
-            for entry in before_state.files:
-                by_path[entry.path] = entry
-        for item in files:
-            if item.action == "delete":
-                by_path.pop(item.path, None)
-                continue
-            by_path[item.path] = FileEntry(
-                path=item.path,
-                owner="source",
-                content_sha256=item.target_sha256,
-                executable=item.executable,
-                exists=True,
-            )
-        entries = tuple(by_path[path] for path in sorted(by_path))
+        if target_entries is not None:
+            entries = tuple(sorted(target_entries, key=lambda entry: entry.path))
+        else:
+            by_path: dict[str, FileEntry] = {}
+            if before_state is not None:
+                for entry in before_state.files:
+                    by_path[entry.path] = entry
+            for item in files:
+                if item.action == "delete":
+                    by_path.pop(item.path, None)
+                    continue
+                by_path[item.path] = FileEntry(
+                    path=item.path,
+                    owner="source",
+                    content_sha256=item.target_sha256,
+                    executable=item.executable,
+                    exists=True,
+                )
+            entries = tuple(by_path[path] for path in sorted(by_path))
+        provenance = (
+            tuple(artifact_provenance)
+            if artifact_provenance is not None
+            else (before_state.artifacts if before_state is not None else ())
+        )
         return build_expected_state(
             generation=generation,
             parent_state_id=parent,
@@ -834,7 +911,40 @@ class StateDeploymentExecutor:
             physical_fingerprint=self.identity.physical_fingerprint,
             policy_fingerprint=self.policy_fp,
             files=entries,
+            artifacts=provenance,
         )
+
+    def _iter_content(self, path: str) -> Iterator[bytes]:
+        """Yield target content from either a streaming or legacy bytes provider."""
+
+        iterator = getattr(self.content_provider, "iter_chunks", None)
+        if callable(iterator):
+            yield from iterator(path)
+            return
+        try:
+            data = self.content_provider(path)
+        except Exception as exc:
+            raise ConfigurationError(f"content provider failed for {path}: {exc}") from exc
+        if data is None or not isinstance(data, (bytes, bytearray)):
+            raise ConfigurationError(f"content provider must return bytes for {path}")
+        yield bytes(data)
+
+    def _content_bytes(self, path: str) -> bytes:
+        """Compatibility adapter that aggregates only one planned file."""
+
+        return b"".join(self._iter_content(path))
+
+    def _stage_content(self, path: str, expected_digest: str) -> str:
+        """Durably stream one planned target file into CAS before remote mutation."""
+
+        try:
+            return self.cas.put_stream(
+                self._iter_content(path), expected_digest=expected_digest
+            )
+        except Exception as exc:
+            if isinstance(exc, ConfigurationError):
+                raise
+            raise ConfigurationError(f"cannot stage content for {path}: {exc}") from exc
 
     def _write_manifest(
         self,

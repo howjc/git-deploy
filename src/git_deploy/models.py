@@ -15,12 +15,65 @@ class ServerConfig:
 
 
 @dataclass(frozen=True)
+class DockerBuildConfig:
+    """Restricted Docker runner settings resolved from TOML."""
+
+    image: str
+    platform: str = "linux/amd64"
+    network: str = "none"
+    pull_policy: str = "never"
+
+
+@dataclass(frozen=True)
+class OnePasswordConfig:
+    """Declared build environment names and opaque 1Password references."""
+
+    env: tuple[tuple[str, str], ...] = ()
+
+    def as_dict(self) -> dict[str, str]:
+        """Return a copy of the configured name-to-reference mapping."""
+
+        return dict(self.env)
+
+
+@dataclass(frozen=True)
+class BuildConfig:
+    """Validated build commands and runner policy for one project target."""
+
+    runner: str
+    commands: tuple[tuple[str, ...], ...]
+    timeout: int = 900
+    cwd: str = "."
+    env_allowlist: tuple[str, ...] = ()
+    docker: DockerBuildConfig | None = None
+    onepassword: OnePasswordConfig | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactConfig:
+    """One worktree-relative build output mapped below ``remote_root``."""
+
+    source: str
+    destination: str
+    kind: str
+
+    @property
+    def owner(self) -> str:
+        """Return a stable state owner name for this artifact mapping."""
+
+        return f"artifact:{self.destination}"
+
+
+@dataclass(frozen=True)
 class ProjectRemoteConfig:
     """Optional project policy overrides for one named remote."""
 
     remote_root: str | None = None
     post_commands: tuple[str, ...] | None = None
     health_urls: tuple[str, ...] | None = None
+    build: BuildConfig | None = None
+    build_configured: bool = False
+    artifacts: tuple[ArtifactConfig, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +92,10 @@ class ProjectConfig:
     remote: str = "default"
     remotes: dict[str, ProjectRemoteConfig] = field(default_factory=dict)
     target_id: str | None = None
+    build: BuildConfig | None = None
+    artifacts: tuple[ArtifactConfig, ...] = ()
+    build_origin: str = "none"
+    artifacts_origin: str = "project"
 
 
 @dataclass(frozen=True)

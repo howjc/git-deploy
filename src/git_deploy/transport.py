@@ -8,8 +8,9 @@ import hashlib
 import io
 import os
 import posixpath
+import stat
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -43,6 +44,18 @@ class RemoteTransport(Protocol):
         progress: ByteProgress | None = None,
     ) -> None:
         """Upload bytes through a temporary name and replace the destination."""
+
+    def replace_file_stream(
+        self,
+        remote_path: str,
+        chunks: Iterable[bytes],
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
+        """Upload bounded chunks through a temporary sibling and replace."""
+
+    def list_files(self, remote_prefix: str) -> tuple[str, ...]:
+        """List regular/non-directory paths at or below a remote prefix."""
 
     def delete_file(self, remote_path: str) -> None:
         """Delete a remote file when present."""
@@ -289,12 +302,27 @@ class SftpTransport:
             progress: Optional callback receiving each uploaded chunk size.
         """
 
+        self.replace_file_stream(
+            remote_path,
+            (data,),
+            executable=executable,
+            progress=progress,
+        )
+
+    def replace_file_stream(
+        self,
+        remote_path: str,
+        chunks: Iterable[bytes],
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
+        """Stream chunks to SFTP temp, then chmod and atomic rename."""
+
         self._ensure_dir(posixpath.dirname(remote_path))
         temporary = remote_path + f".git-deploy-{os.getpid()}.tmp"
         try:
             with self._sftp.open(temporary, "wb") as handle:
-                for offset in range(0, len(data), TRANSFER_BLOCK_SIZE):
-                    chunk = data[offset : offset + TRANSFER_BLOCK_SIZE]
+                for chunk in chunks:
                     handle.write(chunk)
                     if progress is not None:
                         progress(len(chunk))
@@ -313,6 +341,35 @@ class SftpTransport:
             except Exception:
                 pass
             raise GitDeployError(f"cannot replace remote file {remote_path}: {exc}") from exc
+
+    def list_files(self, remote_prefix: str) -> tuple[str, ...]:
+        """Recursively list non-directory SFTP paths without following symlinks."""
+
+        try:
+            root_mode = self._sftp.lstat(remote_prefix).st_mode
+        except FileNotFoundError:
+            return ()
+        except OSError as exc:
+            if getattr(exc, "errno", None) == 2:
+                return ()
+            raise GitDeployError(f"cannot list remote path {remote_prefix}: {exc}") from exc
+        if not stat.S_ISDIR(root_mode):
+            return (remote_prefix,)
+        found: list[str] = []
+        pending = [remote_prefix]
+        while pending:
+            current = pending.pop()
+            try:
+                attributes = self._sftp.listdir_attr(current)
+            except OSError as exc:
+                raise GitDeployError(f"cannot list remote directory {current}: {exc}") from exc
+            for item in attributes:
+                path = posixpath.join(current, item.filename)
+                if stat.S_ISDIR(item.st_mode):
+                    pending.append(path)
+                else:
+                    found.append(path)
+        return tuple(sorted(found))
 
     def delete_file(self, remote_path: str) -> None:
         """Delete one SFTP file when it exists.
@@ -481,6 +538,22 @@ class FtpTransport:
             progress: Optional callback receiving each uploaded chunk size.
         """
 
+        self.replace_file_stream(
+            remote_path,
+            (data,),
+            executable=executable,
+            progress=progress,
+        )
+
+    def replace_file_stream(
+        self,
+        remote_path: str,
+        chunks: Iterable[bytes],
+        executable: bool = False,
+        progress: ByteProgress | None = None,
+    ) -> None:
+        """Stream iterable chunks through FTP STOR and rename the temporary file."""
+
         del executable
         self._ensure_dir(posixpath.dirname(remote_path))
         temporary = remote_path + f".git-deploy-{os.getpid()}.tmp"
@@ -488,7 +561,7 @@ class FtpTransport:
             callback = (lambda chunk: progress(len(chunk))) if progress is not None else None
             self._ftp.storbinary(
                 f"STOR {temporary}",
-                io.BytesIO(data),
+                _IterableReader(chunks),
                 blocksize=TRANSFER_BLOCK_SIZE,
                 callback=callback,
             )
@@ -504,6 +577,40 @@ class FtpTransport:
             except Exception:
                 pass
             raise GitDeployError(f"cannot replace remote file {remote_path}: {exc}") from exc
+
+    def list_files(self, remote_prefix: str) -> tuple[str, ...]:
+        """Recursively list FTP paths using MLSD, treating a direct file as present."""
+
+        try:
+            size = self._ftp.size(remote_prefix)
+            if size is not None:
+                return (remote_prefix,)
+        except ftplib.all_errors:
+            pass
+        found: list[str] = []
+        pending = [remote_prefix]
+        while pending:
+            current = pending.pop()
+            try:
+                rows = list(self._ftp.mlsd(current))
+            except ftplib.error_perm as exc:
+                if str(exc).startswith("550"):
+                    if current == remote_prefix:
+                        return ()
+                    continue
+                raise GitDeployError(f"cannot list FTP directory {current}: {exc}") from exc
+            except (AttributeError, ftplib.error_proto) as exc:
+                raise GitDeployError("FTP server must support MLSD for artifact tree baseline") from exc
+            for name, facts in rows:
+                if name in {".", ".."}:
+                    continue
+                path = posixpath.join(current, name)
+                if facts.get("type") in {"dir", "cdir", "pdir"}:
+                    if facts.get("type") == "dir":
+                        pending.append(path)
+                else:
+                    found.append(path)
+        return tuple(sorted(found))
 
     def delete_file(self, remote_path: str) -> None:
         """Delete one FTP file when present.
@@ -574,6 +681,33 @@ def _resolve_password(server: dict[str, Any]) -> str:
             raise ConfigurationError(f"password environment variable is not set: {variable}")
         return value
     return str(server.get("password", ""))
+
+
+class _IterableReader:
+    """Expose an iterable of bounded chunks as the ``read`` API used by ftplib."""
+
+    def __init__(self, chunks: Iterable[bytes]):
+        """Bind a single-pass chunk iterator."""
+
+        self._chunks: Iterator[bytes] = iter(chunks)
+        self._buffer = bytearray()
+        self._done = False
+
+    def read(self, size: int = -1) -> bytes:
+        """Return up to ``size`` bytes without aggregating the complete payload."""
+
+        if size < 0:
+            size = TRANSFER_BLOCK_SIZE
+        while len(self._buffer) < size and not self._done:
+            try:
+                chunk = next(self._chunks)
+            except StopIteration:
+                self._done = True
+                break
+            self._buffer.extend(chunk)
+        output = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return output
 
 
 def _is_public_key(path: Path) -> bool:

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from pathlib import Path
 
-from .durable_io import durable_publish, ensure_state_directory, file_mode
+from .durable_io import durable_publish, durable_publish_stream, ensure_state_directory, file_mode
 from .errors import ConfigurationError
 
 
@@ -77,6 +78,28 @@ class ContentAddressedStore:
                 f"CAS object digest mismatch for {digest}: actual={actual}"
             )
         return data
+
+    def put_stream(self, chunks: Iterable[bytes], *, expected_digest: str) -> str:
+        """Store a chunk iterable and require its final digest to match.
+
+        Args:
+            chunks: Iterable of bytes chunks.
+            expected_digest: Planned SHA-256 digest.
+
+        Returns:
+            Verified lowercase digest.
+        """
+
+        path = self.path_for(expected_digest)
+        if path.is_file():
+            self.get(expected_digest)
+            return expected_digest.lower()
+        self.ensure_layout()
+        ensure_state_directory(path.parent)
+        actual, _size = durable_publish_stream(
+            path, chunks, expected_digest=expected_digest
+        )
+        return actual
 
     def contains(self, digest: str) -> bool:
         """Return whether a digest is present without reading full integrity.

@@ -50,6 +50,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_plan_arguments(deploy, include_dry_run=True)
     deploy.add_argument("--yes", action="store_true", help="skip the mutation confirmation")
 
+    build = subparsers.add_parser("build", help="build configured artifacts locally (no remote)")
+    build.add_argument("target", help="project name")
+    build.add_argument(
+        "--revisions",
+        nargs="+",
+        required=True,
+        metavar="COMMIT_OR_FROM..TO",
+        help="revision selectors used to derive the exact target source tree",
+    )
+    _add_remote_argument(build)
+
     history = subparsers.add_parser("history", help="show local deployment records")
     history.add_argument("target", help="project name or all")
     history.add_argument("--limit", type=int, default=20, help="records shown per project")
@@ -191,6 +202,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         config = load_config(config_path)
         if args.command in {"plan", "deploy"}:
             return _run_plan_or_deploy(config, args)
+        if args.command == "build":
+            return _run_build(config, args)
         if args.command == "history":
             return _run_history(config, args)
         if args.command == "verify":
@@ -262,6 +275,24 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     ] = []
     legacy_items: list[ProjectPlan] = []
     for project in projects:
+        if project.build is not None:
+            from .config import build_config_summary
+
+            summary = build_config_summary(project)
+            print(
+                f"[{project.name}] build runner={summary['runner']} "
+                f"origin={summary['build_origin']} artifacts={summary['artifact_destinations']}"
+            )
+            print(f"  commands: {summary['commands']}")
+            if summary.get("secret_provider"):
+                print(
+                    f"  secret provider={summary['secret_provider']} "
+                    f"env_names={summary['secret_env_names']} (dry-run: op calls=0)"
+                )
+            if project.build.runner == "host":
+                from .build_runner import HostBuildRunner
+
+                print(f"  warning: {HostBuildRunner.permission_warning}")
         # Plan/dry-run may run with incomplete server tables (host deferred to deploy).
         host = str(server.values.get("host", "")).strip()
         if not host and is_dry_run:
@@ -291,6 +322,10 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
             _print_working_tree_warning(item)
             if is_dry_run:
                 print("  remote: unverified (local-only plan/dry-run; no current state)")
+            elif project.build is not None:
+                raise PolicyError(
+                    f"project {project.name} artifact deploy requires state bootstrap first"
+                )
             legacy_items.append(item)
             continue
 
@@ -389,7 +424,7 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     actionable_state = [
         item
         for item in stateful_items
-        if item[3].files or item[3].introduced_transition_ids
+        if item[0].build is not None or item[3].files or item[3].introduced_transition_ids
     ]
     if not actionable_legacy and not actionable_state:
         print("No selected tracked-file changes; nothing deployed.")
@@ -408,35 +443,162 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
 
     for project, identity, target_root, source_plan, object_env, git_store in actionable_state:
         repo = GitRepository(project.repository)
-
-        def _content(
-            path: str,
-            *,
-            _repo: GitRepository = repo,
-            _tree: str = source_plan.after_tree_id,
-            _env: dict[str, str] | None = object_env,
-        ) -> bytes:
-            blob = _repo.blob(_tree, path, env=_env)
-            if blob is None:
-                return b""
-            return blob.data
-
-        transport = open_cli_transport(dict(server.values))
+        transport = None
         try:
-            executor = StateDeploymentExecutor(
-                project,
-                identity,
-                target_root,
-                transport=transport,
-                content_provider=_content,
-            )
-            result = executor.deploy(
-                source_plan,
-                list(source_plan.files),
-                force=bool(getattr(args, "force", False)),
-            )
+            if project.build is None:
+                def _content(
+                    path: str,
+                    *,
+                    _repo: GitRepository = repo,
+                    _tree: str = source_plan.after_tree_id,
+                    _env: dict[str, str] | None = object_env,
+                ) -> bytes:
+                    blob = _repo.blob(_tree, path, env=_env)
+                    if blob is None:
+                        return b""
+                    return blob.data
+
+                transport = open_cli_transport(dict(server.values))
+                executor = StateDeploymentExecutor(
+                    project,
+                    identity,
+                    target_root,
+                    transport=transport,
+                    content_provider=_content,
+                )
+                result = executor.deploy(
+                    source_plan,
+                    list(source_plan.files),
+                    force=bool(getattr(args, "force", False)),
+                )
+            else:
+                from .artifact_planner import ArtifactPlanner
+                from .build_service import BuildService
+                from .combined_planner import CombinedPlanner
+                from .streaming import FileContentRef, StreamingContentProvider
+                from .worktree import WorktreeManager
+
+                state_store = ExpectedStateStore(target_root, identity)
+                loaded = state_store.load_current_state()
+                if loaded is None:
+                    raise PolicyError("artifact deploy requires current state")
+                _pointer, current_state = loaded
+                build_service = BuildService(project, target_root)
+                target_build = build_service.execute(
+                    source_plan.after_tree_id,
+                    object_env=object_env,
+                )
+                artifact_planner = ArtifactPlanner()
+                artifact_plan = artifact_planner.plan(
+                    project, current_state, target_build.entry
+                )
+                if artifact_plan.status == "baseline_required":
+                    transport = open_cli_transport(dict(server.values))
+                    baseline_build = (
+                        target_build
+                        if current_state.source_tree_id == source_plan.after_tree_id
+                        else build_service.execute(
+                            current_state.source_tree_id,
+                            object_env=(
+                                git_store.object_environment()
+                                if git_store is not None
+                                else object_env
+                            ),
+                        )
+                    )
+                    baseline = artifact_planner.verify_known_source_baseline(
+                        project,
+                        baseline_build.entry,
+                        transport,
+                    )
+                    writes_before = getattr(transport, "write_calls", 0)
+                    baseline_executor = StateDeploymentExecutor(
+                        project,
+                        identity,
+                        target_root,
+                        transport=transport,
+                    )
+                    current_state = baseline_executor.commit_artifact_baseline(
+                        baseline.files,
+                        baseline.provenance,
+                    )
+                    if getattr(transport, "write_calls", 0) != writes_before:
+                        raise ConfigurationError(
+                            "artifact baseline state transition wrote remote"
+                        )
+                    artifact_plan = artifact_planner.plan(
+                        project, current_state, target_build.entry
+                    )
+                combined = CombinedPlanner().combine(
+                    current_state.files,
+                    source_plan,
+                    artifact_plan,
+                )
+                artifact_hashes = dict(combined.artifact_content_refs)
+                provenance = ({
+                    "mode": "build",
+                    "build_fingerprint": target_build.fingerprint,
+                    "source_tree_id": source_plan.after_tree_id,
+                    "runner": project.build.runner,
+                    "artifacts": [
+                        {
+                            "path": item.destination,
+                            "content_sha256": item.content_sha256,
+                            "size": item.size,
+                            "executable": item.executable,
+                        }
+                        for item in target_build.entry.artifacts
+                    ],
+                },)
+                if transport is None:
+                    transport = open_cli_transport(dict(server.values))
+                worktrees = WorktreeManager(
+                    project.repository,
+                    target_root / "build" / "deploy-worktrees",
+                )
+                with worktrees.materialize(
+                    source_plan.after_tree_id,
+                    object_env=object_env,
+                ) as worktree:
+                    refs: dict[str, FileContentRef] = {}
+                    cache = build_service.cache
+                    for operation in combined.files:
+                        if operation.action == "delete" or operation.target_sha256 is None:
+                            continue
+                        if operation.path in artifact_hashes:
+                            local = cache.cas.path_for(artifact_hashes[operation.path])
+                        else:
+                            local = worktree.path / operation.path
+                        refs[operation.path] = FileContentRef(
+                            local,
+                            operation.target_sha256,
+                            operation.target_size,
+                        )
+                    provider = StreamingContentProvider(
+                        refs,
+                        target_root / "build" / "spool",
+                    )
+                    executor = StateDeploymentExecutor(
+                        project,
+                        identity,
+                        target_root,
+                        transport=transport,
+                        content_provider=provider,
+                    )
+                    result = executor.deploy(
+                        source_plan,
+                        combined.files,
+                        force=bool(getattr(args, "force", False)),
+                        target_entries=combined.target_entries,
+                        artifact_provenance=provenance,
+                    )
+                print(
+                    f"[{project.name}] build "
+                    f"{'cache hit' if target_build.cache_hit else 'completed'} "
+                    f"fingerprint={target_build.fingerprint[:12]}"
+                )
         finally:
-            close = getattr(transport, "close", None)
+            close = getattr(transport, "close", None) if transport is not None else None
             if callable(close):
                 close()
         status = result.get("status", "unknown")
@@ -455,6 +617,88 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         elif status not in {"succeeded", "already deployed", "reconciled"}:
             exit_code = 3
     return exit_code
+
+
+def _run_build(config: AppConfig, args: argparse.Namespace) -> int:
+    """Run an explicit local artifact build without opening a remote transport."""
+
+    from .build_service import BuildService
+    from .config import build_config_summary, resolve_project_target
+    from .expected_state import ExpectedStateStore
+    from .git_store import PersistentGitStore
+    from .gitrepo import GitRepository
+    from .state_planner import StatePlanner
+    from .target_identity import default_state_base
+
+    remote_name, server, available_projects = select_remote(config, args.remote)
+    projects = _select_projects(available_projects, [args.target])
+    if len(projects) != 1:
+        raise ConfigurationError("build requires exactly one project")
+    project = projects[0]
+    if project.build is None:
+        raise ConfigurationError(f"project {project.name} has no build configuration")
+    identity = resolve_project_target(server, project, config=config)
+    target_root = identity.state_root(
+        default_state_base(project.name, project.local_state_dir)
+    )
+    store = ExpectedStateStore(target_root, identity)
+    current = store.load_current_state()
+    git_store = PersistentGitStore(target_root, project.repository)
+    git_store.ensure_layout()
+    git_store._publish_repository_identity()
+    if current is None:
+        if len(args.revisions) != 1 or ".." in args.revisions[0]:
+            raise PolicyError(
+                "first artifact build without current state requires one known revision"
+            )
+        repo = GitRepository(project.repository)
+        commit = repo.resolve_commit(args.revisions[0])
+        target_tree = repo._run_text("rev-parse", f"{commit}^{{tree}}").strip()
+        object_env = git_store.object_environment()
+    else:
+        _pointer, state = current
+        planner = StatePlanner(
+            project.repository,
+            include=project.include,
+            exclude=project.exclude,
+            protected=project.protected,
+            remote_root=project.remote_root,
+            git_store=git_store,
+        )
+        source_plan = planner.plan_selectors(
+            args.revisions,
+            current_tree_id=state.source_tree_id,
+            applied_transition_ids=state.applied_transition_ids,
+        )
+        target_tree = source_plan.after_tree_id
+        object_env = planner.object_env() or git_store.object_environment()
+
+    summary = build_config_summary(project)
+    print(f"Config: {config.path}")
+    print(f"Remote: {remote_name} (identity selection only; not connected)")
+    print(f"[{project.name}] target_id={identity.target_id}")
+    print(f"  target tree: {target_tree}")
+    print(f"  commands: {summary['commands']}")
+    if summary.get("secret_provider"):
+        print(
+            f"  secret provider={summary['secret_provider']} "
+            f"env_names={summary['secret_env_names']} (cache bypass)"
+        )
+    if project.build.runner == "docker" and project.build.onepassword is not None:
+        from .docker_runner import DockerBuildRunner
+
+        print(f"  warning: {DockerBuildRunner.daemon_warning}")
+    outcome = BuildService(project, target_root).execute(
+        target_tree,
+        object_env=object_env,
+    )
+    print(f"  warning: {outcome.warning}")
+    print(
+        f"  build {'cache hit' if outcome.cache_hit else 'completed'}: "
+        f"fingerprint={outcome.fingerprint} artifacts={len(outcome.entry.artifacts)}"
+    )
+    print("Remote: not connected; remote writes=0")
+    return 0
 
 
 def _run_history(config: AppConfig, args: argparse.Namespace) -> int:

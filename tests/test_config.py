@@ -350,3 +350,324 @@ def test_ftps_effective_port_matches_transport_default() -> None:
     assert payload.port == 21
     # Explicit override still works.
     assert effective_port("ftps", 990) == 990
+
+
+def test_host_build_and_artifact_schema(tmp_path: Path) -> None:
+    """Host build defaults and file/tree artifact mappings resolve immutably."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+
+[projects.demo.build]
+commands = [["composer", "install"], ["npm", "run", "build"]]
+timeout = 321
+cwd = "frontend"
+env_allowlist = ["CI", "COMPOSER_AUTH"]
+
+[[projects.demo.artifacts]]
+source = "vendor"
+destination = "vendor"
+kind = "tree"
+
+[[projects.demo.artifacts]]
+source = "bin/server"
+destination = "bin/server"
+kind = "file"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    project = load_config(config_path).projects["demo"]
+    assert project.build is not None
+    assert project.build.runner == "host"
+    assert project.build.commands == (
+        ("composer", "install"),
+        ("npm", "run", "build"),
+    )
+    assert project.build.timeout == 321
+    assert project.build.cwd == "frontend"
+    assert project.build.env_allowlist == ("CI", "COMPOSER_AUTH")
+    assert [(item.source, item.destination, item.kind) for item in project.artifacts] == [
+        ("vendor", "vendor", "tree"),
+        ("bin/server", "bin/server", "file"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("build_body", "message"),
+    [
+        ('commands = ["npm run build"]', "argv array"),
+        ('commands = [["npm"]]\ntimeout = 0', "positive integer"),
+        ('commands = [["npm"]]\ncwd = "../outside"', "traversal"),
+        ('commands = [["npm"]]\nenv_allowlist = ["BAD-NAME"]', "invalid name"),
+        ('commands = [["npm"]]\nextra_args = ["--privileged"]', "unsupported keys"),
+    ],
+)
+def test_host_build_rejects_invalid_contract(
+    tmp_path: Path, build_body: str, message: str
+) -> None:
+    """Host build rejects shell strings, unsafe paths/env, and unknown knobs."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[projects.demo.build]
+{build_body}
+""".strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match=message):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("artifact_body", "message"),
+    [
+        ('source = "../vendor"\ndestination = "vendor"\nkind = "tree"', "traversal"),
+        ('source = "vendor"\ndestination = "/srv/vendor"\nkind = "tree"', "relative"),
+        ('source = "vendor"\ndestination = "vendor"\nkind = "link"', "file.*tree"),
+    ],
+)
+def test_artifact_schema_rejects_unsafe_paths_and_kinds(
+    tmp_path: Path, artifact_body: str, message: str
+) -> None:
+    """Artifact mappings remain worktree/remote-root relative and regular-only."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[[projects.demo.artifacts]]
+{artifact_body}
+""".strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match=message):
+        load_config(config_path)
+
+
+def test_docker_build_schema_defaults_and_rejects_arbitrary_args(tmp_path: Path) -> None:
+    """Docker config has closed network/pull enums and no raw run arguments."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[projects.demo.build]
+runner = "docker"
+commands = [["composer", "install"]]
+[projects.demo.build.docker]
+image = "composer:2"
+""".strip(),
+        encoding="utf-8",
+    )
+    build = load_config(config_path).projects["demo"].build
+    assert build is not None and build.docker is not None
+    assert build.docker.platform == "linux/amd64"
+    assert build.docker.network == "none"
+    assert build.docker.pull_policy == "never"
+
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write('\nrun_args = ["--privileged"]\n')
+    with pytest.raises(ConfigurationError, match="unsupported keys"):
+        load_config(config_path)
+
+
+def test_onepassword_schema_accepts_only_allowlisted_op_references(tmp_path: Path) -> None:
+    """1Password config stores opaque references under declared build names only."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    base = f"""
+[server]
+protocol = "sftp"
+host = "build.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[projects.demo.build]
+commands = [["composer", "install"]]
+env_allowlist = ["COMPOSER_AUTH"]
+[projects.demo.build.onepassword.env]
+COMPOSER_AUTH = "op://build/composer/auth"
+""".strip()
+    config_path.write_text(base, encoding="utf-8")
+    build = load_config(config_path).projects["demo"].build
+    assert build is not None and build.onepassword is not None
+    assert build.onepassword.as_dict() == {
+        "COMPOSER_AUTH": "op://build/composer/auth"
+    }
+    from git_deploy.config import build_config_summary
+
+    summary = build_config_summary(load_config(config_path).projects["demo"])
+    assert summary["secret_provider"] == "1password"
+    assert summary["secret_env_names"] == ["COMPOSER_AUTH"]
+    assert "op://" not in repr(summary)
+
+    config_path.write_text(base.replace("op://build/composer/auth", "plaintext"), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="op://"):
+        load_config(config_path)
+    config_path.write_text(base.replace("COMPOSER_AUTH =", "OP_SESSION_X ="), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="invalid or reserved"):
+        load_config(config_path)
+
+
+def test_remote_host_build_override_replaces_whole_project_config(tmp_path: Path) -> None:
+    """Remote host build/artifacts replace defaults and report their source layer."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[remotes.dev]
+protocol = "sftp"
+host = "dev.example"
+[remotes.prod]
+protocol = "sftp"
+host = "prod.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[projects.demo.build]
+commands = [["build-prod"]]
+timeout = 900
+[[projects.demo.artifacts]]
+source = "dist-prod"
+destination = "dist"
+kind = "tree"
+[projects.demo.remotes.dev.build]
+commands = [["build-dev"]]
+timeout = 30
+[[projects.demo.remotes.dev.artifacts]]
+source = "dist-dev"
+destination = "preview"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    dev = select_remote(config, "dev")[2]["demo"]
+    prod = select_remote(config, "prod")[2]["demo"]
+    assert dev.build is not None and dev.build.commands == (("build-dev",),)
+    assert dev.build.timeout == 30
+    assert [item.destination for item in dev.artifacts] == ["preview"]
+    assert dev.build_origin == "remote:dev"
+    assert dev.artifacts_origin == "remote:dev"
+    assert prod.build is not None and prod.build.commands == (("build-prod",),)
+    assert [item.destination for item in prod.artifacts] == ["dist"]
+    assert prod.build_origin == "project"
+
+
+def test_remote_docker_override_replaces_without_deep_merge(tmp_path: Path) -> None:
+    """A remote Docker table is complete and does not inherit project image/network."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[remotes.dev]
+protocol = "sftp"
+host = "same.example"
+[remotes.prod]
+protocol = "sftp"
+host = "same.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[projects.demo.build]
+runner = "docker"
+commands = [["prod-build"]]
+[projects.demo.build.docker]
+image = "prod@sha256:abc"
+network = "bridge"
+[projects.demo.remotes.dev.build]
+runner = "docker"
+commands = [["dev-build"]]
+[projects.demo.remotes.dev.build.docker]
+image = "dev@sha256:def"
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    dev = select_remote(config, "dev")[2]["demo"].build
+    prod = select_remote(config, "prod")[2]["demo"].build
+    assert dev is not None and dev.docker is not None
+    assert dev.docker.image == "dev@sha256:def"
+    assert dev.docker.network == "none"
+    assert prod is not None and prod.docker is not None
+    assert prod.docker.image == "prod@sha256:abc"
+    assert prod.docker.network == "bridge"
+
+
+def test_remote_onepassword_override_does_not_inherit_prod_reference(tmp_path: Path) -> None:
+    """Remote secret mappings replace project mappings so dev never inherits prod."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[remotes.dev]
+protocol = "sftp"
+host = "same.example"
+[remotes.prod]
+protocol = "sftp"
+host = "same.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+[projects.demo.build]
+commands = [["prod-build"]]
+env_allowlist = ["TOKEN"]
+[projects.demo.build.onepassword.env]
+TOKEN = "op://prod/item/token"
+[projects.demo.remotes.dev.build]
+commands = [["dev-build"]]
+env_allowlist = ["TOKEN"]
+[projects.demo.remotes.dev.build.onepassword.env]
+TOKEN = "op://dev/item/token"
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    dev = select_remote(config, "dev")[2]["demo"].build
+    prod = select_remote(config, "prod")[2]["demo"].build
+    assert dev is not None and dev.onepassword is not None
+    assert prod is not None and prod.onepassword is not None
+    assert dev.onepassword.as_dict()["TOKEN"] == "op://dev/item/token"
+    assert prod.onepassword.as_dict()["TOKEN"] == "op://prod/item/token"

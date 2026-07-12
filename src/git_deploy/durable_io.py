@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal
 
@@ -179,6 +179,75 @@ def durable_publish(path: Path, data: bytes) -> None:
         except OSError:
             pass
         raise
+
+
+def durable_publish_stream(
+    path: Path,
+    chunks: Iterable[bytes],
+    *,
+    expected_digest: str | None = None,
+) -> tuple[str, int]:
+    """Durably publish bounded chunks without aggregating the payload in memory.
+
+    Args:
+        path: Final durable path.
+        chunks: Iterable of bytes-like chunks consumed exactly once.
+        expected_digest: Optional SHA-256 that must match before atomic replace.
+
+    Returns:
+        SHA-256 digest and total byte count of the published payload.
+    """
+
+    import hashlib
+
+    path = path.resolve()
+    parent = ensure_state_directory(path.parent)
+    check_durable_filesystem(parent)
+    _fire("before_write", path)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=_TEMP_SUFFIX, dir=str(parent)
+    )
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        os.fchmod(fd, _FILE_MODE)
+        with os.fdopen(fd, "wb") as handle:
+            for chunk in chunks:
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise ConfigurationError("durable stream yielded a non-bytes chunk")
+                data = bytes(chunk)
+                handle.write(data)
+                digest.update(data)
+                total += len(data)
+            handle.flush()
+            _fire("after_write", path)
+            os.fsync(handle.fileno())
+            _fire("after_file_fsync", path)
+        actual = digest.hexdigest()
+        if expected_digest is not None and actual != expected_digest.lower():
+            raise ConfigurationError(
+                f"durable stream digest mismatch: expected={expected_digest} actual={actual}"
+            )
+        os.replace(temporary, path)
+        _fire("after_replace", path)
+        dir_fd = os.open(str(parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        _fire("after_dir_fsync", path)
+        try:
+            path.chmod(_FILE_MODE)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return digest.hexdigest(), total
 
 
 def list_orphan_temps(directory: Path) -> list[Path]:

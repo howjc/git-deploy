@@ -107,6 +107,11 @@ when an intentional default is preferable. `remote_root`, `post_commands`, and
 override them. Deployment history and rollback backups are isolated by project
 and remote.
 
+v0.2 的 target identity、旧历史迁移、bootstrap、policy migration 和 recover
+流程见 [状态运维指南](docs/v0.2-state-operations.md)；Host/Docker 构建、
+1Password 注入、remote override 和 artifact 信任边界见
+[构建产物与秘密安全指南](docs/v0.2-build-artifacts.md)。
+
 For 1Password SSH Agent, use a public `IdentityFile` in `~/.ssh/config`:
 
 ```sshconfig
@@ -144,6 +149,13 @@ git-deploy deploy official --revisions COMMIT_A..COMMIT_B --remote prod --yes
 
 # Deploy the same project to development instead.
 git-deploy deploy official --revisions COMMIT_A..COMMIT_B --remote dev --yes
+
+# Build configured artifacts locally without connecting to the remote.
+git-deploy build official --revisions COMMIT_B --remote prod
+
+# Inspect and verify the selected physical target state.
+git-deploy state inspect official --remote prod
+git-deploy state verify official --remote prod
 
 # Show local deployment history and restore the latest successful deployment.
 git-deploy history official --remote prod
