@@ -1,211 +1,628 @@
 # git-deploy
 
-Deploy tracked file changes selected from Git commits over SFTP, FTP, or FTPS.
-The tool accepts single commits, continuous ranges, and non-contiguous
-combinations. It creates an exact pre-deployment backup and can restore it
-later by deployment ID. Existing `deploy.py` remains the legacy full-upload
-command.
+`git-deploy` 是一个基于 Git revision 的增量部署、状态管理与回滚工具。它从提交、连续范围或非连续提交组合中计算精确文件变化，通过 SFTP、FTP 或 FTPS 部署，并用持久化 expected state、事务日志和部署前备份保证重复部署、失败恢复及最新版本回滚的一致性。
 
-The new package lives under `src/git_deploy`; neither `deploy.py` nor its
-`deploy.example.toml` configuration is imported or modified by the new CLI.
+v0.2.0 支持 named remote、多环境切换、Host/Docker 构建产物，以及通过 1Password CLI 为构建过程注入环境变量。源码和构建产物进入同一个部署事务，任一步失败时共同恢复。
 
-## Install
+> `deploy.py` 是旧版全量上传入口；新的 `git-deploy` CLI 位于 `src/git_deploy`，不会读取旧版 `deploy.example.toml`。
 
-From a standalone `git-deploy` clone:
+## 文档导航
+
+- [功能概览](#功能概览)
+- [系统要求](#系统要求)
+- [安装指南](#安装指南)
+- [快速开始](#快速开始)
+- [配置指南](#配置指南)
+- [Revision 选择规则](#revision-选择规则)
+- [完整使用指南](#完整使用指南)
+- [命令说明表](#命令说明表)
+- [打包和发布](#打包和发布)
+- [安全模型](#安全模型)
+- [深入文档](#深入文档)
+
+## 功能概览
+
+- 选择单个提交、`FROM..TO` 连续范围或多个非连续 selector。
+- 支持 SFTP、FTP、FTPS，以及 SSH config、SSH Agent、密码环境变量。
+- 支持 `dev`、`prod` 等多个 named remote，并可设置安全的默认环境。
+- 按 physical target 隔离或共享 state、lock、部署历史和构建缓存。
+- 持久化 current generation、Git tree、CAS 内容和 transaction journal。
+- 上传前检查远端漂移，部署前保存真实 bytes，部署后逐文件验证。
+- 支持 Host 或 Docker 构建，并收集 file/tree artifact。
+- 支持 `op run` 向 Host/Docker 构建注入白名单环境变量。
+- source 与 artifact 统一规划、流式传输、事务提交和最新回滚。
+- plan/dry-run 默认不连接远端、不构建、不调用 Docker/op、不写 state。
+
+## 系统要求
+
+| 组件 | 要求 | 用途 |
+|---|---|---|
+| Python | 3.11 或更高 | 运行 git-deploy |
+| Git | 可用的命令行客户端 | 解析 revision、tree 和 blob |
+| uv | 推荐当前稳定版 | 安装、开发、测试和打包 |
+| Docker | 可选 | 使用 `runner = "docker"` 时需要 |
+| 1Password CLI | 可选 | 配置 `build.onepassword` 时需要 |
+| Composer / Node / Go 等 | 可选 | Host runner 需要的项目构建工具 |
+
+远端只需要对应协议和目标目录权限，不需要安装 Python、Git、Docker 或 git-deploy。
+
+## 安装指南
+
+### 从 GitHub Release 安装
+
+当前稳定版本为 `v0.2.0`：
 
 ```bash
-uv tool install --editable .
+uv tool install \
+  https://github.com/howjc/git-deploy/releases/download/v0.2.0/git_deploy-0.2.0-py3-none-any.whl
+
+git-deploy --version
 git-deploy --help
 ```
 
-From the `baota-official` monorepo root:
+下载并验证发布产物：
 
 ```bash
-uv tool install --editable ./scripts/deploy
+gh release download v0.2.0 \
+  --repo howjc/git-deploy \
+  --pattern "git_deploy-0.2.0*" \
+  --pattern "SHA256SUMS"
+
+sha256sum -c SHA256SUMS
+uv tool install ./git_deploy-0.2.0-py3-none-any.whl
 ```
 
-For a non-editable standalone installation:
+升级或重新安装：
 
 ```bash
-uv build
+uv tool install --force \
+  https://github.com/howjc/git-deploy/releases/download/v0.2.0/git_deploy-0.2.0-py3-none-any.whl
+```
+
+卸载：
+
+```bash
+uv tool uninstall git-deploy
+```
+
+### 从源码安装
+
+```bash
+git clone https://github.com/howjc/git-deploy.git
+cd git-deploy
+
+# 普通安装
 uv tool install .
+
+# 开发环境
+uv sync
+uv tool install --editable .
 ```
 
-## Configuration
+也可以直接安装另一个工作区中的项目目录：
 
-`git-deploy` resolves its configuration in this order:
+```bash
+uv tool install --editable /path/to/git-deploy
+```
 
-1. `--config PATH`
-2. `./deploy.toml` in the current working directory
-3. `GIT_DEPLOY_CONFIG`
-4. `~/.config/git-deploy/deploy.toml`
+## 快速开始
 
-It never searches parent directories. Relative paths inside the configuration
-are resolved from the directory containing that configuration file.
-Start from `git-deploy.example.toml`; keep the real `deploy.toml` untracked.
+```bash
+cp git-deploy.example.toml deploy.toml
 
-For a single remote, the existing `[server]` form remains supported:
+# 预览
+git-deploy plan application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote dev
+
+# dry-run
+git-deploy deploy application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote dev \
+  --dry-run
+
+# 正式部署
+git-deploy deploy application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote dev \
+  --yes
+```
+
+确认开发环境后，将同一 selector 部署到生产：
+
+```bash
+git-deploy deploy application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote prod \
+  --dry-run --check-remote
+
+git-deploy deploy application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote prod \
+  --yes
+```
+
+## 配置指南
+
+### 配置文件发现顺序
+
+1. 顶层参数 `--config PATH`。
+2. 当前目录的 `./deploy.toml`。
+3. 环境变量 `GIT_DEPLOY_CONFIG`。
+4. `~/.config/git-deploy/deploy.toml`。
+
+工具不会向父目录递归搜索。配置中的相对路径以配置文件所在目录为基准。`--config` 必须写在子命令之前：
+
+```bash
+git-deploy --config /path/to/deploy.toml plan application --revisions HEAD
+```
+
+`deploy.toml` 可能包含服务器名称、路径和凭据变量名，默认应保持未跟踪。
+
+### 单远程配置
 
 ```toml
 [server]
 protocol = "sftp"
-ssh_host_alias = "bt-official-prod"
+host = "192.0.2.10"
+port = 22
+username = "deploy"
+ssh_host_alias = "application-prod"
 ssh_config_file = "~/.ssh/config"
 strict_host_key_checking = true
+timeout = 15
 
-[projects.official]
+[projects.application]
 repository = "."
-remote_root = "/www/wwwroot/www.bt.cn"
-include = ["app/**", "config/**", "public/**", "route/**", "extend/**"]
-exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**", ".env*"]
-protected = [".env", "runtime/**", "app/storage/cert/**", "app/storage/enc/**"]
-post_commands = [
-  "cd /www/wwwroot/www.bt.cn && php think clear",
-  "/etc/init.d/php-fpm-83 reload",
-]
-health_urls = ["https://www.bt.cn/api/oauth/jwks"]
+remote_root = "/srv/application"
+include = ["src/**", "public/**", "config/**"]
+exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**"]
+protected = [".env", "runtime/**", "storage/cert/**"]
+post_commands = ["cd /srv/application && ./bin/clear-cache"]
+health_urls = ["https://example.invalid/health"]
 ```
 
-For multiple environments, name each connection under `[remotes.NAME]` and
-put environment-specific project settings under `[projects.NAME.remotes.NAME]`:
+FTP/FTPS 推荐用 `password_env`，不要在 TOML 中写明文密码：
 
 ```toml
+[server]
+protocol = "ftps"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "GIT_DEPLOY_FTP_PASSWORD"
+```
+
+### 多远程与默认环境
+
+```toml
+default_remote = "dev"
+
 [remotes.dev]
 protocol = "sftp"
-ssh_host_alias = "bt-official-dev"
-ssh_config_file = "~/.ssh/config"
+host = "dev.example.invalid"
+username = "deploy-dev"
 strict_host_key_checking = true
 
 [remotes.prod]
 protocol = "sftp"
-ssh_host_alias = "bt-official-prod"
-ssh_config_file = "~/.ssh/config"
+host = "prod.example.invalid"
+username = "deploy-prod"
 strict_host_key_checking = true
 
-[projects.official]
+[projects.application]
 repository = "."
-include = ["app/**", "config/**", "public/**", "route/**", "extend/**"]
-exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**", ".env*"]
-protected = [".env", "runtime/**", "app/storage/cert/**", "app/storage/enc/**"]
+include = ["src/**", "public/**", "config/**"]
+exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**"]
+protected = [".env", "runtime/**", "storage/cert/**"]
 
-[projects.official.remotes.dev]
-remote_root = "/www/dev/www.bt.cn"
-post_commands = ["cd /www/dev/www.bt.cn && php think clear"]
-health_urls = ["https://dev.example.com/health"]
+[projects.application.remotes.dev]
+remote_root = "/srv/dev/application"
+post_commands = ["cd /srv/dev/application && ./bin/clear-cache"]
+health_urls = ["https://dev.example.invalid/health"]
 
-[projects.official.remotes.prod]
-remote_root = "/www/wwwroot/www.bt.cn"
-post_commands = ["cd /www/wwwroot/www.bt.cn && php think clear"]
-health_urls = ["https://www.bt.cn/api/oauth/jwks"]
+[projects.application.remotes.prod]
+remote_root = "/srv/application"
+post_commands = ["cd /srv/application && ./bin/clear-cache"]
+health_urls = ["https://example.invalid/health"]
 ```
 
-When more than one named remote exists, every command requires an explicit
-`--remote NAME`. This fail-closed behavior prevents an omitted option from
-silently choosing production. You can set top-level `default_remote = "dev"`
-when an intentional default is preferable. `remote_root`, `post_commands`, and
-`health_urls` inherit their project-level values when an environment does not
-override them. Deployment history and rollback backups are isolated by project
-and remote.
+- 未配置 `default_remote` 且存在多个 remote 时，所有命令必须显式传 `--remote`。
+- 建议默认指向 `dev`，不要默认指向生产。
+- `remote_root`、`post_commands`、`health_urls` 未覆盖时继承项目级配置。
+- remote 层的 `build` 和 `artifacts` 是整体替换，不进行深合并。
+- 相同 canonical protocol/host/port/project/root 的 alias 共享 target、state 和 lock；不同目标隔离。
+- 显式 `target_id` 不能跨不同 physical payload 复用。
 
-v0.2 的 target identity、旧历史迁移、bootstrap、policy migration 和 recover
-流程见 [状态运维指南](docs/v0.2-state-operations.md)；Host/Docker 构建、
-1Password 注入、remote override 和 artifact 信任边界见
-[构建产物与秘密安全指南](docs/v0.2-build-artifacts.md)。
+### 项目字段
 
-For 1Password SSH Agent, use a public `IdentityFile` in `~/.ssh/config`:
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `repository` | 路径 | Git 仓库；相对配置目录解析 |
+| `remote_root` | POSIX 绝对路径 | 项目远端根目录 |
+| `include` | glob 数组 | 纳入管理的路径 |
+| `exclude` | glob 数组 | 从受管集合排除的路径 |
+| `protected` | glob 数组 | 禁止部署或删除的敏感路径 |
+| `post_commands` | 字符串数组 | 文件变更后的远端命令 |
+| `health_urls` | URL 数组 | 部署后的健康检查 |
+| `local_state_dir` | 路径 | 可选的本地 state 基目录 |
+| `target_id` | 字符串 | 可选的稳定 physical target ID |
+| `build` | table | Host/Docker 构建配置 |
+| `artifacts` | table 数组 | artifact source→destination 映射 |
+| `remotes.NAME` | table | 指定环境的项目覆盖 |
+
+### Host 构建产物
+
+```toml
+[projects.application.build]
+runner = "host"
+commands = [
+  ["npm", "ci", "--offline"],
+  ["npm", "run", "build"],
+]
+timeout = 600
+cwd = "."
+env_allowlist = ["NODE_ENV"]
+
+[[projects.application.artifacts]]
+source = "dist"
+destination = "public/dist"
+kind = "tree"
+```
+
+`kind` 支持 `file` / `tree`。Host runner 不经过 shell，但拥有当前用户可访问的 filesystem/network 权限；隔离 worktree 不是操作系统沙箱。
+
+### Docker 与 1Password 构建
+
+```toml
+[projects.application.remotes.prod.build]
+runner = "docker"
+commands = [
+  ["composer", "install", "--no-dev", "--classmap-authoritative", "--no-interaction"],
+]
+timeout = 900
+env_allowlist = ["COMPOSER_AUTH"]
+
+[projects.application.remotes.prod.build.docker]
+image = "composer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+platform = "linux/amd64"
+network = "none"
+pull_policy = "never"
+
+[projects.application.remotes.prod.build.onepassword.env]
+COMPOSER_AUTH = "op://build/composer/auth"
+
+[[projects.application.remotes.prod.artifacts]]
+source = "vendor"
+destination = "vendor"
+kind = "tree"
+```
+
+请替换示例 digest 和 `op://` URI。规则如下：
+
+- `runner` 只支持 `host` / `docker`；Docker 不可用时不会回退 Host。
+- `network` 支持 `none` / `bridge`；`pull_policy` 支持 `never` / `missing`。
+- 建议配置不可变 image digest，解析后的 image ID 会进入 build fingerprint。
+- 1Password 变量名必须同时出现在 `env_allowlist`，且不能以 `OP_` 开头。
+- 工具使用固定 `op run --`，不使用 `op read`、`op inject` 或 `--no-masking`。
+- 启用 1Password 后绕过 artifact cache，secret rotation 会重新构建。
+- Docker daemon 管理员可读取存活容器环境变量；Docker secret build 必须信任本地 daemon。
+- git-deploy 不扫描 artifact 内容，不能阻止构建脚本把秘密写入产物，不提供 DLP 保证。
+
+### 1Password SSH Agent
 
 ```sshconfig
-Host bt-official-prod
+Host application-prod
     HostName 192.0.2.10
     User deploy
-    IdentityFile ~/.ssh/1password/bt-official-prod.pub
+    IdentityFile ~/.ssh/1password/application-prod.pub
     IdentitiesOnly yes
 ```
 
-The corresponding private key remains in the agent. The tool matches the
-public-key fingerprint to one agent key instead of trying every loaded key.
+```toml
+[remotes.prod]
+protocol = "sftp"
+host = "192.0.2.10"
+ssh_host_alias = "application-prod"
+ssh_config_file = "~/.ssh/config"
+strict_host_key_checking = true
+```
 
-## Usage
+私钥保留在 Agent 中；TOML 中的规范 host 用于 target identity，alias 用于连接配置。
+
+## Revision 选择规则
+
+| 写法 | 含义 |
+|---|---|
+| `COMMIT` | 选择该提交相对 first parent 的变化；根提交相对空 tree |
+| `FROM..TO` | 选择 FROM 之后到 TO 为止的 first-parent 提交 |
+| `COMMIT_1 COMMIT_3` | 组合多个非连续提交 |
+| `COMMIT_1 RANGE COMMIT_9` | 混合提交与连续范围 |
+| `COMMIT..HEAD` | 从某提交之后一直部署到当前最新提交 |
+
+- selector 会去重并按 Git 历史顺序应用，而不是命令行顺序。
+- 所有 selector 必须属于同一 first-parent 历史；merge commit 按 first parent 解释。
+- 最老 selector 的父提交是 legacy 基线；已有 current state 时以可信 current tree 为基线。
+- 省略提交导致 patch 无法干净应用时，会在连接远端前失败。
+- 旧参数 `--from`、`--to`、`--range` 已移除。
+
+## 完整使用指南
+
+### 1. 预览和只读检查
 
 ```bash
-# Deploy one commit. Its first parent is the expected remote baseline.
-git-deploy deploy official --revisions COMMIT --dry-run
+git-deploy plan application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote dev
 
-# Deploy a continuous range. COMMIT_A is the baseline and is not reapplied.
-git-deploy deploy official --revisions COMMIT_A..COMMIT_B --dry-run
+git-deploy plan application \
+  --revisions COMMIT_A..COMMIT_B \
+  --remote dev \
+  --check-remote
+```
 
-# Combine multiple continuous and non-contiguous selections.
-git-deploy deploy official --revisions COMMIT_1 COMMIT_3 COMMIT_5..COMMIT_8 --dry-run
+普通 plan 只读 Git 和本地 state；`--check-remote` 才建立只读远端连接。
 
-# Equivalent dedicated preview command.
-git-deploy plan official --revisions COMMIT_A..COMMIT_B
+### 2. 建立可信 state
 
-# Read-only remote drift check; still performs no writes.
-git-deploy deploy official --revisions COMMIT_A..COMMIT_B \
+远端已与某个已知提交一致：
+
+```bash
+git-deploy state bootstrap application \
+  --revision CURRENT_COMMIT \
+  --remote prod \
+  --dry-run
+
+git-deploy state bootstrap application \
+  --revision CURRENT_COMMIT \
+  --remote prod \
+  --yes
+```
+
+所有受管 source/artifact destination 都确定为空：
+
+```bash
+git-deploy state bootstrap application --empty --remote dev --dry-run
+git-deploy state bootstrap application --empty --remote dev --yes
+```
+
+bootstrap 执行只读验证远端并写本地 generation 1，不修改远端。`--empty` 仍会验证受管路径不存在。artifact 部署必须先有可信 state。
+
+### 3. Dry-run 与正式部署
+
+```bash
+git-deploy deploy application \
+  --revisions CURRENT_COMMIT..TARGET_COMMIT \
+  --remote prod \
+  --dry-run
+
+git-deploy deploy application \
+  --revisions CURRENT_COMMIT..TARGET_COMMIT \
+  --remote prod \
+  --yes
+```
+
+普通 dry-run 不创建 worktree、不构建、不调用 Docker/op、不写 state、不连接远端。`--dry-run --check-remote` 增加只读远端验证。不传 `--yes` 时会交互确认。
+
+### 4. 单独构建 artifact
+
+```bash
+git-deploy build application \
+  --revisions TARGET_COMMIT \
+  --remote prod
+```
+
+`build` 写本地隔离 worktree/cache，不连接部署远端。
+
+### 5. 多项目部署
+
+```bash
+git-deploy deploy all \
+  --revisions HEAD~1..HEAD \
+  --remote dev \
+  --dry-run
+```
+
+`all` 对每个仓库独立解析同一 selector。不同项目需要不同 revision 时应分别运行。`rollback all` / `verify all` 使用 `--latest`。
+
+### 6. 历史、验证与回滚
+
+```bash
+git-deploy history application --remote prod --limit 20
+
+git-deploy verify application \
+  --deployment DEPLOYMENT_ID \
+  --remote prod
+
+git-deploy rollback application \
+  --latest \
+  --remote prod \
   --dry-run --check-remote
 
-# Apply a deployment.
-git-deploy deploy official --revisions COMMIT_A..COMMIT_B --remote prod --yes
-
-# Deploy the same project to development instead.
-git-deploy deploy official --revisions COMMIT_A..COMMIT_B --remote dev --yes
-
-# Build configured artifacts locally without connecting to the remote.
-git-deploy build official --revisions COMMIT_B --remote prod
-
-# Inspect and verify the selected physical target state.
-git-deploy state inspect official --remote prod
-git-deploy state verify official --remote prod
-
-# Show local deployment history and restore the latest successful deployment.
-git-deploy history official --remote prod
-git-deploy verify official --deployment DEPLOYMENT_ID --remote prod
-git-deploy rollback official --latest --remote prod --dry-run
-git-deploy rollback official --latest --remote prod --yes
+git-deploy rollback application \
+  --latest \
+  --remote prod \
+  --yes
 ```
 
-`--revisions` uses these rules:
+`--deployment` 接受完整 ID 或唯一前缀。v0.2 stateful 路径只允许回滚最新成功 deployment；非最新回滚会在连接远端前拒绝。回滚恢复文件 bytes/mode 和 state，不回滚数据库或其他外部副作用。
 
-- `COMMIT` selects that commit's change against its first parent.
-- `FROM..TO` selects first-parent commits after `FROM` through `TO`.
-- Multiple selectors are deduplicated and applied in Git history order, not
-  command-line order.
-- All selections must belong to one first-parent history. A merge commit is
-  interpreted against its first parent.
-- The parent of the oldest selected commit is the expected remote baseline.
-- If omitted commits make a selected patch impossible to apply cleanly,
-  planning fails before any remote connection.
-
-`all` still selects every configured project. The same selectors are resolved
-independently in each repository, so symbolic expressions are convenient when
-their histories differ:
+### 7. State 检查与恢复
 
 ```bash
-git-deploy deploy all --revisions HEAD~1..HEAD --dry-run
+git-deploy state inspect application --remote prod
+git-deploy state verify application --remote prod
+git-deploy state verify application --remote prod --check-remote
+
+git-deploy state recover application --remote prod
+git-deploy state recover application --remote prod --execute --yes
 ```
 
-Run separate commands when projects require different revision selections.
-The former `--from`, `--to`, and `--range` options are intentionally removed.
+`inspect` 和默认 `state verify` 纯本地只读。recover 默认显示决策；`--execute --yes` 才执行可证明安全的恢复。第三种远端内容进入人工恢复状态，不会被覆盖。
 
-`--deployment` is the local deployment record ID printed after a successful
-deployment. A unique prefix is accepted. `--latest` selects the newest record
-whose status is still `succeeded`; `rollback all` therefore requires
-`--latest` rather than one shared deployment ID.
+### 8. 历史与 policy 迁移
 
-## Safety model
+```bash
+# legacy history：plan → staging → publish
+git-deploy state migrate application --remote dev
+git-deploy state migrate application --remote dev --stage
+git-deploy state migrate application --remote dev --yes
 
-- Target bytes are read from a real or locally composed Git snapshot, never
-  from the working tree.
-- Non-contiguous selections are replayed in an isolated temporary Git index
-  and object directory; the working tree, current branch, normal Git index,
-  and repository object database are not modified.
-- Uncommitted working-tree changes are ignored and reported before deployment.
-- Modified and deleted remote files must match the source commit by SHA-256.
-- A delete is idempotent when the remote path is already absent; no `--force` is needed.
-- An upload is idempotent when the remote hash already equals the target commit and is skipped.
-- Added files must be absent remotely unless `--force` is supplied.
-- `.env`, private keys, runtime data, and configured protected paths are blocked.
-- Uploads use temporary names followed by rename; deletes run last.
-- Remote checks, backups, uploads, deletes, verification, and rollback report progress.
-- Rollback restores the exact remote bytes captured before deployment.
-- Rollback is code/file rollback only and does not reverse database migrations.
+# managed policy：plan → read-only verify + local CAS
+git-deploy state policy-migrate application --remote prod
+git-deploy state policy-migrate application --remote prod --execute --yes
+```
+
+历史迁移保留 legacy 证据。policy migration 的远端写调用为 0。
+
+## 命令说明表
+
+### 顶层命令
+
+| 命令 | 用途 | 默认副作用 | 关键参数 |
+|---|---|---|---|
+| `plan TARGETS...` | 生成 revision 计划 | 本地只读；check 时远端只读 | `--revisions`、`--remote`、`--check-remote`、`--force` |
+| `deploy TARGETS...` | 部署 source/artifact | 正式执行写远端和 state | `--revisions`、`--remote`、`--dry-run`、`--check-remote`、`--force`、`--yes` |
+| `build TARGET` | 本地构建 artifact | 写 worktree/cache，不连接远端 | `--revisions`、`--remote` |
+| `history TARGET` | 查看部署历史 | 本地只读 | `--limit`、`--remote` |
+| `verify TARGET` | 比较远端与 deployment record | 远端只读 | `--deployment` / `--latest`、`--remote` |
+| `rollback TARGET` | 恢复部署前快照 | 正式执行写远端和 state | `--deployment` / `--latest`、`--dry-run`、`--check-remote`、`--force`、`--yes` |
+| `state ...` | 管理 expected state | 取决于子命令 | 见下表 |
+
+### State 子命令
+
+| 命令 | 用途 | 远端行为 | 本地写入 |
+|---|---|---|---|
+| `state inspect TARGET` | 显示 target/generation/policy/transaction | 无 | 无 |
+| `state verify TARGET` | 校验 current、CAS、Git tree、policy | 默认无；check 时只读 | 无 |
+| `state bootstrap TARGET` | 创建 generation 1 | `--yes` 时只读验证 | `--yes` 写 state/Git store |
+| `state recover TARGET` | 显示或执行 transaction 恢复 | execute 可能读写远端 | execute 更新 journal/state |
+| `state migrate TARGET` | 迁移 legacy/named-remote 历史 | 无 | stage/yes 写本地历史 |
+| `state policy-migrate TARGET` | 迁移 managed policy | execute 时远端只读 | `--execute --yes` CAS 推进 |
+| `state gc` | v0.2 保留全部对象 | 不支持并返回错误 | 无 |
+
+### 常用参数
+
+| 参数 | 说明 |
+|---|---|
+| `--config PATH` | 指定 TOML；放在子命令之前 |
+| `--version` | 显示版本 |
+| `--remote NAME` | 选择 named remote |
+| `--revisions SELECTOR...` | 一个或多个 commit/range selector |
+| `--dry-run` | 预览，不执行 mutation |
+| `--check-remote` | 增加只读远端核对；deploy/rollback 需与 dry-run 配合 |
+| `--yes` | 跳过 mutation 的交互确认 |
+| `--force` | 允许已确认的 hash drift；不能绕过其他门禁 |
+| `--deployment ID` | 完整 deployment ID 或唯一前缀 |
+| `--latest` | 最新成功 deployment |
+| `--limit N` | history 每项目记录数，默认 20 |
+| `--execute` | 执行 recover/policy migration 计划 |
+| `--stage` | 创建 history migration staging |
+| `--empty` | bootstrap 已验证的空基线 |
+
+### 退出码
+
+| 退出码 | 含义 |
+|---:|---|
+| 0 | 成功 |
+| 1 | 一般预期部署错误 |
+| 2 | 安全策略阻断或 migration conflict |
+| 3 | 远端漂移或验证不一致 |
+| 4 | 配置、路径或 Git revision 输入错误 |
+| 130 | Ctrl-C 中断 |
+
+```bash
+git-deploy deploy --help
+git-deploy state bootstrap --help
+```
+
+## 打包和发布
+
+### 1. 发布门禁
+
+```bash
+uv lock --check
+uv run pytest -q
+uvx ruff check src tests
+uvx ty check src
+uv build --clear
+```
+
+当前 v0.2.0 GA 基线为 261 个自动测试，包含 Host、真实本地 Docker scratch image 和 fake 1Password contract 门禁。
+
+### 2. 更新版本
+
+同步修改 `pyproject.toml` 的 `project.version` 和 `src/git_deploy/__init__.py` 的 `__version__`，再由工具更新 lock：
+
+```bash
+uv lock
+```
+
+禁止手工编辑 `uv.lock`。
+
+### 3. 构建、校验与隔离安装
+
+```bash
+uv build --clear
+
+sha256sum \
+  dist/git_deploy-0.2.0-py3-none-any.whl \
+  dist/git_deploy-0.2.0.tar.gz \
+  > dist/SHA256SUMS
+
+uv venv --clear tmp/release-smoke
+uv pip install \
+  --python tmp/release-smoke/bin/python \
+  dist/git_deploy-0.2.0-py3-none-any.whl
+
+tmp/release-smoke/bin/git-deploy --version
+tmp/release-smoke/bin/git-deploy --help
+```
+
+继续用隔离配置验证 named remote、单/组合 revision 和 Host/Docker/1Password dry-run；fake Docker/op 调用必须为 0。
+
+### 4. 提交、Tag 与 GitHub Release
+
+```bash
+git add README.md pyproject.toml uv.lock src tests docs git-deploy.example.toml
+git commit -m "release v0.2.0"
+git push
+
+git tag -a v0.2.0 -m "git-deploy v0.2.0"
+git push origin v0.2.0
+
+gh release create v0.2.0 \
+  dist/git_deploy-0.2.0-py3-none-any.whl \
+  dist/git_deploy-0.2.0.tar.gz \
+  dist/SHA256SUMS \
+  --verify-tag \
+  --title "git-deploy v0.2.0" \
+  --notes-file /path/to/release-notes.md
+```
+
+仓库当前通过 GitHub Release 分发 wheel/sdist，尚未配置 PyPI 自动发布。未来接入 PyPI 时应使用 trusted publishing 或受保护的 registry credential，不能把 token 写入仓库、命令历史或文档。
+
+## 安全模型
+
+- 部署 bytes 来自真实或本地合成 Git tree，不读取工作区文件。
+- 非连续 selector 使用隔离 Git index/object directory，不修改正常 index、分支或仓库 objects。
+- 未提交工作区变化被忽略并在输出中提示。
+- 修改/删除前必须匹配可信 hash，upload 后再次验证。
+- 已达到目标 hash 的上传和已不存在的删除按幂等 no-op 处理。
+- `.env`、私钥、证书、runtime 及 `protected` 路径被阻断。
+- source/artifact owner 冲突在连接远端前拒绝。
+- artifact collector 拒绝绝对路径、`..`、symlink、submodule、FIFO、socket 和 device。
+- 上传使用临时文件再 rename，删除最后执行；事务阶段写入 durable journal。
+- source/artifact 任一步失败时恢复 before bytes 和 before state。
+- `--force` 只处理明确漂移，不能绕过 identity、policy、integrity 或 transaction 门禁。
+- Host runner 具有当前用户权限；Docker daemon 管理员可读取存活容器环境变量。
+- 1Password reference、认证 token 和解析值不会写入 fingerprint、manifest、state 或日志。
+- 回滚不处理数据库、消息、支付或其他外部系统副作用。
+- v0.2 不删除 state/CAS/Git 对象；引用可达性 GC 和非最新回滚计划在 v0.3 实现。
+
+## 深入文档
+
+- [v0.2 状态、目标与迁移运维](docs/v0.2-state-operations.md)
+- [v0.2 构建产物与秘密安全](docs/v0.2-build-artifacts.md)
+- [v0.2 北极星设计](docs/planning/2026-07-10-git-deploy-build-artifacts-northstar.md)
+- [v0.2 原子 TODO](docs/planning/2026-07-10-git-deploy-v0.2-state-build-todo.md)
+- [v0.3 TUI 北极星](docs/planning/2026-07-12-git-deploy-v0.3-tui-northstar.md)
