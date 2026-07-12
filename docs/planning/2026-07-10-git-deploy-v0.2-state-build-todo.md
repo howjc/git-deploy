@@ -21,6 +21,9 @@
 - `--force` 只能放行已确认的远端内容漂移，不能绕过 target identity、state hash、generation、锁或 transaction recovery 门禁。
 - v0.2 只承诺单控制端本地排他锁；不得把实现描述为支持跨机器并发部署。
 - 普通 `--dry-run` 只能只读已有状态；不得创建 worktree、构建、连接远端或写 state/CAS/journal/deployment。
+- build runner 默认 `host`，可显式选择 `docker`；Docker 只负责在隔离 worktree 中生成文件产物，不构建/发布镜像，也不改变远端事务语义。
+- Docker 模式不得回退宿主执行；只允许挂载隔离 worktree，不挂载仓库、home、SSH Agent、Docker socket 或 state/CAS，普通 dry-run 不 inspect/pull/run。
+- Docker tag 在真实构建前解析为不可变 image ID；image identity、platform、network、pull policy 和 UID/GID 映射进入 build fingerprint，敏感环境变量值不得进入 argv、日志或状态。
 - state 只表达期望，不能证明远端当前内容；真实 deploy 的重复 patch 必须只读校验相关远端路径后才能返回 `already deployed`。
 - state/CAS/Git objects 默认不自动淘汰；GC 必须按引用可达性工作，dry-run 是默认入口。
 
@@ -28,7 +31,7 @@
 
 | ID | 任务 | 涉及范围 | 完成定义（DoD） | 依赖 | 状态 |
 |----|------|---------|----------------|------|------|
-| T00 | 环境预检：确认 v0.2 自动门禁工具链 | 实施环境、`pyproject.toml` | 记录 `python --version`、`git --version`、`uv --version`、`composer --version`、`node --version`、`npm --version`、`go version`；执行 `uv run pytest -q`、`uvx ruff check src tests`、`uvx ty check src`、`uv build --clear` 全部通过 | — | 待办 |
+| T00 | 环境预检：确认 v0.2 自动门禁工具链 | 实施环境、`pyproject.toml` | 记录 `python --version`、`git --version`、`uv --version`、`composer --version`、`node --version`、`npm --version`、`go version`、`docker --version`；执行 `uv run pytest -q`、`uvx ruff check src tests`、`uvx ty check src`、`uv build --clear` 全部通过 | — | 待办 |
 | S01 | 固化 `target_id` 配置解析契约 | `config.py`、`models.py`、`tests/test_config.py` | `uv run pytest tests/test_config.py -q -k target_id` 通过，覆盖显式值、规范化默认值、非法值；输出中不含 password/token | T00 | 待办 |
 | S02 | 实现非敏感 target/repository/config fingerprint | 新增状态身份模块、`tests/test_target_identity.py` | `uv run pytest tests/test_target_identity.py -q` 通过，断言 host/port/user/remote_root/include 变化会改变相应指纹，password 值变化不会进入或改变身份 payload | S01 | 待办 |
 | S03 | 冻结 immutable state schema v1 | `models.py`、新增 expected-state 模块、`tests/test_expected_state.py` | `uv run pytest tests/test_expected_state.py -q -k schema` 通过，覆盖 canonical JSON、state ID、generation、parent、source tree、transition IDs、file owner/content ref、未知 schema 拒绝 | S02 | 待办 |
@@ -84,16 +87,19 @@
 
 | ID | 任务 | 涉及范围 | 完成定义（DoD） | 依赖 | 状态 |
 |----|------|---------|----------------|------|------|
-| B01 | 固化 build/artifact TOML schema | `config.py`、模型、`tests/test_config.py` | `uv run pytest tests/test_config.py -q -k 'build or artifact'` 通过，覆盖 argv、timeout、cwd、env allowlist、file/tree mapping 和非法路径 | S02 | 待办 |
+| B01 | 固化 host build/artifact TOML schema | `config.py`、模型、`tests/test_config.py` | `uv run pytest tests/test_config.py -q -k 'host_build or artifact'` 通过，覆盖默认/显式 host runner、argv、timeout、cwd、env allowlist、file/tree mapping 和非法路径 | S02 | 待办 |
+| B01D | 固化 Docker build runner 配置契约 | `config.py`、build 模型、`tests/test_config.py` | `uv run pytest tests/test_config.py -q -k docker_build` 通过，覆盖 image、platform、`none/bridge` network、`never/missing` pull policy、默认值和非法 runner；Docker 配置不能注入任意 `docker run` 参数 | B01 | 待办 |
 | B02 | 从真实或持久化合成 tree 物化隔离 worktree | 新增 worktree manager、`tests/test_worktree.py` | `uv run pytest tests/test_worktree.py -q` 通过，current/target tree ID 精确一致，成功/异常/中断后清理，主工作区脏文件不进入 | P02, S06 | 待办 |
-| B03 | 实现受限 BuildRunner | 新增 build runner、`tests/test_build_runner.py` | `uv run pytest tests/test_build_runner.py -q` 通过，覆盖 argv 无 shell、cwd、timeout 终止进程组、env 白名单、敏感值脱敏和非零退出 | B01, B02 | 待办 |
+| B03 | 实现受限 host BuildRunner | 新增 build runner、`tests/test_build_runner.py` | `uv run pytest tests/test_build_runner.py -q -k host` 通过，覆盖 argv 无 shell、cwd、timeout 终止进程组、env 白名单、敏感值脱敏和非零退出 | B01, B02 | 待办 |
+| B03D | 实现 Docker CLI 命令与镜像身份适配器 | 新增 Docker build backend、`tests/test_docker_build_runner.py` | `uv run pytest tests/test_docker_build_runner.py -q -k 'command or image'` 通过；fake Docker 断言 inspect/pull policy、不可变 image ID、固定 worktree mount、UID/GID、platform/network、no-new-privileges，且无 home/repository/SSH Agent/socket/state mount 和任意参数注入 | B01D, B02 | 待办 |
+| B03E | 实现 Docker 构建生命周期与 BuildRunner 接线 | Docker build backend、runner facade、`tests/test_docker_build_runner.py` | `uv run pytest tests/test_docker_build_runner.py -q -k 'lifecycle or env or timeout'` 通过；成功/非零/超时/Ctrl-C 均按 stop/kill/remove 清理，产物归属当前 UID/GID，env 值不进 argv/log；清理失败阻断且远端调用为 0，绝不回退 host | B03, B03D | 待办 |
 | B04 | 实现 artifact collector 安全边界 | 新增 artifact collector、`tests/test_artifacts.py` | `uv run pytest tests/test_artifacts.py -q -k collector` 通过，file/tree、mode/hash/size 正确，绝对路径、`..`、symlink、submodule、FIFO/socket/device 全部拒绝 | B01, B02 | 待办 |
-| B05 | 实现 build fingerprint 与 artifact cache | build cache、CAS、`tests/test_build_cache.py` | `uv run pytest tests/test_build_cache.py -q` 通过，tree/config/lock/tool/platform 任一变化 miss，完全相同 hit；环境值不进 fingerprint/log | B03, B04, S05 | 待办 |
+| B05 | 实现 build fingerprint 与 artifact cache | build cache、CAS、`tests/test_build_cache.py` | `uv run pytest tests/test_build_cache.py -q` 通过，tree/config/lock/tool/runner 任一变化 miss；Docker tag 解析后的 image ID、platform、network、pull policy、UID/GID 任一变化 miss，完全相同 hit；环境值不进 fingerprint/log | B03E, B04, S05 | 待办 |
 | B06 | 以 current artifact manifest 生成 target artifact 差量 | artifact planner、state schema、`tests/test_artifact_planner.py` | `uv run pytest tests/test_artifact_planner.py -q` 通过，新增、修改、删除、mode、首次 baseline build/bootstrap 和缺失基线阻断均覆盖 | B05, S08 | 待办 |
 | B07 | 合并 source/artifact 计划并执行 owner 冲突门禁 | combined planner、`tests/test_combined_planner.py` | `uv run pytest tests/test_combined_planner.py -q` 通过，统一 current/target file state；source/artifact、artifact/artifact 目标路径冲突在远端连接前失败 | P05, B06 | 待办 |
 | B08 | 把目标内容读取改为逐文件 provider/spool | planner/executor/content provider、`tests/test_streaming.py` | `uv run pytest tests/test_streaming.py -q` 通过，以大文件和多文件 fixture 断言不会预加载全部 target bytes，临时 spool 在成功/失败后清理 | B07 | 待办 |
 | B09 | 将 source/artifact 纳入同一远端事务与 state 迁移 | executor、rollback、`tests/test_combined_transaction.py` | `uv run pytest tests/test_combined_transaction.py -q` 通过，任一 source/artifact 上传、删除、hook、verify 失败都恢复统一 before bytes 与 before state | B08, D09, R01 | 待办 |
-| B10 | 增加显式本地 build 验证入口并保持 dry-run 边界 | CLI、README、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'build_command or build_dry_run'` 通过；build 可写本地 cache 但不连接远端，普通 deploy dry-run 不构建/不写状态 | B05, B09 | 待办 |
+| B10 | 增加显式本地 build 验证入口并保持 dry-run 边界 | CLI、README、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'build_command or build_dry_run'` 通过；build 可写本地 cache 但不连接远端；host/docker 普通 deploy dry-run 均不创建 worktree、不 inspect/pull/run、不写状态 | B05, B09 | 待办 |
 
 ## F. 状态对象回收
 
@@ -108,24 +114,27 @@
 | ID | 任务 | 涉及范围 | 完成定义（DoD） | 依赖 | 状态 |
 |----|------|---------|----------------|------|------|
 | I01 | 验证 `all` 的 target/state/lock/build 隔离 | CLI、多项目 fixture、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k all_state_isolation` 通过，一个项目失败不改变另一个项目的 current、CAS、journal 或远端 fixture | B10, S09 | 待办 |
-| I02 | 增加 official-v2 Composer 构建 fixture 与样例配置 | `deploy.example.toml`、测试 fixture、`tests/test_official_v2_build.py` | `uv run pytest tests/test_official_v2_build.py -q` 通过，锁定依赖 fixture 覆盖 `vendor/` 新增、修改、删除、漂移、no-op、失败恢复和回滚 | B10 | 待办 |
+| I02 | 增加 official-v2 Docker Composer 构建 fixture 与样例配置 | `deploy.example.toml`、fake Docker fixture、`tests/test_official_v2_build.py` | `uv run pytest tests/test_official_v2_build.py -q` 通过，digest 固定的 Docker Composer 配置与确定性 fake CLI 覆盖 `vendor/` 新增、修改、删除、漂移、no-op、失败恢复和回滚；自动测试不连接 registry/daemon | B10 | 待办 |
 | I03 | 完成 FTP/FTPS/SFTP fake transport 端到端矩阵 | transport integration tests | `uv run pytest tests/test_transport.py tests/test_combined_transaction.py -q` 通过，三协议不访问真实服务器且断言相同 state/rollback 语义 | B09 | 待办 |
 | I04 | 编写 v0.1.5 状态迁移、bootstrap、inspect、verify、recover、gc 操作文档 | `README.md`、规划/迁移文档、CLI help snapshot | `uv run pytest tests/test_cli.py -q -k help` 通过；文档包含首次部署、状态丢失、配置身份变化、未完成事务、GC dry-run 和禁止常态化 `--force` 的命令流程 | B10, C01, C02, C03, C04, C05, C06 | 待办 |
-| I05 | 执行 v0.2 完整发布门禁 | 全项目、package metadata、`uv.lock` | `uv run pytest -q`、`uvx ruff check src tests`、`uvx ty check src`、`uv build --clear` 全部通过；在 `<项目根>/tmp` 隔离 `uv tool install` 后版本/help/单提交/组合提交 dry-run smoke 通过 | I01, I02, I03, I04 | 待办 |
+| I05 | 执行 v0.2 完整发布门禁 | 全项目、package metadata、`uv.lock` | `uv run pytest -q`、`uvx ruff check src tests`、`uvx ty check src`、`uv build --clear` 全部通过；在 `<项目根>/tmp` 隔离 `uv tool install` 后版本/help/单提交/组合提交及 Docker 配置 dry-run smoke 通过，断言 dry-run 的 fake Docker 调用为 0 | I01, I02, I03, I04 | 待办 |
 | U01 | 真实 FTP/FTPS 隔离目录人工增强验证 | 用户提供的非生产测试目录和最小权限账号 | **由用户代验**：先 dry-run，再只读 remote check，再部署 fixture、重复 no-op、回滚；记录文件哈希和清理结果，不记录密码；未执行不阻塞 I05 自动主线 | I05 | 待办 |
+| U02 | 真实 Docker daemon 隔离构建人工增强验证 | 本地/CI Docker daemon、预置 digest 镜像、临时仓库 | **由用户代验**：使用非生产临时仓库和预置 digest 镜像运行 host/docker 等价 fixture，验证 UID/GID、network none/bridge、超时/中断清理及 artifact hash；不挂载凭据、不连接远端，未执行不阻塞 I05 自动主线 | I05 | 待办 |
 
 ## 完成门禁
 
 - [x] 每条 TODO 都有可执行或可观察的 DoD。
-- [x] 清单含 T00 环境预检，并覆盖 Python、Git、uv、Composer、Node/npm、Go 和发布命令。
+- [x] 清单含 T00 环境预检，并覆盖 Python、Git、uv、Composer、Node/npm、Go、Docker 和发布命令。
 - [x] 已声明北极星依据与 v0.1.5 当前边界。
 - [x] 已包含验证纪律、受阻留言、禁止绕过、熔断、状态同步和用户代验约定。
 - [x] 真实远端联调与 fake transport 自动主线分离，且明确敏感配置不得进入日志/文档/对话。
 - [x] 各任务以单一产出为主，依赖显式且无循环依赖。
 - [x] 状态基线任务位于构建产物任务之前。
+- [x] Docker runner 已拆分配置、命令/镜像身份、生命周期接线、fingerprint、dry-run 和真实 daemon 人工增强，且依赖无环。
 
 ## 变更记录
 
 | 日期 | 变更内容 | 原因 |
 |---|---|---|
 | 2026-07-10 | 首版：整合 current snapshot、revision patch 幂等、事务恢复与构建产物任务 | 解决重复选择性部署不能继续以 Git 父提交作为远端基线的问题 |
+| 2026-07-12 | 将 Docker 构建沙箱拆入 B01D/B03D/B03E，并扩展 B05/B10/I02/I05/U02 | 用户要求构建产物阶段可选择在 Docker 中执行，同时保持 dry-run、凭据和远端事务边界 |

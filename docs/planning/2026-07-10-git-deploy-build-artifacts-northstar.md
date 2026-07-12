@@ -7,7 +7,7 @@
 
 为每一个“部署目标”（服务器身份 + 项目 + `remote_root`）维护一份不可变的期望远端状态快照和一个原子 current pointer。后续 `--revisions` 不再把所选最早提交的父提交当作远端真实基线，而是把选中的 first-parent patch 应用到 current snapshot 的持久化源码 tree；远端漂移检查比较“远端实际内容”与“current snapshot 期望内容”，部署或回滚成功后再原子推进状态指针。
 
-在该状态模型上，为目标 tree 物化隔离的 detached Git worktree，执行受配置约束的本地构建，收集 Git 未跟踪的生成产物，并将“源码差量 + 构建产物差量 + 期望状态迁移”作为一个可校验、可备份、可回滚、可恢复的部署事务。连续范围的目标 tree 通常来自真实 commit；不连续选择和历史回滚后的目标 tree 可能只存在于工具自己的持久化 object store，不能假设它有仓库中的真实 commit ID。
+在该状态模型上，为目标 tree 物化隔离的 detached Git worktree，通过宿主进程或受约束的 Docker 容器执行本地构建，收集 Git 未跟踪的生成产物，并将“源码差量 + 构建产物差量 + 期望状态迁移”作为一个可校验、可备份、可回滚、可恢复的部署事务。连续范围的目标 tree 通常来自真实 commit；不连续选择和历史回滚后的目标 tree 可能只存在于工具自己的持久化 object store，不能假设它有仓库中的真实 commit ID。
 
 目标完成后，以下场景应成为一等能力：
 
@@ -18,6 +18,7 @@
 - PHP/Composer：在目标提交中执行 `composer install --no-dev`，部署生成的 `vendor/`。
 - Node/Vite：在目标提交中执行 `npm ci && npm run build`，部署生成的 `dist/`。
 - Go：在目标提交中执行 `go build`，部署生成的 Linux 二进制。
+- Docker 构建沙箱：项目可显式选择固定镜像，在只挂载隔离 worktree 的容器中执行同一组构建命令；git-deploy 仍只部署文件产物，不构建、发布或部署容器镜像。
 - 混合项目：同一次部署中既发布 Git 跟踪源码，也发布一个或多个构建产物目录或文件。
 - FTP/FTPS/SFTP：构建始终在本地隔离工作区执行，远端只接收最终文件；FTP 不依赖远程 shell。
 
@@ -80,7 +81,9 @@ v0.1.5 的部署链路是：
 
 ### 4. 构建与远端部署解耦
 
-- Composer、npm、Go 等命令只在本机临时 worktree 内执行。
+- Composer、npm、Go 等命令只以本机临时 worktree 为源码输入；执行后端可以是宿主进程或显式配置的 Docker 容器。
+- Docker 只是本地构建执行后端，不改变 artifact manifest、远端传输、事务、回滚或状态语义；远端服务器不需要 Docker。
+- Docker 后端只把 worktree 挂载为容器工作区，容器生成的文件必须回写该 worktree 后再由统一 artifact collector 收集。
 - FTP/FTPS/SFTP 只负责远端读写，不在 FTP 上模拟远程命令。
 - SFTP 的 `post_commands` 仍是部署后操作，不承担生成构建产物的职责。
 - 构建失败发生在任何远端写入之前，不得创建成功部署记录。
@@ -164,11 +167,18 @@ target_id = "official-v2-prod"
 include = ["app/**", "config/**", "public/**", "route/**", "view/**"]
 
 [projects.official-v2.build]
+runner = "docker"
 commands = [
   ["composer", "install", "--no-dev", "--classmap-authoritative", "--no-interaction"],
 ]
 timeout = 900
 env_allowlist = ["COMPOSER_AUTH"]
+
+[projects.official-v2.build.docker]
+image = "composer@sha256:<immutable-digest>"
+platform = "linux/amd64"
+network = "bridge"
+pull_policy = "missing"
 
 [[projects.official-v2.artifacts]]
 source = "vendor"
@@ -183,6 +193,10 @@ kind = "tree"
 - 命令优先使用 argv 数组，不默认经过 shell 解释。
 - 确需 shell 管道或变量展开时必须显式启用，并在 plan 中标明。
 - `env_allowlist` 只声明允许继承的变量名；变量值不得进入日志、manifest 或部署历史。
+- `runner` 只允许 `host`（默认）或 `docker`；选择 `docker` 时必须配置 image，宿主执行模式不得静默回退。
+- Docker image 可写 tag 或 digest，但真实构建前必须解析出本地不可变 image ID；构建指纹记录 image ID，tag 指向变化必须 cache miss。生产样例优先使用 digest。
+- Docker `platform`、`network`（首版仅 `none`/`bridge`）和 `pull_policy`（`never`/`missing`）必须显式进入配置契约；默认 `network=none`、`pull_policy=never`，避免普通构建隐式联网或拉取镜像。
+- `pull_policy=missing` 只允许显式 build/deploy 在远端 mutation 前拉取缺失镜像；普通 plan/dry-run 不得执行 `docker inspect`、`docker pull` 或 `docker run`。
 - artifact `source` 必须是 worktree 相对路径，禁止绝对路径、`..`、symlink 逃逸。
 - artifact `destination` 必须位于项目 `remote_root` 下。
 - `kind=file` 与 `kind=tree` 均需支持。
@@ -200,7 +214,8 @@ kind = "tree"
 | `TargetLock` | 对同一 `target_id` 提供进程级排他锁和 generation compare-and-swap；明确不宣称跨机器分布式锁 |
 | `StateGarbageCollector` | 从受保护引用集合计算可达 state/CAS/Git objects；默认只预览，不删除 current、事务证据或可回滚数据 |
 | `WorktreeManager` | 从真实 commit 或合成 target tree 物化 detached worktree、校验 tree ID、处理并发锁、捕获中断并可靠清理 |
-| `BuildRunner` | 在 worktree 根目录执行 argv 命令、控制 timeout、环境变量白名单、日志脱敏和退出码 |
+| `BuildRunner` | 统一宿主/Docker 后端，在 worktree 根目录执行 argv 命令、控制 timeout、环境变量白名单、日志脱敏和退出码 |
+| `DockerBuildBackend` | 解析不可变 image identity，构造受限 `docker run`，管理 pull/stop/kill/remove 生命周期，并保证产物归属当前用户 |
 | `ArtifactCollector` | 校验 artifact 边界，拒绝 symlink/submodule/特殊文件，生成文件级 manifest |
 | `BuildCache` | 以 source tree + build fingerprint 缓存 manifest；缓存只用于优化，不改变正确性 |
 | `CombinedPlanner` | 合并 current/target source diff 与 artifact diff，检测 owner/路径冲突并生成统一操作序列 |
@@ -213,6 +228,7 @@ build fingerprint 至少覆盖：
 
 - 完整 baseline/target tree ID，以及原始 revision selectors 和解析后的提交序列。
 - 构建命令 argv、工作目录、timeout 配置。
+- 构建 runner；Docker 模式还覆盖解析后的 image ID、平台、网络、pull policy 和影响容器文件权限的用户映射。
 - artifact source/destination/kind 配置。
 - 允许继承的环境变量名称，不记录敏感值。
 - 影响依赖解析的 lock 文件内容哈希，例如 `composer.lock`、`package-lock.json`、`uv.lock`、`go.sum`。
@@ -248,6 +264,10 @@ build fingerprint 至少覆盖：
 - worktree 和 artifact cache 权限默认仅当前用户可读写。
 - 拒绝 artifact 中的 symlink、socket、device、FIFO 和路径穿越。
 - 每项目设置构建超时；超时必须终止完整进程组并清理 worktree。
+- Docker 后端不得挂载宿主仓库根目录、用户 home、SSH Agent、Docker socket、git-deploy state/CAS 或任意额外路径；唯一业务挂载是隔离 worktree 到固定容器工作区。
+- Docker 容器默认禁用额外 capabilities、启用 `no-new-privileges`，以当前宿主 UID/GID 写产物，并使用隔离 HOME/临时目录；不允许 privileged、host network、host PID/IPC 或用户自定义任意 `docker run` 参数逃逸安全策略。
+- Docker 构建超时或中断必须按 stop/kill/remove 顺序回收已命名容器；清理失败要保留不含敏感值的容器标识并阻断远端写入。
+- Docker daemon 连接所需宿主环境与传给构建容器的 `env_allowlist` 分离；构建环境变量值不得出现在命令行、日志、fingerprint、manifest 或 state。
 - 同一 repository/project 同时只能有一个构建部署事务，防止缓存和 worktree 互相覆盖。
 - 每次 deploy/rollback/state mutation 都必须持有同一 `target_id` 的本地排他锁；检测到未完成 transaction 时只允许 inspect/recover，不允许新部署。
 - state 文件和 object store 默认权限仅当前用户可读写；canonical JSON、content hash 和 generation 在读取时重新验证。
@@ -257,7 +277,8 @@ build fingerprint 至少覆盖：
 
 - 不在生产服务器上执行 Composer、npm、Go 编译。
 - 不自动执行数据库迁移或尝试回滚数据库 schema/data。
-- 不把 Docker image、Kubernetes、容器编排纳入 v0.2。
+- 不构建、签名、推送或部署 Docker image；Docker 仅作为本机 artifact 构建沙箱。
+- 不纳入 Docker Compose、Kubernetes、容器编排、运行时发布或远端 Docker daemon。
 - 不实现通用 CI/CD 平台、审批流或多阶段环境晋级。
 - 不把生产 `.env`、证书、私钥打入构建产物。
 - 不保证第三方包仓库永久可用；离线缓存和私有 registry 属于部署环境配置。
@@ -275,8 +296,8 @@ build fingerprint 至少覆盖：
 | M3 | 基于 current state 的 revision 规划 | `B + D` 后选择 `E`、范围重叠、重复 patch、冲突、状态丢失等 fixture 全部通过 |
 | M4 | 状态化部署、no-op、reconciliation 与漂移检查 | 远端只与 current/target 比较；重复选择经只读远端验证后零写入；远端已达新 target 时只产生可审计状态迁移 |
 | M5 | 回滚与崩溃恢复 | 最新/较旧非重叠回滚同步生成状态；关键崩溃点可恢复或明确进入 `manual_recovery_required` |
-| M6 | 构建配置与隔离 worktree | current/target tree 均可物化；成功、失败、超时、Ctrl-C 后清理；脏工作区不影响结果 |
-| M7 | 本地构建、产物采集与缓存 | Composer/npm/Go fixture 至少覆盖两类；artifact manifest、fingerprint、CAS 和安全边界有测试 |
+| M6 | 构建配置与隔离 worktree | current/target tree 均可物化；host/docker runner 契约冻结；成功、失败、超时、Ctrl-C 后清理；脏工作区不影响结果 |
+| M7 | 本地构建、产物采集与缓存 | Composer/npm/Go fixture 至少覆盖两类且包含 Docker runner；artifact manifest、image identity、fingerprint、CAS 和安全边界有测试 |
 | M8 | 统一差量、流式部署与事务回滚 | source/artifact owner 无冲突；大文件不全量驻留内存；任一步失败恢复 bytes 与 before state |
 | M9 | CLI、迁移、GC 与 official-v2 样例 | state/build/inspect/verify/recover/gc 入口、dry-run 边界、`all` 隔离和 official-v2 Composer fixture 完整 |
 | M10 | 发布门禁 | 单元/集成测试、Ruff、类型检查、uv build、隔离 uv tool install 全部通过；v0.1.5 manifest 可读 |
@@ -323,6 +344,12 @@ build fingerprint 至少覆盖：
 36. `state inspect`、本地完整性 verify、只读 remote verify、显式 bootstrap 和 recover 均有独立 CLI 契约；任何只读命令不得修改远端或状态。
 37. unknown remote state 不支持静默 adopt；状态丢失时只能从已知 Git revision/empty 基线验证后 bootstrap，或由人工恢复流程决策。
 38. `state gc --dry-run` 准确列出不可达对象；确认执行也不得删除 current lineage、未完成 transaction、可回滚 deployment backup/state 或有效 build cache 引用。
+39. `runner=host` 保持宿主 argv 执行语义；`runner=docker` 必须使用配置镜像且缺少 Docker、镜像或 daemon 时在远端连接前失败，不得回退 host。
+40. Docker 容器只挂载隔离 worktree，不能访问宿主仓库、home、SSH Agent、Docker socket、state/CAS 或任意未声明宿主路径。
+41. Docker image tag 在执行前解析为不可变 image ID；image、platform、network、pull policy 或用户映射任一变化都会使 build cache miss。
+42. Docker 容器以宿主 UID/GID 生成可采集产物；成功、非零退出、超时和 Ctrl-C 后容器均被删除，清理失败时远端写调用为 0。
+43. Docker 构建变量仍按 `env_allowlist` 传入且值不出现在 argv、日志、fingerprint、manifest/state；Docker daemon 客户端环境不自动进入容器。
+44. plan/普通 dry-run 只显示 Docker 构建摘要，不 inspect/pull/run；显式 build/deploy 仅按配置 pull policy 在远端 mutation 前解析或拉取镜像。
 
 ## 真实联调边界
 
@@ -358,3 +385,5 @@ build fingerprint 至少覆盖：
 | 2026-07-10 | 重复部署按远端目标状态去重，不按 revision selection 或历史记录去重 | 相同 selectors 可能对应已部署、已回滚、部分部署或人工漂移；只有远端完整达到目标状态才是真正 no-op |
 | 2026-07-10 | no-op 不创建空版本，也不运行 post commands/health | 空 deployment ID 无回滚价值，钩子和健康检查可能产生无必要副作用 |
 | 2026-07-10 | 构建输入以 target tree ID 为准，不假设每个目标都有真实 commit | 不连续 revision selection 会产生合成 tree；构建必须与实际部署源码快照完全一致 |
+| 2026-07-12 | Docker 作为可选本地构建 runner，不作为部署目标 | 隔离 Composer/npm/Go 工具链并提高环境一致性，同时保持 artifact/state/FTP/SFTP 事务模型不变 |
+| 2026-07-12 | Docker 默认不联网、不拉镜像，执行时解析不可变 image ID | 防止 dry-run 或普通构建产生隐式外部副作用，并确保 tag 漂移正确触发 build cache miss |
