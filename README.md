@@ -44,6 +44,8 @@ It never searches parent directories. Relative paths inside the configuration
 are resolved from the directory containing that configuration file.
 Start from `git-deploy.example.toml`; keep the real `deploy.toml` untracked.
 
+For a single remote, the existing `[server]` form remains supported:
+
 ```toml
 [server]
 protocol = "sftp"
@@ -63,6 +65,47 @@ post_commands = [
 ]
 health_urls = ["https://www.bt.cn/api/oauth/jwks"]
 ```
+
+For multiple environments, name each connection under `[remotes.NAME]` and
+put environment-specific project settings under `[projects.NAME.remotes.NAME]`:
+
+```toml
+[remotes.dev]
+protocol = "sftp"
+ssh_host_alias = "bt-official-dev"
+ssh_config_file = "~/.ssh/config"
+strict_host_key_checking = true
+
+[remotes.prod]
+protocol = "sftp"
+ssh_host_alias = "bt-official-prod"
+ssh_config_file = "~/.ssh/config"
+strict_host_key_checking = true
+
+[projects.official]
+repository = "."
+include = ["app/**", "config/**", "public/**", "route/**", "extend/**"]
+exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**", ".env*"]
+protected = [".env", "runtime/**", "app/storage/cert/**", "app/storage/enc/**"]
+
+[projects.official.remotes.dev]
+remote_root = "/www/dev/www.bt.cn"
+post_commands = ["cd /www/dev/www.bt.cn && php think clear"]
+health_urls = ["https://dev.example.com/health"]
+
+[projects.official.remotes.prod]
+remote_root = "/www/wwwroot/www.bt.cn"
+post_commands = ["cd /www/wwwroot/www.bt.cn && php think clear"]
+health_urls = ["https://www.bt.cn/api/oauth/jwks"]
+```
+
+When more than one named remote exists, every command requires an explicit
+`--remote NAME`. This fail-closed behavior prevents an omitted option from
+silently choosing production. You can set top-level `default_remote = "dev"`
+when an intentional default is preferable. `remote_root`, `post_commands`, and
+`health_urls` inherit their project-level values when an environment does not
+override them. Deployment history and rollback backups are isolated by project
+and remote.
 
 For 1Password SSH Agent, use a public `IdentityFile` in `~/.ssh/config`:
 
@@ -97,13 +140,16 @@ git-deploy deploy official --revisions COMMIT_A..COMMIT_B \
   --dry-run --check-remote
 
 # Apply a deployment.
-git-deploy deploy official --revisions COMMIT_A..COMMIT_B --yes
+git-deploy deploy official --revisions COMMIT_A..COMMIT_B --remote prod --yes
+
+# Deploy the same project to development instead.
+git-deploy deploy official --revisions COMMIT_A..COMMIT_B --remote dev --yes
 
 # Show local deployment history and restore the latest successful deployment.
-git-deploy history official
-git-deploy verify official --deployment DEPLOYMENT_ID
-git-deploy rollback official --latest --dry-run
-git-deploy rollback official --latest --yes
+git-deploy history official --remote prod
+git-deploy verify official --deployment DEPLOYMENT_ID --remote prod
+git-deploy rollback official --latest --remote prod --dry-run
+git-deploy rollback official --latest --remote prod --yes
 ```
 
 `--revisions` uses these rules:

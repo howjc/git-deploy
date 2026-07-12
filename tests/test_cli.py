@@ -210,3 +210,50 @@ remote_root = "/srv/demo"
     assert "UPLOAD one.txt" in output
     assert "UPLOAD three.txt" in output
     assert "skipped.txt" not in output
+
+
+def test_cli_selects_a_named_remote_for_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Require and display the named remote used by a local deployment plan."""
+
+    repository = tmp_path / "repo"
+    older, newer = _two_commit_repository(repository, "file.txt")
+    config = tmp_path / "deploy.toml"
+    config.write_text(
+        f"""
+[remotes.dev]
+protocol = "sftp"
+host = "dev.example.invalid"
+
+[remotes.prod]
+protocol = "sftp"
+host = "prod.example.invalid"
+
+[projects.demo]
+repository = "{repository}"
+
+[projects.demo.remotes.dev]
+remote_root = "/srv/dev/demo"
+
+[projects.demo.remotes.prod]
+remote_root = "/srv/prod/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    missing_code = run(["plan", "demo", "--revisions", f"{older}..{newer}"])
+    missing_output = capsys.readouterr()
+    selected_code = run(
+        ["plan", "demo", "--revisions", f"{older}..{newer}", "--remote", "dev"]
+    )
+    selected_output = capsys.readouterr().out
+
+    assert missing_code == 4
+    assert "--remote is required" in missing_output.err
+    assert selected_code == 0
+    assert "Remote: dev" in selected_output
+    assert "UPLOAD file.txt" in selected_output

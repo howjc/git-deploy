@@ -1,4 +1,12 @@
-[server]
+# Name multiple remote environments and select one with --remote dev|prod.
+[remotes.dev]
+protocol = "sftp"
+ssh_host_alias = "development"
+ssh_config_file = "~/.ssh/config"
+strict_host_key_checking = true
+timeout = 15
+
+[remotes.prod]
 protocol = "sftp"
 ssh_host_alias = "production"
 ssh_config_file = "~/.ssh/config"
@@ -7,10 +15,19 @@ timeout = 15
 
 [projects.application]
 repository = "."
-remote_root = "/srv/application"
 include = ["src/**", "public/**", "config/**"]
 exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**"]
 protected = [".env", "runtime/**", "storage/cert/**"]
+
+[projects.application.remotes.dev]
+remote_root = "/srv/dev/application"
+post_commands = [
+  "cd /srv/dev/application && ./bin/clear-cache",
+]
+health_urls = ["https://dev.example.com/health"]
+
+[projects.application.remotes.prod]
+remote_root = "/srv/application"
 post_commands = [
   "cd /srv/application && ./bin/clear-cache",
 ]

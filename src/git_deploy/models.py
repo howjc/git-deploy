@@ -9,9 +9,18 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ServerConfig:
-    """Connection settings shared by configured projects."""
+    """Connection settings for one named remote environment."""
 
     values: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ProjectRemoteConfig:
+    """Optional project policy overrides for one named remote."""
+
+    remote_root: str | None = None
+    post_commands: tuple[str, ...] | None = None
+    health_urls: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,8 @@ class ProjectConfig:
     post_commands: tuple[str, ...] = ()
     health_urls: tuple[str, ...] = ()
     local_state_dir: Path | None = None
+    remote: str = "default"
+    remotes: dict[str, ProjectRemoteConfig] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -34,8 +45,9 @@ class AppConfig:
     """Fully resolved deployment configuration and its source path."""
 
     path: Path
-    server: ServerConfig
+    remotes: dict[str, ServerConfig]
     projects: dict[str, ProjectConfig]
+    default_remote: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +119,7 @@ class DeploymentManifest:
     snapshots: list[FileSnapshot] = field(default_factory=list)
     error: str | None = None
     revision_specs: list[str] = field(default_factory=list)
+    remote: str = "default"
 
     def to_dict(self) -> dict[str, Any]:
         """Return the complete manifest as JSON-compatible primitives."""

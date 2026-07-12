@@ -21,7 +21,9 @@ class DeploymentStore:
         """
 
         self.project = project
-        self.root = project.local_state_dir or _default_state_root(project.name)
+        base = project.local_state_dir or _default_state_root(project.name)
+        # Named remotes must never share deployment history or rollback backups.
+        self.root = base if project.remote == "default" else base / "remotes" / project.remote
 
     def deployment_dir(self, deployment_id: str) -> Path:
         """Return a validated deployment record directory.
