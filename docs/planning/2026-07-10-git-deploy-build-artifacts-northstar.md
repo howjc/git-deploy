@@ -67,8 +67,9 @@ v0.1.5 的部署链路是：
 
 ### 1. current snapshot 是唯一远端基线
 
-- 每个部署目标必须有稳定 `target_id`；它只覆盖规范化协议端点、项目和远端根目录等物理身份字段，不得包含 remote alias、密码、私钥、token、build 或 secret 配置。
-- named remote 是配置选择入口，不是物理目标身份。同一 endpoint/project/remote_root 即使通过两个 alias 访问，也必须共享 `target_id`、state 和锁；不同 endpoint 或 remote_root 必须隔离。alias 重命名本身不创建新目标。
+- 每个部署目标必须有稳定 `target_id`；默认 canonical payload 固定为规范化 protocol、host、effective port、project key 和 `remote_root`。protocol 小写，DNS host 小写并移除末尾点，IP 使用规范文本，省略端口时填入协议默认端口，`remote_root` 使用无 `.`/`..`/重复分隔符且保留 `/` 的规范 POSIX 形式。
+- remote alias、username、密码、私钥、token、build 和 secret 配置均不进入默认 physical identity。username 是访问主体而不是物理目标；更换账号仍访问同一 canonical endpoint/root 时共享 state/lock，但每次连接仍按当前账号执行权限检查。不同 protocol、host、effective port 或 remote root 默认隔离；跨协议实际映射到同一目录也不得自动合并。
+- named remote 是配置选择入口，不是物理目标身份。同一 canonical endpoint/project/remote_root 即使通过两个 alias 或不同 username 访问，也必须共享 `target_id`、state 和锁；alias 重命名本身不创建新目标。显式 `target_id` 只能为相同 canonical payload 提供稳定名称，不能强制合并两个不同 payload。
 - current snapshot 不可变，至少记录 schema version、state ID、generation、parent state ID、source tree ID、已应用 transition IDs、受管文件条目、artifact provenance、创建它的 deployment ID 和配置指纹。
 - 受管文件条目至少记录远端相对路径、owner、存在性、SHA-256、字节数、可执行位和可解析 content reference。
 - 普通部署只能通过 compare-and-swap 从读取到的 generation 推进 current pointer；并发或状态身份不匹配必须在远端写入前阻断。
@@ -109,7 +110,7 @@ v0.1.5 的部署链路是：
 - 每次构建生成 artifact manifest，至少记录相对路径、SHA-256、字节数、可执行位、来源 tree、revision selectors 和 build fingerprint。
 - target artifact manifest 决定上传后的目标状态。
 - current snapshot 中的 artifact manifest 决定远端预期基线和产物删除集合；常规后续部署不得重新猜测或重建“FROM 状态”。
-- 第一次没有 artifact 状态时，可在独立 worktree 中构建推断出的源码基线，或要求显式 artifact bootstrap；两种路径都必须在远端写入前明确显示。
+- 第一次没有 artifact 状态时，只能在独立 worktree 中从已知 source revision 构建 baseline，或在用户显式声明 empty 且只读验证全部 artifact destination 不存在后建立空 baseline；两种路径都必须在远端写入前明确显示。不得把来源未知的远端 artifact bytes 采纳为 current。
 - 不允许仅构建 target 后凭远端目录列表猜测删除项。
 
 ### 6. 一个部署事务，一套状态迁移和回滚快照
@@ -161,11 +162,12 @@ v0.1.5 的部署链路是：
   deployments/<deployment-id>/manifest.json
 ```
 
-- `current.json` 只保存 schema version、`target_id`、generation 和 current state ID，通过同目录临时文件 + `os.replace` 原子更新。
+- `current.json` 只保存 schema version、`target_id`、generation 和 current state ID，通过同目录权限受控临时文件执行 write→flush/fsync→`os.replace`→父目录 fsync；成功返回后必须能跨进程/主机重启读取旧值或新值，不能出现缺失或半写值。
 - `states/<state-id>.json` 是 canonical JSON 的内容寻址不可变快照；同一 state ID 内容不一致必须视为损坏。
-- `objects/sha256` 保存 artifact、spool 和无法由持久化 Git tree 解析的受管文件 bytes；写入后必须复算哈希再发布。
+- `objects/sha256` 保存 artifact、spool 和无法由持久化 Git tree 解析的受管文件 bytes；写入后必须复算哈希，再通过相同 durable atomic publisher 发布。
 - `git/objects` 保存合成 source tree 所需的新 Git objects，并以项目 Git object database 作为只读 alternate；current source tree 无法解析时阻断。
-- `transactions` 是崩溃恢复 journal，至少区分 `prepared`、`remote_mutating`、`remote_verified`、`state_committed`、`reconciled`、`recovered`、`manual_recovery_required`。
+- `transactions` 是崩溃恢复 journal，至少区分 `prepared`、`remote_mutating`、`remote_verified`、`state_committed`、`reconciled`、`recovered`、`manual_recovery_required`；每个阶段必须在相应远端副作用前后 durable publish，不能只停留在 page cache。
+- durable atomic publisher 仅承诺本地 POSIX 文件系统提供的同目录原子 rename 与 file/directory fsync 语义；不满足这些能力的 NFS/CIFS/FUSE 等 state 目录必须在预检/首次写入时拒绝或明确标记为不支持。异常遗留的 temp 文件不得被当作 current/journal，inspect/recover 可报告并安全清理。
 - deployment manifest 增加 before/after state ID、before/after generation、引入的 transition IDs、配置/目标指纹和 transaction ID；旧 manifest 继续可 history/verify，但没有 state lineage 时不得伪造。legacy rollback 只允许在 current state 尚未建立时执行，建立后必须阻断并引导显式迁移/bootstrap。
 - v0.2 不自动清理也不提供真实删除 GC；state/CAS/Git objects 全部保留。v0.3 再基于 current pointer、未完成 transaction、可回滚 deployment 和有效 build cache 设计 mark-and-sweep。
 - 文件 owner 至少区分 `source` 与具体 artifact mapping；同一路径 owner 冲突在计划阶段阻断。
@@ -207,7 +209,7 @@ kind = "tree"
 
 配置规则：
 
-- `target_id` 可显式配置；省略时由不含凭据的规范化服务器端点、项目名和 `remote_root` 计算。remote alias 只用于选择/显示，不进入默认 `target_id`；解析结果必须显示在 plan/history/state 命令中。
+- `target_id` 可显式配置；省略时由 canonical protocol/host/effective-port、项目名和 `remote_root` 计算。username 及其他认证字段、remote alias 均不进入默认 `target_id`；显式 ID 不能合并不同 canonical payload。解析结果必须显示在 plan/history/state 命令中。
 - 当前 v0.1.5 的 `<project>/remotes/<alias>` 历史迁移到 target-id 目录必须显式执行：同一物理目标的多个 alias 不能静默各自建立 current state；alias 重命名不能丢失历史。
 - 项目级 build/artifact 配置可作为公共默认；`projects.NAME.remotes.REMOTE` 可整体覆盖 build、artifacts、Docker 和 1Password 配置，不做数组/命令的隐式深合并。plan 必须显示最终来源层级，避免 dev 继承 prod secret reference。
 - 配置身份分三层：physical target identity 变化要求迁移/bootstrap；managed-state policy（repository identity、include/exclude/protected、artifact destinations）变化默认阻断并要求显式迁移；build fingerprint 变化只触发重新构建/cache miss，不改变 `target_id`。
@@ -235,7 +237,7 @@ kind = "tree"
 
 | 组件 | 责任 |
 |------|------|
-| `TargetIdentity` | 从规范化 endpoint/project/remote_root 生成稳定物理 `target_id`，让同一目标的多个 alias 共享 state/lock |
+| `TargetIdentity` | 从规范化 protocol/host/effective-port/project/remote_root 生成稳定物理 `target_id`；username/alias 不参与，让同一目标的多个连接配置共享 state/lock |
 | `ManagedPolicyFingerprint` | 覆盖 repository identity、受管源码策略和 artifact destinations；变化时阻断并要求显式迁移 |
 | `ExpectedStateStore` | 读写不可变 state、CAS bytes、持久化 Git objects 和原子 current generation pointer |
 | `StateComposer` | 在 current source tree 上应用未应用的 commit patch，生成 target tree、patch 集和统一文件状态 |
@@ -271,7 +273,7 @@ build fingerprint 至少覆盖：
 
 | 层级 | 典型字段 | 变化动作 |
 |---|---|---|
-| physical target identity | protocol endpoint、project、remote_root | 阻断普通部署，要求迁移/bootstrap；不同 alias 指向同一物理字段时仍共享状态 |
+| physical target identity | canonical protocol/host/effective-port、project、remote_root | 阻断普通部署，要求迁移/bootstrap；username/alias 变化不改变该层，不同 protocol/host/port/root 默认隔离 |
 | managed-state policy | repository identity、include/exclude/protected、artifact destinations | 阻断普通部署，要求显式 policy migration 后生成新 state |
 | build fingerprint | source tree、commands、runner/image、tool/lock、secret provider policy | 重新构建或 cache miss；不得改变 target ID 或要求远端 state bootstrap |
 
@@ -289,9 +291,9 @@ build fingerprint 至少覆盖：
 第一轮 artifact 部署若不存在可信 current manifest，必须选择以下显式路径之一：
 
 1. 自动构建推断出的 source baseline，得到可验证 artifact 基线。
-2. 用户使用明确的 bootstrap 模式，将当前远端文件作为 before snapshot，并在 plan 中标记无法证明其来源。
+2. 用户显式声明 artifact baseline 为空，并只读验证所有配置的 artifact destination 均不存在；任一路径存在即阻断。
 
-不得静默把“无 current artifact manifest”当成“远端不存在”。
+不得静默把“无 current artifact manifest”当成“远端不存在”，也不得把来源未知的远端文件导入 current/backup 来伪造可信基线。
 
 ## 安全要求
 
@@ -306,9 +308,10 @@ build fingerprint 至少覆盖：
 - Docker 后端不得挂载宿主仓库根目录、用户 home、SSH Agent、Docker socket、git-deploy state/CAS 或任意额外路径；唯一业务挂载是隔离 worktree 到固定容器工作区。
 - Docker 容器默认禁用额外 capabilities、启用 `no-new-privileges`，以当前宿主 UID/GID 写产物，并使用隔离 HOME/临时目录；不允许 privileged、host network、host PID/IPC 或用户自定义任意 `docker run` 参数逃逸安全策略。
 - Docker 构建超时或中断必须按 stop/kill/remove 顺序回收已命名容器；清理失败要保留不含敏感值的容器标识并阻断远端写入。
-- Docker daemon 连接所需宿主环境与传给构建容器的 `env_allowlist` 分离；构建环境变量值不得出现在命令行、日志、fingerprint、manifest 或 state。
+- Docker daemon 连接所需宿主环境与传给构建容器的 `env_allowlist` 分离；构建环境变量值不得出现在命令行、git-deploy 日志/摘要、fingerprint、manifest 或 state。
 - image ID/digest 只证明内容身份，不证明镜像可信。Docker + 1Password 必须使用 digest 引用、显示镜像来源与 network 模式并要求显式确认；镜像签名验证不在 v0.2 保证范围。
-- `op run` 必须保持默认输出遮蔽，git-deploy 自身也只能记录变量名和 provider 状态；错误、进度、traceback、子进程 argv、Docker inspect 和测试快照均不得包含 reference URI、service account token 或解析值。
+- `op run -- docker run --env NAME` 只保证 secret value 不进入子进程 argv；Docker daemon 会把容器环境变量保存在存活容器的配置中，拥有 daemon/root 权限的主体可通过 inspect 读取。使用 Docker secret build 即表示信任本地 daemon 与管理员，git-deploy 必须显示该边界并确保命名容器在成功、失败和中断后删除。
+- `op run` 必须保持默认输出遮蔽，git-deploy 自身也只能记录变量名和 provider 状态；错误、进度、traceback、子进程 argv、git-deploy 捕获/渲染的 Docker inspect 输出和测试快照均不得包含 reference URI、service account token 或解析值。不得把这一保证描述成 secret 不存在于 Docker daemon metadata。
 - 启动 `op` 时只继承 CLI 正常运行所需的最小宿主环境、现有 `OP_*` 认证变量和待解析 reference；启动真实 host/Docker 子进程前移除所有 `OP_*`，且注入变量名以外的秘密不得继续传播。
 - 自动测试使用 fake `op` fixture 和哨兵 secret，断言 argv/log/state/cache/Docker 参数均无泄漏；真实 1Password vault、账号、token 和 item 内容只做独立人工增强验证。
 - 执行前必须显示将获得秘密的项目、target tree、命令摘要和变量名，并明确提示：被选提交中的构建代码一旦获得变量，就有能力主动读取或写入产物；git-deploy 只能约束自身和 runner 的泄漏，不能对不可信构建脚本提供 DLP 保证。
@@ -332,6 +335,8 @@ build fingerprint 至少覆盖：
 - 不在本轮支持 Git submodule 或 artifact symlink。
 - 不在 v0.2 宣称支持多个控制端并发部署同一目标；跨机器状态同步、远端 lease 和分布式锁另立后续迭代。
 - 不采纳来源不明的远端文件作为可信 current snapshot；v0.2 bootstrap 只接受已知 Git revision 或 empty 基线并先做只读验证，unknown adopt 不支持。
+- 不承诺把 state 放在缺少可靠同目录原子 rename、file fsync 或 directory fsync 语义的网络/虚拟文件系统；这类目录不得用于可恢复事务。
+- 不把本地 Docker daemon、root/daemon 管理员视为 secret 隔离边界；容器环境变量在容器存活期间可由该权限域读取。
 - 不在 v0.2 自动按天数/数量淘汰部署历史；自动 retention 策略需在显式 GC 和恢复测试稳定后另行设计。
 - 不在 v0.2 提供 state/CAS/Git object 的真实删除 GC；所有对象默认保留，mark-and-sweep 移至 v0.3。
 - 不在 v0.2 支持较旧非最新 deployment 的派生回滚；只支持最新成功 deployment，非最新回滚移至 v0.3。
@@ -341,7 +346,7 @@ build fingerprint 至少覆盖：
 | 里程碑 | 目标 | 完成信号 |
 |--------|------|----------|
 | M1 | 目标身份与状态契约冻结 | named remote→physical target 解析、三层 fingerprint、state/current/transaction schema、manifest 兼容策略和 target-id 目录布局有解析及损坏测试 |
-| M2 | 持久化 source tree 与状态对象 | 真实/合成 tree 可跨进程解析；CAS、canonical state ID、generation pointer 和本地锁通过原子性测试 |
+| M2 | 持久化 source tree 与状态对象 | 真实/合成 tree 可跨进程解析；CAS、canonical state ID、generation pointer、journal 和 backup 通过 durable atomic publisher/重开进程测试，本地锁通过并发测试 |
 | M3 | 基于 current state 的 revision 规划 | `B + D` 后选择 `E`、范围重叠、重复 patch、冲突、状态丢失等 fixture 全部通过 |
 | M4 | 状态化部署、no-op、reconciliation 与漂移检查 | 远端只与 current/target 比较；重复选择经只读远端验证后零写入；远端已达新 target 时只产生可审计状态迁移 |
 | M5 | 最新回滚与崩溃恢复 | 最新成功 deployment 回滚同步生成状态；关键崩溃点可恢复或明确进入 `manual_recovery_required` |
@@ -355,9 +360,9 @@ build fingerprint 至少覆盖：
 
 必须全部满足：
 
-1. `target_id` 不含任何凭据或 remote alias；两个不同 endpoint/remote root 不得静默复用 state，同一物理目标的多个 alias 必须共享 state/lock。
+1. `target_id` canonical payload 固定为 protocol/host/effective-port/project/remote_root，不含 username、任何凭据或 remote alias；两个不同 protocol/host/port/root 不得静默复用 state，同一 payload 的多个 alias/username 必须共享 state/lock。
 2. physical target、managed-state policy 和 build fingerprint 字段及变化动作完全分离；篡改 state、CAS bytes、generation 或 identity/policy fingerprint 时读取失败并阻断部署。
-3. current pointer 使用原子 replace 和 generation compare-and-swap；两个本地并发部署至多一个进入远端 mutation。
+3. state/CAS/current/journal 使用 write→file fsync→atomic replace→directory fsync 的 durable publisher；故障后重开进程只能看到旧值或新值。current pointer 继续使用 generation compare-and-swap，两个本地并发部署至多一个进入远端 mutation。
 4. current source tree 与它依赖的 Git objects 可跨进程解析；临时规划目录清理后仍能作为下一次 revision 基线。
 5. 首次没有状态时沿用 v0.1.5 推断基线和远端哈希门禁；首次成功部署后创建 generation 1，失败或 dry-run 不创建 current state。
 6. 已存在状态后，`COMMIT` 与 `FROM..TO` 都应用到 current source tree；`FROM` 不再被解释为远端整体基线。
@@ -381,7 +386,7 @@ build fingerprint 至少覆盖：
 24. 构建失败、超时和用户中断均发生在远端写入前，并可靠清理临时 worktree和完整进程组。
 25. 构建命令默认不经 shell，环境变量按名称白名单继承，敏感值不进入日志、manifest 或 state。
 26. artifact collector 拒绝绝对路径、父目录穿越、symlink、submodule 和特殊文件。
-27. current/target artifact manifest 能确定新增、修改、删除、可执行位变化和 owner；无可信首次基线时必须构建 baseline 或显式 bootstrap。
+27. current/target artifact manifest 能确定新增、修改、删除、可执行位变化和 owner；无可信首次基线时只能从已知 source revision 构建 baseline，或显式声明并只读验证 empty，不能采纳未知远端 bytes。
 28. source 与 artifact 远端路径冲突在任何远端写入前阻断；artifact 漂移和 `--force` 规则与 source 一致。
 29. 上传采用逐文件流式读取或磁盘 spool；500 MB 多文件 fixture 的额外峰值 RSS、单 chunk 和 spool 预算由测试常量给出并断言，成功/失败后临时文件均清理。
 30. source/artifact 部署中途失败时共同恢复真实 before bytes；回滚不要求重新构建历史产物。
@@ -399,14 +404,14 @@ build fingerprint 至少覆盖：
 42. Docker 容器以宿主 UID/GID 生成可采集产物；成功、非零退出、超时和 Ctrl-C 后容器均被删除，清理失败时远端写调用为 0。
 43. Docker 构建变量仍按 `env_allowlist` 传入且值不出现在 argv、日志、fingerprint、manifest/state；Docker daemon 客户端环境不自动进入容器。
 44. plan/普通 dry-run 只显示 Docker 构建摘要，不 inspect/pull/run；显式 build/deploy 仅按配置 pull policy 在远端 mutation 前解析或拉取镜像。
-45. host/Docker runner 均可通过 `op run` 解析 `op://` references；git-deploy 配置只接受 reference URI，实际构建进程只得到声明在 `env_allowlist` 的变量名和值。
+45. host/Docker runner 均可通过 `op run` 解析 `op://` references；git-deploy 配置只接受 reference URI，实际构建进程只得到声明在 `env_allowlist` 的变量名和值。Docker 模式明确把本地 daemon/管理员列为可信主体，因为环境变量会存在于存活容器 metadata。
 46. `op` 缺失、未认证、reference 不可读或权限不足时，在创建 transaction、连接远端或启动 Docker 容器前失败，且不得回退普通环境变量或明文配置。
 47. `OP_SERVICE_ACCOUNT_TOKEN`、`OP_CONNECT_*`、`OP_SESSION_*` 等认证变量只对 `op` 可见；host 构建进程和 Docker client/container 环境均不存在任何 `OP_*` 变量。
-48. `op run --no-masking`、`op read` 和 `op inject` 不在执行路径中；fake fixture 的 sentinel secret/reference/token 不出现在 argv、stdout/stderr、异常、progress、fingerprint、manifest、state 或 Docker inspect 参数。
+48. `op run --no-masking`、`op read` 和 `op inject` 不在执行路径中；fake fixture 的 sentinel secret/reference/token 不出现在 argv、stdout/stderr、异常、progress、fingerprint、manifest、state 或 git-deploy 捕获/渲染的 Docker inspect 输出；不得断言存活容器的 daemon metadata 不含注入环境变量。
 49. 启用 1Password secret provider 的构建固定绕过 build cache；secret rotation 后必定重新执行构建，系统不读取或持久化秘密值来计算 cache key。
 50. plan/普通 dry-run 只显示 `provider=1password` 和变量名，不执行 `op` 或认证；真实 vault/service account 验证是独立人工增强项，不阻塞 fake `op` 自动主线。
 51. 执行前确认摘要明确列出 target tree、构建命令和注入变量名，并警告被选构建代码可读取这些值；自动测试只证明 git-deploy/runner 不泄漏，不把该结论扩张为 artifact DLP。
-52. 所有 host build 都明确提示其拥有当前用户权限；真实 Docker daemon 自动门禁覆盖成功、非零、超时、Ctrl-C、UID/GID、mount 和容器清理，且不连接 registry。
+52. 所有 host build 都明确提示其拥有当前用户权限；真实 Docker daemon 自动门禁覆盖成功、非零、超时、Ctrl-C、UID/GID、mount 和容器清理，且不连接 registry；secret fixture 同时证明存活容器 metadata 对 daemon 权限可见、git-deploy 输出无 sentinel、删除后容器不可 inspect。
 
 ## 真实联调边界
 
@@ -450,3 +455,7 @@ build fingerprint 至少覆盖：
 | 2026-07-12 | named remote alias 不进入 physical target ID，同一物理目标共享 state/lock | 防止两个 alias 指向同一 endpoint/root 时建立双状态和双锁并发写同一目标 |
 | 2026-07-12 | fingerprint 分为 physical target、managed policy、build 三层 | 避免 build/image/secret 配置变化误触发 bootstrap，也避免远端/受管路径变化只产生 cache miss |
 | 2026-07-12 | GC 真实删除与非最新回滚移至 v0.3 | 两者收益低于可信状态、最新回滚和 artifact 主线，后置可缩短 v0.2 关键路径 |
+| 2026-07-12 | physical target canonical payload 排除 username，显式 ID 不跨 payload 合并 | username 是访问主体；把它混入物理身份会让相同 endpoint/root 建立双状态与双锁 |
+| 2026-07-12 | state/current/journal 采用 file+directory fsync 的 durable atomic publisher | `os.replace` 只冻结名称原子性，不足以支撑主机重启后的 transaction recovery 承诺 |
+| 2026-07-12 | artifact 首次基线只接受已知 source 构建或已验证 empty | 消除 unknown remote adopt 与可信 current 契约的冲突 |
+| 2026-07-12 | Docker secret build 明确信任 daemon/管理员 | 普通环境变量会进入存活容器 metadata，不能承诺对 daemon 权限域保密 |

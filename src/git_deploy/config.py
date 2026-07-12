@@ -100,12 +100,65 @@ def load_config(path: Path) -> AppConfig:
             raise ConfigurationError(f"projects.{name} must be a table")
         projects[name] = _load_project(name, values, path.parent, set(remotes))
 
+    # Reject explicit target_id reuse across distinct physical payloads before
+    # any CLI remote connect or state-dir access.
+    _validate_explicit_target_id_bindings(remotes, projects)
+
     return AppConfig(
         path=path,
         remotes=remotes,
         projects=projects,
         default_remote=default_remote,
     )
+
+
+def _validate_explicit_target_id_bindings(
+    remotes: dict[str, ServerConfig],
+    projects: dict[str, ProjectConfig],
+) -> None:
+    """Ensure each explicit ``target_id`` binds to one canonical physical payload.
+
+    Args:
+        remotes: Configured remotes.
+        projects: Configured projects (including per-remote root overrides).
+
+    Returns:
+        None.
+
+    Raises:
+        ConfigurationError: When the same explicit id names different payloads.
+    """
+
+    from .target_identity import PhysicalTargetPayload, build_physical_payload
+
+    bound: dict[str, PhysicalTargetPayload] = {}
+    for remote_name, server in remotes.items():
+        for project in projects.values():
+            if not project.target_id:
+                continue
+            override = project.remotes.get(remote_name)
+            root = (
+                override.remote_root
+                if override is not None and override.remote_root is not None
+                else project.remote_root
+            )
+            if not root:
+                continue
+            payload = build_physical_payload(
+                protocol=str(server.values.get("protocol", "sftp")),
+                host=str(server.values.get("host", "")),
+                port=server.values.get("port"),
+                project=project.name,
+                remote_root=root,
+            )
+            existing = bound.get(project.target_id)
+            if existing is not None and existing.canonical_dict() != payload.canonical_dict():
+                raise ConfigurationError(
+                    f"explicit target_id {project.target_id!r} cannot merge distinct "
+                    f"physical payloads (conflict across remote {remote_name!r} / "
+                    f"project {project.name!r})"
+                )
+            bound[project.target_id] = payload
 
 
 def _load_project(
@@ -188,6 +241,10 @@ def _load_project(
 
     state_value = values.get("local_state_dir")
     state_dir = _resolve_optional_path(state_value, base)
+    explicit_target = values.get("target_id")
+    target_id = str(explicit_target).strip() if explicit_target is not None else None
+    if target_id == "":
+        raise ConfigurationError(f"projects.{name}.target_id must not be empty")
 
     return ProjectConfig(
         name=name,
@@ -200,6 +257,7 @@ def _load_project(
         health_urls=_string_tuple(values.get("health_urls"), ()),
         local_state_dir=state_dir,
         remotes=project_remotes,
+        target_id=target_id,
     )
 
 
@@ -254,6 +312,118 @@ def select_remote(
             remotes={},
         )
     return remote_name, server, projects
+
+
+def resolve_project_target(
+    server: ServerConfig,
+    project: ProjectConfig,
+    *,
+    bound_payloads: dict[str, Any] | None = None,
+    config: AppConfig | None = None,
+) -> Any:
+    """Resolve physical target identity for one project/remote pair.
+
+    When ``config`` is provided, rebuilds the global explicit-id binding table
+    from all remotes/projects so accidental cross-payload merges fail closed
+    even if callers omit ``bound_payloads``.
+
+    Args:
+        server: Selected remote server settings.
+        project: Resolved project (with remote_root already applied).
+        bound_payloads: Optional explicit-id → payload map used to reject merges.
+        config: Optional full app config for global binding enforcement.
+
+    Returns:
+        ``TargetIdentity`` for the project/remote combination.
+    """
+
+    from .target_identity import PhysicalTargetPayload, build_physical_payload, resolve_target_identity
+
+    bound = None
+    table = dict(bound_payloads or {})
+    if config is not None and project.target_id:
+        # Collect payloads already bound to this explicit id across the config.
+        for remote_name, remote_server in config.remotes.items():
+            other = config.projects.get(project.name)
+            if other is None or not other.target_id:
+                continue
+            if other.target_id != project.target_id:
+                continue
+            override = other.remotes.get(remote_name)
+            root = (
+                override.remote_root
+                if override is not None and override.remote_root is not None
+                else other.remote_root
+            )
+            if not root:
+                continue
+            payload = build_physical_payload(
+                protocol=str(remote_server.values.get("protocol", "sftp")),
+                host=str(remote_server.values.get("host", "")),
+                port=remote_server.values.get("port"),
+                project=other.name,
+                remote_root=root,
+            )
+            existing = table.get(project.target_id)
+            if existing is not None:
+                existing_payload = (
+                    existing
+                    if isinstance(existing, PhysicalTargetPayload)
+                    else None
+                )
+                if (
+                    existing_payload is not None
+                    and existing_payload.canonical_dict() != payload.canonical_dict()
+                ):
+                    raise ConfigurationError(
+                        f"explicit target_id {project.target_id!r} cannot merge "
+                        "distinct physical payloads"
+                    )
+            else:
+                table[project.target_id] = payload
+        # Also scan every project sharing the same explicit id.
+        for other_name, other in config.projects.items():
+            if other.target_id != project.target_id:
+                continue
+            for remote_name, remote_server in config.remotes.items():
+                override = other.remotes.get(remote_name)
+                root = (
+                    override.remote_root
+                    if override is not None and override.remote_root is not None
+                    else other.remote_root
+                )
+                if not root:
+                    # Resolved project already has remote_root applied.
+                    root = project.remote_root if other_name == project.name else other.remote_root
+                if not root:
+                    continue
+                payload = build_physical_payload(
+                    protocol=str(remote_server.values.get("protocol", "sftp")),
+                    host=str(remote_server.values.get("host", "")),
+                    port=remote_server.values.get("port"),
+                    project=other.name,
+                    remote_root=root,
+                )
+                existing = table.get(project.target_id)
+                if isinstance(existing, PhysicalTargetPayload):
+                    if existing.canonical_dict() != payload.canonical_dict():
+                        raise ConfigurationError(
+                            f"explicit target_id {project.target_id!r} cannot merge "
+                            "distinct physical payloads"
+                        )
+                else:
+                    table[project.target_id] = payload
+
+    if project.target_id and project.target_id in table:
+        bound = table[project.target_id]
+        if not isinstance(bound, PhysicalTargetPayload):
+            bound = None
+    return resolve_target_identity(
+        server,
+        project,
+        explicit_target_id=project.target_id,
+        bound_payload=bound,
+    )
 
 
 def _validate_remote_name(name: str) -> None:

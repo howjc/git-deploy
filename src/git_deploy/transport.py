@@ -176,10 +176,12 @@ class SftpTransport:
         else:
             self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+        from .target_identity import effective_port
+
         password = _resolve_password(server)
         connect: dict[str, Any] = {
             "hostname": host,
-            "port": int(server.get("port", 22)),
+            "port": effective_port("sftp", server.get("port")),
             "username": username,
             "timeout": int(server.get("timeout", 15)),
             "allow_agent": bool(server.get("use_ssh_agent", False)),
@@ -384,16 +386,21 @@ class FtpTransport:
             use_tls: Enable TLS for control and data channels.
         """
 
+        from .target_identity import effective_port
+
         host = str(server.get("host", "")).strip()
         username = str(server.get("username", "")).strip()
         if not host or not username:
             raise ConfigurationError("FTP requires host and username")
         client_type = ftplib.FTP_TLS if use_tls else ftplib.FTP
         self._ftp = client_type()
+        # Identity and connect must share the same default-port source of truth.
+        protocol = "ftps" if use_tls else "ftp"
+        connect_port = effective_port(protocol, server.get("port"))
         try:
             self._ftp.connect(
                 host,
-                int(server.get("port", 21)),
+                connect_port,
                 timeout=int(server.get("timeout", 15)),
             )
             self._ftp.login(username, _resolve_password(server))

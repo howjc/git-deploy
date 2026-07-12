@@ -38,6 +38,7 @@ class ProjectConfig:
     local_state_dir: Path | None = None
     remote: str = "default"
     remotes: dict[str, ProjectRemoteConfig] = field(default_factory=dict)
+    target_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,17 @@ class DeploymentManifest:
     error: str | None = None
     revision_specs: list[str] = field(default_factory=list)
     remote: str = "default"
+    # v0.2 optional state lineage (absent on v0.1.5 manifests).
+    before_state_id: str | None = None
+    after_state_id: str | None = None
+    before_generation: int | None = None
+    after_generation: int | None = None
+    introduced_transition_ids: list[str] = field(default_factory=list)
+    physical_fingerprint: str | None = None
+    policy_fingerprint: str | None = None
+    transaction_id: str | None = None
+    target_id: str | None = None
+    state: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the complete manifest as JSON-compatible primitives."""
@@ -138,5 +150,34 @@ class DeploymentManifest:
         """
 
         values = dict(payload)
-        values["snapshots"] = [FileSnapshot(**row) for row in payload.get("snapshots", [])]
-        return cls(**values)
+        values["snapshots"] = [
+            FileSnapshot(**{k: v for k, v in row.items() if k in FileSnapshot.__dataclass_fields__})
+            for row in payload.get("snapshots", [])
+        ]
+        # Drop unknown keys so older/newer fixtures remain readable.
+        allowed = set(cls.__dataclass_fields__)
+        filtered = {key: value for key, value in values.items() if key in allowed}
+        # Preserve legacy readability: missing lineage stays empty/None.
+        if filtered.get("state") is None and not any(
+            filtered.get(key) is not None
+            for key in (
+                "before_state_id",
+                "after_state_id",
+                "before_generation",
+                "after_generation",
+                "transaction_id",
+            )
+        ):
+            filtered["state"] = None
+        return cls(**filtered)
+
+    def lineage_label(self) -> str:
+        """Return a human-readable lineage marker for history/verify output.
+
+        Returns:
+            ``legacy`` when no v0.2 state lineage is present, otherwise ``v1``.
+        """
+
+        if self.state == "v1" or self.before_state_id or self.after_state_id or self.transaction_id:
+            return "v1"
+        return "legacy"
