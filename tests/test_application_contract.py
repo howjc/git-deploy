@@ -14,15 +14,18 @@ from git_deploy.application import (
     GCRequest,
     HistoryRequest,
     OperationKind,
+    PlanTokenSigner,
     PlanRequest,
     ResultField,
     ResultStatus,
     RollbackRequest,
     SideEffectLevel,
+    StalePlanError,
     StateAction,
     StateRequest,
     VerifyRequest,
     application_error_from_exception,
+    confirmation_policy_fingerprint,
 )
 from git_deploy.errors import ConfigurationError, PolicyError, RemoteDriftError
 
@@ -243,3 +246,132 @@ def test_error_contract_rejects_unstable_codes() -> None:
             category=ErrorCategory.INTERNAL,
             message="bad",
         )
+
+
+def test_stale_plan_token_binds_request_target_policy_generation_and_plan() -> None:
+    """Accept only the exact request and execution boundaries used at planning."""
+
+    signer = PlanTokenSigner(b"p" * 32)
+    request = DeployRequest(
+        **_target_context(SideEffectLevel.REMOTE_MUTATION),
+        revisions=("HEAD",),
+    )
+    token = signer.issue(
+        request,
+        policy_fingerprint="policy-v1",
+        plan_digest="plan-v1",
+    )
+
+    signer.verify(
+        token,
+        request,
+        policy_fingerprint="policy-v1",
+        plan_digest="plan-v1",
+    )
+    assert str(token).startswith("v1.")
+
+
+@pytest.mark.parametrize(
+    ("changed_request", "policy_fingerprint", "plan_digest"),
+    [
+        (
+            DeployRequest(
+                **_target_context(SideEffectLevel.REMOTE_MUTATION),
+                revisions=("HEAD~1",),
+            ),
+            "policy-v1",
+            "plan-v1",
+        ),
+        (
+            DeployRequest(
+                **{
+                    **_target_context(SideEffectLevel.REMOTE_MUTATION),
+                    "expected_target_id": "tgt-other",
+                },
+                revisions=("HEAD",),
+            ),
+            "policy-v1",
+            "plan-v1",
+        ),
+        (
+            DeployRequest(
+                **{
+                    **_target_context(SideEffectLevel.REMOTE_MUTATION),
+                    "expected_generation": 8,
+                },
+                revisions=("HEAD",),
+            ),
+            "policy-v1",
+            "plan-v1",
+        ),
+    ],
+)
+def test_stale_plan_token_rejects_changed_request_boundaries(
+    changed_request: DeployRequest,
+    policy_fingerprint: str,
+    plan_digest: str,
+) -> None:
+    """Reject changed selectors, target identity, or generation."""
+
+    signer = PlanTokenSigner(b"p" * 32)
+    original = DeployRequest(
+        **_target_context(SideEffectLevel.REMOTE_MUTATION),
+        revisions=("HEAD",),
+    )
+    token = signer.issue(
+        original,
+        policy_fingerprint="policy-v1",
+        plan_digest="plan-v1",
+    )
+
+    with pytest.raises(StalePlanError, match="stale"):
+        signer.verify(
+            token,
+            changed_request,
+            policy_fingerprint=policy_fingerprint,
+            plan_digest=plan_digest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("policy_fingerprint", "plan_digest"),
+    [("policy-v2", "plan-v1"), ("policy-v1", "plan-v2")],
+)
+def test_stale_plan_token_rejects_changed_policy_or_plan_digest(
+    policy_fingerprint: str,
+    plan_digest: str,
+) -> None:
+    """Reject current policy or structured plan changes after review."""
+
+    signer = PlanTokenSigner(b"p" * 32)
+    request = DeployRequest(
+        **_target_context(SideEffectLevel.REMOTE_MUTATION),
+        revisions=("HEAD",),
+    )
+    token = signer.issue(
+        request,
+        policy_fingerprint="policy-v1",
+        plan_digest="plan-v1",
+    )
+
+    with pytest.raises(StalePlanError, match="stale"):
+        signer.verify(
+            token,
+            request,
+            policy_fingerprint=policy_fingerprint,
+            plan_digest=plan_digest,
+        )
+
+
+def test_stale_plan_policy_fingerprint_is_canonical() -> None:
+    """Produce stable policy fingerprints without renderer-specific data."""
+
+    from git_deploy.application import ConfirmationPolicy, ConfirmationRequirement, RiskLevel
+
+    policy = ConfirmationPolicy(
+        requirement=ConfirmationRequirement.CONFIRM,
+        level=RiskLevel.NORMAL,
+        risks=(),
+    )
+
+    assert confirmation_policy_fingerprint(policy) == confirmation_policy_fingerprint(policy)

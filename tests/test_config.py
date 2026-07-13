@@ -8,6 +8,7 @@ import pytest
 
 from git_deploy.config import discover_config, load_config, select_remote
 from git_deploy.errors import ConfigurationError
+from git_deploy.remote_permissions import load_sftp_permission_policy
 from git_deploy.state import DeploymentStore
 
 
@@ -53,6 +54,103 @@ include = ["src/**"]
     assert config.projects["demo"].repository == repository.resolve()
     assert config.projects["demo"].local_state_dir == (tmp_path / ".state/demo").resolve()
     assert config.projects["demo"].include == ("src/**",)
+
+
+def test_sftp_permission_policy_accepts_owner_group_and_octal_modes(
+    tmp_path: Path,
+) -> None:
+    """Validate configurable ownership while retaining safe SFTP mode defaults."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+owner = "www-data"
+group = "web"
+file_mode = "0640"
+executable_mode = 0o750
+directory_mode = "0750"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    policy = load_sftp_permission_policy(config.remotes["default"].values)
+
+    assert policy.owner == "www-data"
+    assert policy.group == "web"
+    assert policy.file_mode == 0o640
+    assert policy.executable_mode == 0o750
+    assert policy.directory_mode == 0o750
+
+
+def test_sftp_permission_policy_defaults_and_invalid_protocol_are_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """Use 0644/0755 defaults and reject POSIX policy on FTP transports."""
+
+    defaults = load_sftp_permission_policy({"protocol": "sftp"})
+    assert defaults.file_mode == 0o644
+    assert defaults.executable_mode == 0o755
+    assert defaults.directory_mode == 0o755
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "ftps"
+file_mode = "0644"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="cannot guarantee POSIX"):
+        load_config(config_path)
+
+
+def test_sftp_permission_policy_rejects_decimal_looking_mode(tmp_path: Path) -> None:
+    """Reject decimal 644 so an accidental TOML representation is not misapplied."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+file_mode = 644
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="octal string"):
+        load_config(config_path)
+
+
+def test_sftp_ownership_rejects_shell_metacharacters() -> None:
+    """Reject unsafe ownership identities before opening an SSH connection."""
+
+    with pytest.raises(ConfigurationError, match="safe user/group"):
+        load_sftp_permission_policy(
+            {"protocol": "sftp", "owner": "www-data; touch /tmp/unsafe"}
+        )
 
 
 def test_explicit_missing_config_is_rejected(tmp_path: Path) -> None:

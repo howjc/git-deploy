@@ -1371,7 +1371,17 @@ local_state_dir = ".state/demo"
 
     set_cli_transport_factory(factory)
     try:
-        code = run(["state", "recover", "demo", "--execute", "--yes"])
+        code = run(
+            [
+                "state",
+                "recover",
+                "demo",
+                "--execute",
+                "--yes",
+                "--confirm-phrase",
+                f"CONFIRM STATE {identity.target_id}",
+            ]
+        )
         assert code == 0
         current = store.read_current()
         assert current is not None
@@ -3459,7 +3469,26 @@ kind = "tree"
 
     set_cli_transport_factory(factory)
     try:
-        assert run(["deploy", "demo", "--revisions", head, "--yes"]) == 0
+        # Secret-backed deploy is high-risk: --yes alone must not bypass the
+        # application confirmation policy or invoke the secret provider.
+        assert run(["deploy", "demo", "--revisions", head, "--yes"]) == 2
+        assert calls.read_text().splitlines() == ["run"]
+        assert connection_calls["count"] == 0
+        capsys.readouterr()
+        assert (
+            run(
+                [
+                    "deploy",
+                    "demo",
+                    "--revisions",
+                    head,
+                    "--yes",
+                    "--confirm-phrase",
+                    f"CONFIRM DEPLOY {identity.target_id}",
+                ]
+            )
+            == 0
+        )
     finally:
         set_cli_transport_factory(None)
     deploy_output = capsys.readouterr().out
@@ -3486,7 +3515,20 @@ kind = "tree"
     op.chmod(0o755)
     set_cli_transport_factory(factory)
     try:
-        assert run(["deploy", "demo", "--revisions", head, "--yes"]) != 0
+        assert (
+            run(
+                [
+                    "deploy",
+                    "demo",
+                    "--revisions",
+                    head,
+                    "--yes",
+                    "--confirm-phrase",
+                    f"CONFIRM DEPLOY {identity.target_id}",
+                ]
+            )
+            != 0
+        )
     finally:
         set_cli_transport_factory(None)
     assert connection_calls["count"] == 1

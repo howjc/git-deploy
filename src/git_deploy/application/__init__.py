@@ -1,5 +1,38 @@
 """UI-neutral application contracts shared by CLI and future TUI adapters."""
 
+from .cancellation import (
+    CancellationAction,
+    CancellationState,
+    CancellationStateMachine,
+    CancellationTransition,
+)
+from .config_service import (
+    ApplicationConfigService,
+    ProjectSelection,
+    SelectionState,
+)
+from .events import (
+    ApplicationEvent,
+    OperationEvent,
+    OperationEventKind,
+    OperationProgressEvent,
+    OperationStartedEvent,
+    OperationWarningEvent,
+    TargetResolvedEvent,
+    TerminalResultEvent,
+    TransactionStage,
+    TransactionStageEvent,
+)
+from .deploy_service import (
+    ConfirmationGrant,
+    DeployService,
+)
+from .history_service import (
+    HistoryEntry,
+    HistoryLineage,
+    HistoryResult,
+    HistoryService,
+)
 from .models import (
     ApplicationRequest,
     DeployRequest,
@@ -14,6 +47,28 @@ from .models import (
     StateRequest,
     VerifyRequest,
 )
+from .policy import (
+    ConfirmationPolicy,
+    ConfirmationRequirement,
+    EnvironmentRisk,
+    RiskFactor,
+    RiskItem,
+    RiskLevel,
+    confirmation_policy_for,
+)
+from .plan_token import (
+    OperationPlanToken,
+    PlanTokenSigner,
+    StalePlanError,
+    confirmation_policy_fingerprint,
+)
+from .plan_service import (
+    ArtifactMappingPlan,
+    BuildPlanSummary,
+    PlannedChange,
+    RevisionPlanResult,
+    RevisionPlanService,
+)
 from .errors import (
     ApplicationError,
     ErrorCategory,
@@ -21,25 +76,104 @@ from .errors import (
     application_error_from_exception,
 )
 from .results import ApplicationResult, ResultField, ResultStatus
+from .rollback_service import (
+    LatestRollbackPlan,
+    LatestRollbackService,
+    RollbackPathPlan,
+)
+from .state_service import (
+    OpenTransactionSummary,
+    StateInspectResult,
+    StateInspectService,
+    StateVerifyMode,
+    StateVerifyResult,
+)
+from .verify_service import (
+    VerifyMode,
+    VerifyPathResult,
+    VerifyResult,
+    VerifyService,
+)
+from .worker import (
+    ApplicationWorker,
+    DuplicateOperationError,
+    TargetBusyError,
+    WorkerHandle,
+)
 
 __all__ = [
+    "ApplicationEvent",
     "ApplicationRequest",
     "ApplicationError",
+    "ApplicationConfigService",
     "ApplicationResult",
+    "ApplicationWorker",
+    "ArtifactMappingPlan",
+    "BuildPlanSummary",
+    "CancellationAction",
+    "CancellationState",
+    "CancellationStateMachine",
+    "CancellationTransition",
+    "ConfirmationPolicy",
+    "ConfirmationRequirement",
+    "ConfirmationGrant",
     "DeployRequest",
+    "DeployService",
+    "DuplicateOperationError",
     "ErrorCategory",
     "ErrorContextItem",
+    "EnvironmentRisk",
     "GCRequest",
     "HistoryRequest",
+    "HistoryEntry",
+    "HistoryLineage",
+    "HistoryResult",
+    "HistoryService",
+    "LatestRollbackPlan",
+    "LatestRollbackService",
     "OperationKind",
+    "OperationPlanToken",
+    "OperationEvent",
+    "OperationEventKind",
+    "OperationProgressEvent",
     "OperationRequest",
+    "OperationStartedEvent",
+    "OperationWarningEvent",
+    "OpenTransactionSummary",
     "PlanRequest",
+    "PlanTokenSigner",
+    "PlannedChange",
+    "ProjectSelection",
     "ResultField",
     "ResultStatus",
+    "RevisionPlanResult",
+    "RevisionPlanService",
+    "RiskFactor",
+    "RiskItem",
+    "RiskLevel",
     "RollbackRequest",
+    "RollbackPathPlan",
     "SideEffectLevel",
+    "SelectionState",
     "StateAction",
+    "StateInspectResult",
+    "StateInspectService",
+    "StateVerifyMode",
+    "StateVerifyResult",
+    "StalePlanError",
     "StateRequest",
+    "TargetResolvedEvent",
+    "TargetBusyError",
+    "TerminalResultEvent",
+    "TransactionStage",
+    "TransactionStageEvent",
     "VerifyRequest",
+    "VerifyMode",
+    "VerifyPathResult",
+    "VerifyResult",
+    "VerifyService",
+    "WorkerHandle",
     "application_error_from_exception",
+    "confirmation_policy_for",
+    "confirmation_policy_fingerprint",
 ]

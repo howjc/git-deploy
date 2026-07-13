@@ -10,7 +10,7 @@ from typing import TextIO
 
 @dataclass(frozen=True)
 class ProgressEvent:
-    """One progress snapshot emitted by the deployment executor."""
+    """One backward-compatible progress snapshot emitted by the executor."""
 
     phase: str
     completed: int
@@ -18,6 +18,22 @@ class ProgressEvent:
     path: str = ""
     bytes_completed: int = 0
     bytes_total: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject malformed counters before adapters render the snapshot."""
+
+        if not isinstance(self.phase, str) or not self.phase.strip():
+            raise ValueError("phase must be a non-empty string")
+        for name in ("completed", "total", "bytes_completed", "bytes_total"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.total and self.completed > self.total:
+            raise ValueError("completed cannot exceed total")
+        if self.bytes_total and self.bytes_completed > self.bytes_total:
+            raise ValueError("bytes_completed cannot exceed bytes_total")
+        if not isinstance(self.path, str):
+            raise TypeError("path must be a string")
 
 
 class TerminalProgress:

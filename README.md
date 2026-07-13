@@ -171,6 +171,11 @@ ssh_host_alias = "application-prod"
 ssh_config_file = "~/.ssh/config"
 strict_host_key_checking = true
 timeout = 15
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [projects.application]
 repository = "."
@@ -202,12 +207,22 @@ protocol = "sftp"
 host = "dev.example.invalid"
 username = "deploy-dev"
 strict_host_key_checking = true
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [remotes.prod]
 protocol = "sftp"
 host = "prod.example.invalid"
 username = "deploy-prod"
 strict_host_key_checking = true
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [projects.application]
 repository = "."
@@ -232,6 +247,30 @@ health_urls = ["https://example.invalid/health"]
 - remote 层的 `build` 和 `artifacts` 是整体替换，不进行深合并。
 - 相同 canonical protocol/host/port/project/root 的 alias 共享 target、state 和 lock；不同目标隔离。
 - 显式 `target_id` 不能跨不同 physical payload 复用。
+
+### SFTP 所属者与权限
+
+SFTP remote 可以声明部署文件和新建目录的 POSIX ownership/mode：
+
+```toml
+[remotes.prod]
+protocol = "sftp"
+host = "prod.example.invalid"
+username = "root"
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
+```
+
+- 默认普通文件为 `0644`、Git 可执行文件为 `0755`、新建目录为 `0755`。
+- `owner`、`group` 接受安全的用户/组名称或数字 UID/GID；两者均可单独配置。
+- mode 推荐写成字符串（如 `"0644"`），也可用 TOML 八进制整数（如 `0o644`）；十进制 `644` 会被拒绝，避免误设权限。
+- 文件先在临时路径完成 chmod 和 chown/chgrp，再执行原子替换；设置失败会终止部署，不会把错误 ownership 的临时文件发布为目标文件。
+- ownership 设置需要登录账号具备对应权限；以 `root` 登录并希望由 Web 用户运行时，必须显式配置 `owner`/`group`。省略时保留 SFTP 登录用户 ownership。
+- 只调整本次新建的目录，不递归修改既有目录或远端根目录；既有 `remote_root` 应在首次部署前正确预置。
+- FTP/FTPS 无法可靠保证 POSIX ownership/mode，因此配置这些字段会直接报错。
 
 ### 项目字段
 

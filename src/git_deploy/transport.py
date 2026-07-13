@@ -8,6 +8,7 @@ import hashlib
 import io
 import os
 import posixpath
+import shlex
 import stat
 import subprocess
 from collections.abc import Callable, Iterable, Iterator
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .errors import ConfigurationError, GitDeployError
+from .remote_permissions import load_sftp_permission_policy
 
 
 ByteProgress = Callable[[int], None]
@@ -166,6 +168,7 @@ class SftpTransport:
             server: Effective SFTP connection mapping.
         """
 
+        self._permissions = load_sftp_permission_policy(server)
         try:
             import paramiko
         except ModuleNotFoundError as exc:
@@ -326,7 +329,13 @@ class SftpTransport:
                     handle.write(chunk)
                     if progress is not None:
                         progress(len(chunk))
-            self._sftp.chmod(temporary, 0o755 if executable else 0o644)
+            mode = (
+                self._permissions.executable_mode
+                if executable
+                else self._permissions.file_mode
+            )
+            self._sftp.chmod(temporary, mode)
+            self._set_ownership(temporary)
             try:
                 self._sftp.posix_rename(temporary, remote_path)
             except (OSError, IOError):
@@ -427,7 +436,36 @@ class SftpTransport:
             self._sftp.stat(remote_dir)
         except FileNotFoundError:
             self._sftp.mkdir(remote_dir)
+            self._sftp.chmod(remote_dir, self._permissions.directory_mode)
+            self._set_ownership(remote_dir)
         self._directories.add(remote_dir)
+
+    def _set_ownership(self, remote_path: str) -> None:
+        """Apply configured owner/group before publishing a remote path.
+
+        Args:
+            remote_path: Absolute SFTP path to update.
+
+        Raises:
+            GitDeployError: If the SSH account cannot apply configured ownership.
+        """
+
+        owner = self._permissions.owner
+        group = self._permissions.group
+        if owner is None and group is None:
+            return
+        quoted_path = shlex.quote(remote_path)
+        if owner is None:
+            command = f"chgrp {shlex.quote(group or '')} {quoted_path}"
+        else:
+            ownership = owner if group is None else f"{owner}:{group}"
+            command = f"chown {shlex.quote(ownership)} {quoted_path}"
+        code, _, stderr = self.execute(command)
+        if code != 0:
+            detail = stderr.strip() or f"exit status {code}"
+            raise GitDeployError(
+                f"cannot set remote ownership for {remote_path}: {detail}"
+            )
 
 
 class FtpTransport:

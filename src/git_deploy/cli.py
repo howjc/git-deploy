@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     deploy = subparsers.add_parser("deploy", help="deploy selected commits and ranges")
     _add_plan_arguments(deploy, include_dry_run=True)
     deploy.add_argument("--yes", action="store_true", help="skip the mutation confirmation")
+    deploy.add_argument(
+        "--confirm-phrase",
+        help="exact confirmation phrase required for production or high-risk mutation",
+    )
 
     build = subparsers.add_parser("build", help="build configured artifacts locally (no remote)")
     build.add_argument("target", help="project name")
@@ -82,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollback.add_argument("--force", action="store_true", help="allow remote hash drift")
     rollback.add_argument("--yes", action="store_true", help="skip the mutation confirmation")
+    rollback.add_argument(
+        "--confirm-phrase",
+        help="exact confirmation phrase required for production or high-risk mutation",
+    )
     _add_remote_argument(rollback)
 
     state = subparsers.add_parser("state", help="inspect, verify, bootstrap, and recover target state")
@@ -113,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("target", help="project name")
     recover.add_argument("--execute", action="store_true", help="apply safe finalize/restore decisions")
     recover.add_argument("--yes", action="store_true", help="confirm recovery mutations")
+    recover.add_argument(
+        "--confirm-phrase",
+        help="exact confirmation phrase required for recovery execution",
+    )
     _add_remote_argument(recover)
 
     # Explicitly reject GC in v0.2.
@@ -227,6 +239,258 @@ def main() -> None:
     raise SystemExit(run())
 
 
+def _run_application_plan(
+    config: AppConfig,
+    args: argparse.Namespace,
+) -> int | None:
+    """Render a local plan through shared application services.
+
+    Args:
+        config: Loaded application configuration.
+        args: Parsed ``plan`` arguments.
+
+    Returns:
+        Exit code, or None for legacy hostless configuration compatibility.
+    """
+
+    import secrets
+
+    from .application import (
+        ApplicationConfigService,
+        PlanRequest,
+        PlanTokenSigner,
+        RevisionPlanService,
+        SideEffectLevel,
+        StateInspectService,
+    )
+
+    # A historical local-plan compatibility path permits an incomplete [server]
+    # without host. It has no physical target identity, so keep the legacy
+    # planner until that deprecated configuration shape is removed.
+    _remote_name, server, available = select_remote(config, args.remote)
+    if not str(server.values.get("host", "")).strip():
+        return None
+    if "all" in args.targets:
+        if len(args.targets) != 1:
+            raise ConfigurationError("all cannot be combined with explicit project names")
+        project_names = tuple(available)
+    else:
+        unknown = [name for name in args.targets if name not in available]
+        if unknown:
+            choices = ", ".join(available)
+            raise ConfigurationError(
+                f"unknown project {unknown[0]!r}; available: {choices}"
+            )
+        project_names = tuple(dict.fromkeys(args.targets))
+
+    config_service = ApplicationConfigService(config)
+    state_service = StateInspectService(config_service)
+    planner = RevisionPlanService(
+        config_service,
+        PlanTokenSigner(secrets.token_bytes(32)),
+    )
+    print(f"Config: {config.path}")
+    print(f"Remote: {_remote_name}")
+    for project_name in project_names:
+        selection, generation = state_service.current_generation(
+            _remote_name,
+            project_name,
+        )
+        result = planner.plan(
+            PlanRequest(
+                remote=selection.remote_alias,
+                project=selection.project,
+                side_effect=SideEffectLevel.LOCAL_READ,
+                expected_target_id=selection.target_id,
+                expected_physical_fingerprint=selection.physical_fingerprint,
+                expected_generation=generation,
+                revisions=tuple(args.revisions),
+                force=bool(args.force),
+            )
+        )
+        if result.build.enabled:
+            print(
+                f"[{selection.project}] build runner={result.build.runner} "
+                f"origin={result.build.build_origin} "
+                f"artifacts={[item.destination for item in result.artifacts]}"
+            )
+            print(f"  commands: {[list(item) for item in result.build.commands]}")
+            if result.build.uses_secret:
+                print("  secret provider=1password (dry-run: op calls=0)")
+            for warning in result.warnings:
+                print(f"  warning: {warning}")
+        print(f"[{selection.project}] target_id={selection.target_id}")
+        print(f"[{selection.project}] revisions: {' '.join(args.revisions)}")
+        print(
+            f"  baseline {result.before_tree_id[:12]} -> "
+            f"target {result.after_tree_id[:12]}"
+        )
+        if result.introduced_transition_ids:
+            print(f"  introduced transitions: {len(result.introduced_transition_ids)}")
+        if result.static_noop:
+            print("  static no-op (already applied transitions)")
+        if not result.source_changes:
+            print("  no selected tracked-file changes")
+        for operation in result.source_changes:
+            if operation.action == "upload":
+                print(f"  UPLOAD {operation.path} ({operation.target_size} bytes)")
+            else:
+                print(f"  DELETE {operation.path}")
+        if result.excluded_paths:
+            print(f"  excluded changes: {len(result.excluded_paths)}")
+        print("  remote: unverified (local-only plan/dry-run)")
+    print("Remote: not connected (local-only dry run)")
+    print("state: no state/CAS/journal/deployment/worktree written")
+    return 0
+
+
+def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
+    """Gate CLI deployment through the shared plan, policy, and worker services.
+
+    Args:
+        config: Loaded application configuration.
+        args: Parsed non-dry-run deploy arguments.
+
+    Returns:
+        Process exit code from the domain execution adapter.
+    """
+
+    import secrets
+
+    from .application import (
+        ApplicationConfigService,
+        ApplicationResult,
+        ApplicationWorker,
+        DeployRequest,
+        DeployService,
+        PlanTokenSigner,
+        ResultField,
+        ResultStatus,
+        RevisionPlanService,
+        SideEffectLevel,
+        StateInspectService,
+        confirmation_policy_for,
+    )
+
+    config_service = ApplicationConfigService(config)
+    remote_name = config_service.resolve_project(
+        args.remote,
+        _application_project_names(config_service, args.remote, args.targets)[0],
+    ).remote_alias
+    project_names = _application_project_names(config_service, remote_name, args.targets)
+    worker = ApplicationWorker(max_workers=1)
+    exit_code = 0
+    try:
+        for project_name in project_names:
+            state_service = StateInspectService(config_service)
+            selection, generation = state_service.current_generation(
+                remote_name,
+                project_name,
+            )
+            request = DeployRequest(
+                remote=selection.remote_alias,
+                project=selection.project,
+                side_effect=SideEffectLevel.REMOTE_MUTATION,
+                expected_target_id=selection.target_id,
+                expected_physical_fingerprint=selection.physical_fingerprint,
+                expected_generation=generation,
+                revisions=tuple(args.revisions),
+                force=bool(args.force),
+            )
+            signer = PlanTokenSigner(secrets.token_bytes(32))
+            plan = RevisionPlanService(config_service, signer).plan(request)
+            policy = confirmation_policy_for(
+                request,
+                environment_risk=selection.environment_risk,
+                uses_secret=plan.build.uses_secret,
+            )
+            grant = _cli_confirmation_grant(
+                policy,
+                assume_yes=bool(args.yes),
+                supplied_phrase=getattr(args, "confirm_phrase", None),
+                prompt=f"Deploy project {project_name} to remote {remote_name}?",
+            )
+            nested_args = argparse.Namespace(**vars(args))
+            nested_args.targets = [project_name]
+            nested_args.yes = True
+            nested_args._application_gated = True
+
+            def execute_domain(_request, _plan, _emit, *, _args=nested_args):
+                """Run the existing transaction adapter behind the application facade."""
+
+                code = _run_plan_or_deploy(config, _args)
+                if code:
+                    raise PolicyError(f"deployment failed with exit code {code}")
+                return ApplicationResult(
+                    operation=request.operation,
+                    remote=request.remote,
+                    project=request.project,
+                    side_effect=request.side_effect,
+                    status=ResultStatus.SUCCEEDED,
+                    summary="deployment command completed",
+                    fields=(ResultField("exit_code", code),),
+                )
+
+            service = DeployService(signer, execute_domain)
+
+            def task(event_sink, *, _service=service, _request=request, _plan=plan):
+                """Execute one confirmed deploy in the shared worker boundary."""
+
+                return _service.execute(
+                    _request,
+                    _plan,
+                    token=_plan.plan_token,
+                    confirmation=grant,
+                    event_sink=event_sink,
+                )
+
+            handle = worker.submit(
+                operation_id=f"deploy-{secrets.token_hex(12)}",
+                target_id=selection.target_id,
+                mutation=True,
+                task=task,
+            )
+            result = handle.future.result()
+            for field in result.fields:
+                if field.name == "exit_code" and isinstance(field.value, int):
+                    exit_code = max(exit_code, field.value)
+    finally:
+        worker.shutdown()
+    return exit_code
+
+
+def _application_project_names(
+    config: object,
+    remote: str | None,
+    requested: Sequence[str],
+) -> tuple[str, ...]:
+    """Resolve ordered CLI project selectors through ApplicationConfigService.
+
+    Args:
+        config: ApplicationConfigService instance.
+        remote: Selected remote alias or None.
+        requested: CLI target selectors.
+
+    Returns:
+        De-duplicated selected project names.
+    """
+
+    from .application import ApplicationConfigService
+
+    if not isinstance(config, ApplicationConfigService):
+        raise TypeError("config must be an ApplicationConfigService")
+    available = config.available_projects(remote)
+    if "all" in requested:
+        if len(requested) != 1:
+            raise ConfigurationError("all cannot be combined with explicit project names")
+        return available
+    unknown = [item for item in requested if item not in available]
+    if unknown:
+        choices = ", ".join(available)
+        raise ConfigurationError(f"unknown project {unknown[0]!r}; available: {choices}")
+    return tuple(dict.fromkeys(requested))
+
+
 def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     """Build plans, optionally inspect remote state, and deploy them.
 
@@ -241,6 +505,17 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     Returns:
         Process exit code.
     """
+
+    if args.command == "plan" and not args.check_remote:
+        application_result = _run_application_plan(config, args)
+        if application_result is not None:
+            return application_result
+    if (
+        args.command == "deploy"
+        and not bool(getattr(args, "dry_run", False))
+        and not bool(getattr(args, "_application_gated", False))
+    ):
+        return _run_application_deploy(config, args)
 
     from .config import resolve_project_target
     from .expected_state import ExpectedStateStore
@@ -714,46 +989,48 @@ def _run_history(config: AppConfig, args: argparse.Namespace) -> int:
 
     if args.limit < 1:
         raise ConfigurationError("--limit must be at least 1")
-    remote_name, server, available_projects = select_remote(config, args.remote)
-    print(f"Remote: {remote_name}")
-    for project in _select_projects(available_projects, [args.target]):
-        from .config import resolve_project_target
-        from .target_identity import default_state_base
+    from .application import (
+        ApplicationConfigService,
+        HistoryRequest,
+        HistoryService,
+        SideEffectLevel,
+        StateInspectService,
+    )
 
-        identity = resolve_project_target(server, project)
-        # Prefer target-scoped deployment store (stateful v0.2); fall back to
-        # legacy project store so pre-state history remains visible.
-        target_root = identity.state_root(default_state_base(project.name, project.local_state_dir))
-        target_store = DeploymentStore(project, root=target_root)
-        legacy_store = DeploymentStore(project)
-        by_id: dict[str, DeploymentManifest] = {}
-        for manifest in legacy_store.list_manifests():
-            by_id[manifest.deployment_id] = manifest
-        for manifest in target_store.list_manifests():
-            by_id[manifest.deployment_id] = manifest
-        manifests = sorted(
-            by_id.values(),
-            key=lambda item: item.deployment_id,
-            reverse=True,
-        )[: args.limit]
-        print(f"[{project.name}] {len(manifests)} deployment record(s)")
-        print(f"  target_id: {identity.target_id}")
-        for manifest in manifests:
-            selection = " ".join(manifest.revision_specs) or (
-                f"{manifest.from_commit[:12]}..{manifest.to_commit[:12]}"
+    config_service = ApplicationConfigService(config)
+    selection, generation = StateInspectService(config_service).current_generation(
+        args.remote,
+        args.target,
+    )
+    result = HistoryService(config_service).history(
+        HistoryRequest(
+            remote=selection.remote_alias,
+            project=selection.project,
+            side_effect=SideEffectLevel.LOCAL_READ,
+            expected_target_id=selection.target_id,
+            expected_physical_fingerprint=selection.physical_fingerprint,
+            expected_generation=generation,
+            limit=args.limit,
+        )
+    )
+    print(f"Remote: {selection.remote_alias}")
+    print(f"[{selection.project}] {len(result.entries)} deployment record(s)")
+    print(f"  target_id: {selection.target_id}")
+    for entry in result.entries:
+        revision_selection = " ".join(entry.revision_specs) or (
+            f"{entry.from_commit[:12]}..{entry.to_commit[:12]}"
+        )
+        lineage = "v1" if entry.lineage.value == "stateful" else "legacy"
+        state_note = f"state: {lineage}"
+        if lineage == "v1":
+            state_note += (
+                f" gen={entry.before_generation}->{entry.after_generation}"
+                f" target={selection.target_id}"
             )
-            lineage = manifest.lineage_label()
-            state_note = f"state: {lineage}"
-            if lineage == "v1":
-                state_note += (
-                    f" gen={manifest.before_generation}->{manifest.after_generation}"
-                    f" target={manifest.target_id or identity.target_id}"
-                )
-            print(
-                f"  {manifest.deployment_id}  {manifest.status:<18}  "
-                f"{selection}  "
-                f"{len(manifest.snapshots)} file(s)  {state_note}"
-            )
+        print(
+            f"  {entry.deployment_id}  {entry.status:<18}  "
+            f"{revision_selection}  {entry.file_count} file(s)  {state_note}"
+        )
     return 0
 
 
@@ -768,28 +1045,43 @@ def _run_verify(config: AppConfig, args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    remote_name, server, available_projects = select_remote(config, args.remote)
-    print(f"Remote: {remote_name}")
-    projects = _select_projects(available_projects, [args.target])
-    for project in projects:
-        from .config import resolve_project_target
-        from .target_identity import default_state_base
+    from .application import (
+        ApplicationConfigService,
+        SideEffectLevel,
+        StateInspectService,
+        VerifyRequest,
+        VerifyService,
+    )
 
-        identity = resolve_project_target(server, project)
-        target_root = identity.state_root(default_state_base(project.name, project.local_state_dir))
-        manifest = _select_manifest(
-            project,
-            args.deployment,
-            args.latest,
-            len(projects) > 1,
-            target_root=target_root,
+    config_service = ApplicationConfigService(config)
+    selection, generation = StateInspectService(config_service).current_generation(
+        args.remote,
+        args.target,
+    )
+    result = VerifyService(config_service).verify(
+        VerifyRequest(
+            remote=selection.remote_alias,
+            project=selection.project,
+            side_effect=SideEffectLevel.REMOTE_READ,
+            expected_target_id=selection.target_id,
+            expected_physical_fingerprint=selection.physical_fingerprint,
+            expected_generation=generation,
+            deployment_id=args.deployment,
+            latest=args.latest,
+            remote_check=True,
         )
-        with _progress_executor(server, project) as executor:
-            # Point legacy executor store at target-scoped root when present.
-            if (target_root / "deployments").is_dir():
-                executor.store = DeploymentStore(project, root=target_root)
-            checks = executor.verify(manifest)
-        _print_checks(project.name, checks)
+    )
+    print(f"Remote: {selection.remote_alias}")
+    matched = sum(item.status == "match" for item in result.paths)
+    print(f"[{selection.project}] remote checks: {matched}/{len(result.paths)} matched")
+    for item in result.paths:
+        if item.status == "match":
+            continue
+        expected = item.expected_sha256[:12] if item.expected_sha256 else "absent"
+        actual = item.actual_sha256[:12] if item.actual_sha256 else "absent"
+        print(f"  DRIFT {item.path}: expected {expected}, actual {actual}")
+    if not result.ok:
+        raise PolicyError("remote files do not match deployment state")
     return 0
 
 
@@ -807,6 +1099,13 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
     Returns:
         Process exit code.
     """
+
+    if (
+        bool(args.latest)
+        and not bool(args.dry_run)
+        and not bool(getattr(args, "_application_gated", False))
+    ):
+        return _run_application_latest_rollback(config, args)
 
     from .config import resolve_project_target
     from .expected_state import ExpectedStateStore
@@ -879,10 +1178,46 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
             print("Remote: not connected (local-only dry run)")
         return 0
 
-    _confirm(
-        args.yes,
-        f"Rollback {len(stateful) + len(legacy)} project(s) on remote {remote_name}?",
-    )
+    if bool(getattr(args, "_application_gated", False)):
+        _confirm(True, "rollback already confirmed by application policy")
+    else:
+        from .application import (
+            ApplicationConfigService,
+            RollbackRequest,
+            SideEffectLevel,
+            StateInspectService,
+            confirmation_policy_for,
+        )
+
+        config_service = ApplicationConfigService(config)
+        selection, generation = StateInspectService(config_service).current_generation(
+            remote_name,
+            projects[0].name,
+        )
+        request = RollbackRequest(
+            remote=selection.remote_alias,
+            project=selection.project,
+            side_effect=SideEffectLevel.REMOTE_MUTATION,
+            expected_target_id=selection.target_id,
+            expected_physical_fingerprint=selection.physical_fingerprint,
+            expected_generation=generation,
+            deployment_id=args.deployment,
+            latest=bool(args.latest),
+            force=bool(args.force),
+        )
+        policy = confirmation_policy_for(
+            request,
+            environment_risk=selection.environment_risk,
+        )
+        _cli_confirmation_grant(
+            policy,
+            assume_yes=bool(args.yes),
+            supplied_phrase=getattr(args, "confirm_phrase", None),
+            prompt=(
+                f"Rollback {len(stateful) + len(legacy)} project(s) "
+                f"on remote {remote_name}?"
+            ),
+        )
     for project, identity, target_root, service, manifest in stateful:
         # Re-check eligibility after confirm (current may have moved); still
         # before factory so repeat/advanced stay factory=0.
@@ -906,6 +1241,143 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_application_latest_rollback(
+    config: AppConfig,
+    args: argparse.Namespace,
+) -> int:
+    """Gate latest rollback through preview, policy, and worker services.
+
+    Args:
+        config: Loaded application configuration.
+        args: Parsed non-dry-run latest rollback arguments.
+
+    Returns:
+        Zero after all selected latest rollbacks complete.
+    """
+
+    import secrets
+
+    from .application import (
+        ApplicationConfigService,
+        ApplicationResult,
+        ApplicationWorker,
+        LatestRollbackService,
+        PlanTokenSigner,
+        ResultField,
+        ResultStatus,
+        RollbackRequest,
+        SideEffectLevel,
+        StateInspectService,
+        confirmation_policy_for,
+    )
+
+    config_service = ApplicationConfigService(config)
+    project_names = _application_project_names(
+        config_service,
+        args.remote,
+        [args.target],
+    )
+    first = config_service.resolve_project(args.remote, project_names[0])
+    remote_name = first.remote_alias
+    worker = ApplicationWorker(max_workers=1)
+    try:
+        for project_name in project_names:
+            state_service = StateInspectService(config_service)
+            selection, generation = state_service.current_generation(
+                remote_name,
+                project_name,
+            )
+            request = RollbackRequest(
+                remote=selection.remote_alias,
+                project=selection.project,
+                side_effect=SideEffectLevel.REMOTE_MUTATION,
+                expected_target_id=selection.target_id,
+                expected_physical_fingerprint=selection.physical_fingerprint,
+                expected_generation=generation,
+                latest=True,
+                force=bool(args.force),
+            )
+            signer = PlanTokenSigner(secrets.token_bytes(32))
+            nested_args = argparse.Namespace(**vars(args))
+            nested_args.target = project_name
+            nested_args.yes = True
+            nested_args._application_gated = True
+
+            def execute_domain(
+                _request,
+                rollback_plan,
+                _emit,
+                *,
+                _args=nested_args,
+                _request_context=request,
+                _state=state_service,
+            ):
+                """Run the existing latest rollback transaction adapter."""
+
+                code = _run_rollback(config, _args)
+                if code:
+                    raise PolicyError(f"rollback failed with exit code {code}")
+                _selection, after_generation = _state.current_generation(
+                    _request_context.remote,
+                    _request_context.project,
+                )
+                return ApplicationResult(
+                    operation=_request_context.operation,
+                    remote=_request_context.remote,
+                    project=_request_context.project,
+                    side_effect=_request_context.side_effect,
+                    status=ResultStatus.SUCCEEDED,
+                    summary="latest rollback command completed",
+                    fields=(
+                        ResultField("deployment_id", rollback_plan.deployment_id),
+                        ResultField("generation", after_generation),
+                        ResultField("exit_code", code),
+                    ),
+                )
+
+            service = LatestRollbackService(config_service, signer, execute_domain)
+            plan = service.preview(request)
+            policy = confirmation_policy_for(
+                request,
+                environment_risk=selection.environment_risk,
+            )
+            grant = _cli_confirmation_grant(
+                policy,
+                assume_yes=bool(args.yes),
+                supplied_phrase=getattr(args, "confirm_phrase", None),
+                prompt=f"Rollback project {project_name} on remote {remote_name}?",
+            )
+
+            def task(
+                event_sink,
+                *,
+                _service=service,
+                _request=request,
+                _plan=plan,
+                _grant=grant,
+            ):
+                """Execute one confirmed latest rollback in the worker boundary."""
+
+                return _service.execute(
+                    _request,
+                    _plan,
+                    token=_plan.plan_token,
+                    confirmation=_grant,
+                    event_sink=event_sink,
+                )
+
+            handle = worker.submit(
+                operation_id=f"rollback-{secrets.token_hex(12)}",
+                target_id=selection.target_id,
+                mutation=True,
+                task=task,
+            )
+            handle.future.result()
+    finally:
+        worker.shutdown()
+    return 0
+
+
 def _run_state(config: AppConfig, args: argparse.Namespace) -> int:
     """Dispatch ``git-deploy state`` subcommands.
 
@@ -923,6 +1395,11 @@ def _run_state(config: AppConfig, args: argparse.Namespace) -> int:
             "state gc is not supported in v0.2; all state/CAS/Git objects are retained"
         )
 
+    if command == "inspect":
+        return _state_inspect_application(config, args)
+    if command == "verify":
+        return _state_verify_application(config, args)
+
     remote_name, server, available_projects = select_remote(config, getattr(args, "remote", None))
     projects = _select_projects(available_projects, [args.target])
     if len(projects) != 1:
@@ -935,27 +1412,132 @@ def _run_state(config: AppConfig, args: argparse.Namespace) -> int:
     base = default_state_base(project.name, project.local_state_dir)
     target_root = identity.state_root(base)
 
-    if command == "inspect":
-        return _state_inspect(project, identity, target_root, remote_name)
-    if command == "verify":
-        remote_check = bool(getattr(args, "state_remote_check", False))
-        return _state_verify(
-            project,
-            identity,
-            target_root,
-            remote_name,
-            server,
-            remote_check=remote_check,
-        )
     if command == "bootstrap":
         return _state_bootstrap(project, identity, target_root, server, args)
     if command == "recover":
+        if bool(args.execute) and not bool(getattr(args, "_application_gated", False)):
+            return _run_application_recover(
+                config,
+                project,
+                identity,
+                target_root,
+                server,
+                remote_name,
+                args,
+            )
         return _state_recover(project, identity, target_root, server, args)
     if command == "migrate":
         return _state_migrate(project, config, server, remote_name, args)
     if command == "policy-migrate":
         return _state_policy_migrate(project, identity, target_root, server, args)
     raise ConfigurationError(f"unsupported state command: {command}")
+
+
+def _run_application_recover(
+    config: AppConfig,
+    project: ProjectConfig,
+    identity,
+    target_root: Path,
+    server: ServerConfig,
+    remote_name: str,
+    args: argparse.Namespace,
+) -> int:
+    """Gate recovery execution through shared risk policy and worker services.
+
+    Args:
+        config: Loaded application configuration.
+        project: Selected project configuration.
+        identity: Resolved physical target identity.
+        target_root: Target-scoped durable state root.
+        server: Selected server configuration.
+        remote_name: Canonical selected remote alias.
+        args: Parsed recovery execution arguments.
+
+    Returns:
+        Process exit code from the recovery domain adapter.
+    """
+
+    import secrets
+
+    from .application import (
+        ApplicationConfigService,
+        ApplicationResult,
+        ApplicationWorker,
+        ResultField,
+        ResultStatus,
+        SideEffectLevel,
+        StateAction,
+        StateInspectService,
+        StateRequest,
+        confirmation_policy_for,
+    )
+
+    config_service = ApplicationConfigService(config)
+    selection, generation = StateInspectService(config_service).current_generation(
+        remote_name,
+        project.name,
+    )
+    request = StateRequest(
+        remote=selection.remote_alias,
+        project=selection.project,
+        side_effect=SideEffectLevel.REMOTE_MUTATION,
+        expected_target_id=selection.target_id,
+        expected_physical_fingerprint=selection.physical_fingerprint,
+        expected_generation=generation,
+        action=StateAction.RECOVER,
+        execute=True,
+    )
+    policy = confirmation_policy_for(
+        request,
+        environment_risk=selection.environment_risk,
+    )
+    _cli_confirmation_grant(
+        policy,
+        assume_yes=bool(args.yes),
+        supplied_phrase=getattr(args, "confirm_phrase", None),
+        prompt=f"Recover project {project.name} on remote {remote_name}?",
+    )
+    nested_args = argparse.Namespace(**vars(args))
+    nested_args.yes = True
+    nested_args._application_gated = True
+
+    def task(_event_sink):
+        """Run the existing transaction recovery adapter off the caller thread."""
+
+        code = _state_recover(
+            project,
+            identity,
+            target_root,
+            server,
+            nested_args,
+        )
+        if code:
+            raise PolicyError(f"state recovery failed with exit code {code}")
+        return ApplicationResult(
+            operation=request.operation,
+            remote=request.remote,
+            project=request.project,
+            side_effect=request.side_effect,
+            status=ResultStatus.SUCCEEDED,
+            summary="state recovery command completed",
+            fields=(ResultField("exit_code", code),),
+        )
+
+    worker = ApplicationWorker(max_workers=1)
+    try:
+        handle = worker.submit(
+            operation_id=f"recover-{secrets.token_hex(12)}",
+            target_id=selection.target_id,
+            mutation=True,
+            task=task,
+        )
+        result = handle.future.result()
+    finally:
+        worker.shutdown()
+    for field in result.fields:
+        if field.name == "exit_code" and isinstance(field.value, int):
+            return field.value
+    return 0
 
 
 def _state_inspect(project: ProjectConfig, identity, target_root, remote_name: str) -> int:
@@ -1000,6 +1582,95 @@ def _state_inspect(project: ProjectConfig, identity, target_root, remote_name: s
     print(f"Legacy migration record: {'present' if migration.is_file() else 'absent'}")
     print("Remote: not connected (state inspect is local-only)")
     return 0
+
+
+def _state_inspect_application(config: AppConfig, args: argparse.Namespace) -> int:
+    """Render local state inspection through the shared application service.
+
+    Args:
+        config: Loaded application configuration.
+        args: Parsed state inspect arguments.
+
+    Returns:
+        Process exit code.
+    """
+
+    from .application import ApplicationConfigService, StateInspectService
+
+    result = StateInspectService(ApplicationConfigService(config)).inspect_selected(
+        getattr(args, "remote", None),
+        args.target,
+    )
+    print(f"Remote alias: {result.selection.remote_alias}")
+    print(f"Physical target ID: {result.selection.target_id}")
+    print("Policy fingerprint: (see current state)")
+    if not result.current_present:
+        print("Generation: (none)")
+        print("Current state: absent")
+    else:
+        print(f"Generation: {result.generation}")
+        print(f"State ID: {result.state_id}")
+        print(f"Source tree: {result.source_tree_id}")
+        print(f"Applied transitions: {result.applied_transition_count}")
+        print(f"Policy fingerprint: {result.state_policy_fingerprint}")
+        print(f"Physical fingerprint: {result.state_physical_fingerprint}")
+        print(f"Files: {result.file_count}")
+    print(f"Open transactions: {len(result.open_transactions)}")
+    for transaction in result.open_transactions:
+        print(f"  {transaction.transaction_id} stage={transaction.stage}")
+    print(
+        "Legacy migration record: "
+        f"{'present' if result.legacy_migration_present else 'absent'}"
+    )
+    print("Remote: not connected (state inspect is local-only)")
+    return 0
+
+
+def _state_verify_application(config: AppConfig, args: argparse.Namespace) -> int:
+    """Render current-state verification through the application service.
+
+    Args:
+        config: Loaded application configuration.
+        args: Parsed state verify arguments.
+
+    Returns:
+        Zero on match, three on local integrity failure or remote drift.
+    """
+
+    from .application import ApplicationConfigService, StateInspectService
+
+    remote_check = bool(getattr(args, "state_remote_check", False))
+    result = StateInspectService(ApplicationConfigService(config)).verify_selected(
+        getattr(args, "remote", None),
+        args.target,
+        remote_check=remote_check,
+    )
+    print(f"Remote alias: {result.selection.remote_alias}")
+    print(f"Target ID: {result.selection.target_id}")
+    if not result.current_present:
+        print("state_verify_local: no current state")
+        return 0
+    print(f"state_verify_local: current generation {result.generation} ok")
+    print(
+        "state_verify_local: physical fingerprint "
+        f"{result.selection.physical_fingerprint[:12]}..."
+    )
+    if not result.local_ok:
+        for reason in result.local_reasons:
+            print(f"state_verify_local: FAIL {reason}", file=sys.stderr)
+        return 3
+    print("state_verify_local: local integrity checks passed")
+    if not remote_check:
+        print("Remote: not connected")
+        return 0
+    print(f"state_verify_remote: write_calls={result.remote_write_calls}")
+    print(f"state_verify_remote: read_calls={result.remote_read_calls}")
+    for item in result.remote_paths:
+        print(
+            f"  {item.status} {item.path}: "
+            f"expected={item.expected_sha256} actual={item.actual_sha256}"
+        )
+    return 0 if result.ok else 3
 
 
 def _state_verify(
@@ -1660,6 +2331,55 @@ def _confirm(assume_yes: bool, prompt: str) -> None:
     answer = input(f"{prompt} Type 'yes' to continue: ").strip().lower()
     if answer != "yes":
         raise PolicyError("operation cancelled")
+
+
+def _cli_confirmation_grant(
+    policy: object,
+    *,
+    assume_yes: bool,
+    supplied_phrase: str | None,
+    prompt: str,
+):
+    """Map CLI confirmation flags to an adapter-neutral confirmation grant.
+
+    Args:
+        policy: ConfirmationPolicy derived by the application layer.
+        assume_yes: Whether ordinary confirmation was supplied with ``--yes``.
+        supplied_phrase: Explicit high-risk phrase, if provided.
+        prompt: Human-readable operation summary for an interactive terminal.
+
+    Returns:
+        ConfirmationGrant accepted by mutation application services.
+    """
+
+    from .application import (
+        ConfirmationGrant,
+        ConfirmationPolicy,
+        ConfirmationRequirement,
+    )
+
+    if not isinstance(policy, ConfirmationPolicy):
+        raise TypeError("policy must be a ConfirmationPolicy")
+    if policy.requirement is ConfirmationRequirement.NONE:
+        return ConfirmationGrant(True)
+    if policy.requirement is ConfirmationRequirement.CONFIRM:
+        _confirm(assume_yes, prompt)
+        return ConfirmationGrant(True)
+
+    assert policy.phrase is not None
+    if supplied_phrase is not None:
+        if supplied_phrase != policy.phrase:
+            raise PolicyError("high-risk confirmation phrase does not match")
+        return ConfirmationGrant(True, supplied_phrase)
+    if not sys.stdin.isatty():
+        raise PolicyError(
+            "high-risk mutation requires --confirm-phrase "
+            f"{policy.phrase!r}; --yes alone is insufficient"
+        )
+    answer = input(f"{prompt} Type {policy.phrase!r} to continue: ").strip()
+    if answer != policy.phrase:
+        raise PolicyError("operation cancelled: confirmation phrase did not match")
+    return ConfirmationGrant(True, answer)
 
 
 def _print_plan(plan: DeploymentPlan) -> None:

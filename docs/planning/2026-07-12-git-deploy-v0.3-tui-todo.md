@@ -30,26 +30,27 @@
 | T00 | 环境预检：确认 v0.2 基线与 v0.3 核心工具链 | Python/Git/uv、v0.2 清单、全量测试 | 输出 `python --version`、`git --version`、`uv --version`；确认 v0.2 `V2A/V2B/V2C/I05` 状态为已完成；`uv run pytest -q` 通过，否则本任务受阻 | — | 已完成 |
 | A01 | 定义 application operation request 协议 | 新增 application models、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k request` 通过；plan/deploy/history/verify/rollback/state/GC request 不可变并显式包含 remote、project、side-effect level 与预期 identity/generation | T00 | 已完成 |
 | A02 | 定义 application result 与 error 协议 | application models/errors、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k 'result or error'` 通过；结果不含 renderer 对象，错误具有稳定 code/category/context 且 context 自动脱敏 | A01 | 已完成 |
-| A03 | 扩展 operation/progress/transaction 事件协议 | `progress.py`、application events、`tests/test_progress.py` | `uv run pytest tests/test_progress.py -q -k operation_event` 通过；事件覆盖 operation/target/warning/transaction stage/terminal result，旧 `ProgressEvent` 消费者保持可用 | A02 | 待办 |
-| A04 | 实现确认策略模型 | application policy、`tests/test_confirmation_policy.py` | `uv run pytest tests/test_confirmation_policy.py -q` 通过；普通 mutation、prod、force、secret、历史回滚、GC/recover 分级，风险来自显式策略而非 alias 猜测 | A01 | 待办 |
-| A05 | 实现 operation plan 防重放凭据 | application plan token、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k stale_plan` 通过；token 绑定 request、target identity、policy fingerprint、generation 和 plan digest，任一变化使执行拒绝 | A04 | 待办 |
-| A06 | 定义协调取消状态机 | application cancellation、`tests/test_cancellation.py` | `uv run pytest tests/test_cancellation.py -q -k state_machine` 通过；区分可立即取消、等待 executor 协调、已提交和 manual recovery，不把 UI 关闭映射为成功回滚 | A03 | 待办 |
+| T01P | 增加 SFTP 文件 ownership 与权限策略 | `config.py`、`transport.py`、配置文档与 fake transport tests | `uv run pytest tests/test_config.py tests/test_transport.py -q -k 'sftp_permission or sftp_ownership'` 通过；默认文件 `0644`/可执行文件 `0755`/目录 `0755`，可按 remote 配置 owner/group/mode，文件在原子替换前完成 chmod/chown，FTP/FTPS 不静默接受该策略 | T00 | 已完成 |
+| A03 | 扩展 operation/progress/transaction 事件协议 | `progress.py`、application events、`tests/test_progress.py` | `uv run pytest tests/test_progress.py -q -k operation_event` 通过；事件覆盖 operation/target/warning/transaction stage/terminal result，旧 `ProgressEvent` 消费者保持可用 | A02 | 已完成 |
+| A04 | 实现确认策略模型 | application policy、`tests/test_confirmation_policy.py` | `uv run pytest tests/test_confirmation_policy.py -q` 通过；普通 mutation、prod、force、secret、历史回滚、GC/recover 分级，风险来自显式策略而非 alias 猜测 | A01 | 已完成 |
+| A05 | 实现 operation plan 防重放凭据 | application plan token、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k stale_plan` 通过；token 绑定 request、target identity、policy fingerprint、generation 和 plan digest，任一变化使执行拒绝 | A04 | 已完成 |
+| A06 | 定义协调取消状态机 | application cancellation、`tests/test_cancellation.py` | `uv run pytest tests/test_cancellation.py -q -k state_machine` 通过；区分可立即取消、等待 executor 协调、已提交和 manual recovery，不把 UI 关闭映射为成功回滚 | A03 | 已完成 |
 
 ## B. Gate A：共享应用服务与 CLI 兼容
 
 | ID | 任务 | 涉及范围 | 完成定义（DoD） | 依赖 | 状态 |
 |---|---|---|---|---|---|
-| S01 | 抽取配置、remote 与项目选择服务 | `config.py`、application config service、`tests/test_application_config.py` | `uv run pytest tests/test_application_config.py -q` 通过；解析结果包含 alias/physical target/risk 摘要，切换 remote 不继承旧 project selection 或确认状态 | A02 | 待办 |
-| S02 | 抽取 revision plan 应用服务 | planner facade、`tests/test_application_plan.py` | `uv run pytest tests/test_application_plan.py -q` 通过；local-only plan 返回结构化 source/artifact/build/warning，远端、state 写、worktree/build 调用均为 0 | S01, A05 | 待办 |
-| S03 | 抽取 history 应用服务 | state/history facade、`tests/test_application_history.py` | `uv run pytest tests/test_application_history.py -q` 通过；分页/选择/legacy lineage 返回结构化结果且零远端调用、零状态写 | S01 | 待办 |
-| S04 | 抽取 state inspect 应用服务 | state facade、`tests/test_application_state.py` | `uv run pytest tests/test_application_state.py -q -k inspect` 通过；返回 current/generation/identity/policy/transaction 摘要，损坏对象成为结构化错误且零写入 | S01 | 待办 |
-| S05 | 抽取 remote verify 应用服务 | verify facade、fake transport、`tests/test_application_verify.py` | `uv run pytest tests/test_application_verify.py -q` 通过；local/remote read 模式明确，remote 模式 transport 写调用和 state 写调用均为 0 | S04 | 待办 |
-| S06 | 抽取 deploy 应用服务 | executor facade、fake transport、`tests/test_application_deploy.py` | `uv run pytest tests/test_application_deploy.py -q` 通过；仅接受有效 plan token/confirmation，重复 execute 只产生一个 transaction，事件与最终 manifest 一致 | S02, A03, A04, A06 | 待办 |
-| S07 | 抽取最新回滚应用服务 | rollback facade、fake transport、`tests/test_application_rollback.py` | `uv run pytest tests/test_application_rollback.py -q -k latest` 通过；预览与执行分离，identity/generation/confirmation 复核，事件与派生 state 一致 | S03, S05, A05, A06 | 待办 |
-| S08 | 实现 application worker 适配器 | worker/operation controller、`tests/test_application_worker.py` | `uv run pytest tests/test_application_worker.py -q` 通过；同步服务在 worker 执行，事件有序投递；同 target mutation 互斥，重复提交被拒绝 | S06, S07 | 待办 |
-| C01 | 让 argparse CLI 改用只读应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'plan or history or verify or state'` 通过；parser/help/stdout/stderr/exit code snapshot 兼容，CLI 不直接调用 planner/store/transport | S02, S03, S04, S05 | 待办 |
-| C02 | 让 argparse CLI 改用变更应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'deploy or rollback or recover'` 通过；`--yes` 仅映射允许的确认策略，prod/高风险不能因适配器差异绕过 | S06, S07, S08, C01 | 待办 |
-| V3A | Gate A：CLI 与应用服务兼容门禁 | application/CLI/既有回归 | `uv run pytest tests/test_application_*.py tests/test_cli.py tests/test_progress.py -q` 与 `uv run pytest -q` 通过；未安装 TUI 依赖时基础 CLI 仍可运行 | C02 | 待办 |
+| S01 | 抽取配置、remote 与项目选择服务 | `config.py`、application config service、`tests/test_application_config.py` | `uv run pytest tests/test_application_config.py -q` 通过；解析结果包含 alias/physical target/risk 摘要，切换 remote 不继承旧 project selection 或确认状态 | A02 | 已完成 |
+| S02 | 抽取 revision plan 应用服务 | planner facade、`tests/test_application_plan.py` | `uv run pytest tests/test_application_plan.py -q` 通过；local-only plan 返回结构化 source/artifact/build/warning，远端、state 写、worktree/build 调用均为 0 | S01, A05 | 已完成 |
+| S03 | 抽取 history 应用服务 | state/history facade、`tests/test_application_history.py` | `uv run pytest tests/test_application_history.py -q` 通过；分页/选择/legacy lineage 返回结构化结果且零远端调用、零状态写 | S01 | 已完成 |
+| S04 | 抽取 state inspect 应用服务 | state facade、`tests/test_application_state.py` | `uv run pytest tests/test_application_state.py -q -k inspect` 通过；返回 current/generation/identity/policy/transaction 摘要，损坏对象成为结构化错误且零写入 | S01 | 已完成 |
+| S05 | 抽取 remote verify 应用服务 | verify facade、fake transport、`tests/test_application_verify.py` | `uv run pytest tests/test_application_verify.py -q` 通过；local/remote read 模式明确，remote 模式 transport 写调用和 state 写调用均为 0 | S04 | 已完成 |
+| S06 | 抽取 deploy 应用服务 | executor facade、fake transport、`tests/test_application_deploy.py` | `uv run pytest tests/test_application_deploy.py -q` 通过；仅接受有效 plan token/confirmation，重复 execute 只产生一个 transaction，事件与最终 manifest 一致 | S02, A03, A04, A06 | 已完成 |
+| S07 | 抽取最新回滚应用服务 | rollback facade、fake transport、`tests/test_application_rollback.py` | `uv run pytest tests/test_application_rollback.py -q -k latest` 通过；预览与执行分离，identity/generation/confirmation 复核，事件与派生 state 一致 | S03, S05, A05, A06 | 已完成 |
+| S08 | 实现 application worker 适配器 | worker/operation controller、`tests/test_application_worker.py` | `uv run pytest tests/test_application_worker.py -q` 通过；同步服务在 worker 执行，事件有序投递；同 target mutation 互斥，重复提交被拒绝 | S06, S07 | 已完成 |
+| C01 | 让 argparse CLI 改用只读应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'plan or history or verify or state'` 通过；parser/help/stdout/stderr/exit code snapshot 兼容，CLI 不直接调用 planner/store/transport | S02, S03, S04, S05 | 已完成 |
+| C02 | 让 argparse CLI 改用变更应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'deploy or rollback or recover'` 通过；`--yes` 仅映射允许的确认策略，prod/高风险不能因适配器差异绕过 | S06, S07, S08, C01 | 已完成 |
+| V3A | Gate A：CLI 与应用服务兼容门禁 | application/CLI/既有回归 | `uv run pytest tests/test_application_*.py tests/test_cli.py tests/test_progress.py -q` 与 `uv run pytest -q` 通过；未安装 TUI 依赖时基础 CLI 仍可运行 | C02 | 已完成 |
 
 ## C. Gate B：只读 TUI 与鼠标基础
 
@@ -142,3 +143,19 @@
 | 2026-07-13 | T00 v0.3 环境预检完成 | v0.2 V2A/V2B/V2C/I05 均已完成；宿主 Python 3.12.3、项目 uv Python 3.11.15、Git 2.43.0、uv 0.11.6；全量 261 passed |
 | 2026-07-13 | A01 application request 协议完成 | plan/deploy/history/verify/rollback/state/GC 均有不可变 typed request；remote/project/side-effect/target identity/generation 显式携带且 flag 与副作用等级一致；精确门禁 3 passed |
 | 2026-07-13 | A02 application result/error 协议完成 | 结构化结果不接受 renderer/widget 对象；错误 code/category/context 稳定，消息与递归 context 自动脱敏；精确门禁 8 passed |
+| 2026-07-13 | 新增并完成 T01P SFTP ownership/mode 策略 | 用户要求 root SFTP 登录时可将部署文件与新建目录交付给指定 owner/group；默认 `0644`/`0755`，配置、原子替换顺序、失败清理与 FTP/FTPS 拒绝共 8 项精确门禁通过 |
+| 2026-07-13 | A03 operation event 协议完成 | 类型化不可变事件覆盖 operation/target/warning/progress/transaction/terminal；旧 `ProgressEvent` 构造与 executor 消费保持兼容；精确门禁 2 passed、相关回归 9 passed |
+| 2026-07-13 | A04 confirmation policy 完成 | 环境风险使用显式分类而非 alias 猜测；普通 mutation、production/force/secret、历史回滚、GC delete、recover 分级并生成 target-bound 确认短语；精确门禁 6 passed |
+| 2026-07-13 | A05 signed plan token 完成 | HMAC token 绑定完整 request、target identity、generation、policy fingerprint 与 plan digest；任一边界变化均按 stale plan 拒绝；精确门禁 7 passed |
+| 2026-07-13 | A06 cancellation state machine 完成 | mutation 前立即取消，remote mutation 后仅协调取消；committed/recovered/manual recovery 保持可区分且 UI 关闭不伪报回滚；精确门禁 10 passed |
+| 2026-07-13 | S01 application config service 完成 | secret-safe 结果包含 alias/canonical endpoint/root/target identity/physical-policy fingerprint/显式风险；切换 remote 清空旧 project/token/confirmation；精确门禁 4 passed |
+| 2026-07-13 | S02 local revision plan service 完成 | 结构化返回 source/artifact/build/warning/digest/token；测试封锁 remote/build/worktree/state write/CAS 且 target state 目录未创建；精确门禁 1 passed |
+| 2026-07-13 | S03 application history service 完成 | 合并 target-scoped/legacy manifest，支持 offset/limit 分页与 deployment prefix 选择并显式标注 lineage；服务路径零远端、零 manifest/backup 写；精确门禁 1 passed |
+| 2026-07-13 | S04 application state inspect service 完成 | 结构化返回 current/generation/identity/policy/files/open transaction；损坏 state 映射为稳定 `state.corrupt` error，测试封锁 state/transaction 写；精确门禁 2 passed |
+| 2026-07-13 | S05 application verify service 完成 | local 模式零 transport，remote-read 模式结构化返回 match/absent/drift 并硬断言 transport write delta=0、state write=0；精确门禁 2 passed |
+| 2026-07-13 | C01 read-only argparse adapter 完成 | 常规 plan/history/deployment verify/state inspect/state verify 改用 application services，保留缺 host 旧配置 plan 兼容分支；CLI 精确门禁 25 passed、application 回归 31 passed、ruff/ty 通过 |
+| 2026-07-13 | S06 deploy application service 完成 | 签名 plan token + 分级确认后才调用 executor；同 token 成功结果幂等缓存，transaction/terminal events 与结构化 result 一致；精确门禁 2 passed |
+| 2026-07-13 | S07 latest rollback application service 完成 | preview/execute 分离，执行复核 identity/generation/token/confirmation；transaction event 与 result 一致且派生 generation=current+1，同 token 幂等；精确门禁 1 passed |
+| 2026-07-13 | S08 application worker 完成 | 同步 service 后台执行且事件 sequence 严格有序；同 target mutation 互斥、重复 operation ID 在提交阶段拒绝，并复用协调取消状态机；精确门禁 2 passed |
+| 2026-07-13 | C02 mutation argparse adapter 完成 | deploy/latest rollback 经签名计划、确认策略、application service 与 worker 执行；recover 经显式 StateRequest 风险策略与 worker 执行；新增 `--confirm-phrase`，production/force/secret/recover 不可被 `--yes` 单独绕过；精确门禁 12 passed、完整 CLI 40 passed |
+| 2026-07-13 | V3A CLI/application Gate A 完成 | application/CLI/progress 聚合门禁 76 passed，全项目 320 passed；ruff/ty/diff check 通过，基础 `git-deploy --help` 在未引入 TUI 依赖时正常启动 |

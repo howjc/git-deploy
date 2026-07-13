@@ -150,6 +150,8 @@ class HistoryRequest(ApplicationRequest):
 
     operation: ClassVar[OperationKind] = OperationKind.HISTORY
     limit: int = 20
+    offset: int = 0
+    deployment_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate history pagination and its local-read contract."""
@@ -157,6 +159,17 @@ class HistoryRequest(ApplicationRequest):
         super(HistoryRequest, self).__post_init__()
         if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit <= 0:
             raise ValueError("limit must be a positive integer")
+        if (
+            isinstance(self.offset, bool)
+            or not isinstance(self.offset, int)
+            or self.offset < 0
+        ):
+            raise ValueError("offset must be a non-negative integer")
+        if self.deployment_id is not None and (
+            not isinstance(self.deployment_id, str)
+            or not self.deployment_id.strip()
+        ):
+            raise ValueError("deployment_id must be a non-empty string or None")
         self._require_side_effect(SideEffectLevel.LOCAL_READ)
 
 
@@ -167,13 +180,18 @@ class VerifyRequest(ApplicationRequest):
     operation: ClassVar[OperationKind] = OperationKind.VERIFY
     deployment_id: str | None = None
     latest: bool = False
+    remote_check: bool = True
 
     def __post_init__(self) -> None:
         """Require one deployment selector and a remote-read declaration."""
 
         super(VerifyRequest, self).__post_init__()
         _validate_deployment_selector(self.deployment_id, self.latest)
-        self._require_side_effect(SideEffectLevel.REMOTE_READ)
+        self._require_side_effect(
+            SideEffectLevel.REMOTE_READ
+            if self.remote_check
+            else SideEffectLevel.LOCAL_READ
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
