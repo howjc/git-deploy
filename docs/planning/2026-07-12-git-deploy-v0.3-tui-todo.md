@@ -27,9 +27,9 @@
 
 | ID | 任务 | 涉及范围 | 完成定义（DoD） | 依赖 | 状态 |
 |---|---|---|---|---|---|
-| T00 | 环境预检：确认 v0.2 基线与 v0.3 核心工具链 | Python/Git/uv、v0.2 清单、全量测试 | 输出 `python --version`、`git --version`、`uv --version`；确认 v0.2 `V2A/V2B/V2C/I05` 状态为已完成；`uv run pytest -q` 通过，否则本任务受阻 | — | 待办 |
-| A01 | 定义 application operation request 协议 | 新增 application models、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k request` 通过；plan/deploy/history/verify/rollback/state/GC request 不可变并显式包含 remote、project、side-effect level 与预期 identity/generation | T00 | 待办 |
-| A02 | 定义 application result 与 error 协议 | application models/errors、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k 'result or error'` 通过；结果不含 renderer 对象，错误具有稳定 code/category/context 且 context 自动脱敏 | A01 | 待办 |
+| T00 | 环境预检：确认 v0.2 基线与 v0.3 核心工具链 | Python/Git/uv、v0.2 清单、全量测试 | 输出 `python --version`、`git --version`、`uv --version`；确认 v0.2 `V2A/V2B/V2C/I05` 状态为已完成；`uv run pytest -q` 通过，否则本任务受阻 | — | 已完成 |
+| A01 | 定义 application operation request 协议 | 新增 application models、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k request` 通过；plan/deploy/history/verify/rollback/state/GC request 不可变并显式包含 remote、project、side-effect level 与预期 identity/generation | T00 | 已完成 |
+| A02 | 定义 application result 与 error 协议 | application models/errors、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k 'result or error'` 通过；结果不含 renderer 对象，错误具有稳定 code/category/context 且 context 自动脱敏 | A01 | 已完成 |
 | A03 | 扩展 operation/progress/transaction 事件协议 | `progress.py`、application events、`tests/test_progress.py` | `uv run pytest tests/test_progress.py -q -k operation_event` 通过；事件覆盖 operation/target/warning/transaction stage/terminal result，旧 `ProgressEvent` 消费者保持可用 | A02 | 待办 |
 | A04 | 实现确认策略模型 | application policy、`tests/test_confirmation_policy.py` | `uv run pytest tests/test_confirmation_policy.py -q` 通过；普通 mutation、prod、force、secret、历史回滚、GC/recover 分级，风险来自显式策略而非 alias 猜测 | A01 | 待办 |
 | A05 | 实现 operation plan 防重放凭据 | application plan token、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k stale_plan` 通过；token 绑定 request、target identity、policy fingerprint、generation 和 plan digest，任一变化使执行拒绝 | A04 | 待办 |
@@ -139,3 +139,6 @@
 |---|---|---|
 | 2026-07-12 | 首版：拆分共享应用服务、只读 TUI、部署/最新回滚、鼠标门禁、历史回滚、GC 与发布任务 | 用户希望 v0.3 向支持键盘与鼠标的 TUI 方向迭代，同时承接 v0.2 后移能力 |
 | 2026-07-12 | `0.2.0a1` 后续计划轻量巡检：62 项仍待办、无进行中或受阻项 | v0.3 T00 明确依赖 v0.2 V2A/V2B/V2C/I05；当前仅 V2A 完成，因此先完成 v0.2 Gate B/C 与 GA，再进入 application service/TUI 实施 |
+| 2026-07-13 | T00 v0.3 环境预检完成 | v0.2 V2A/V2B/V2C/I05 均已完成；宿主 Python 3.12.3、项目 uv Python 3.11.15、Git 2.43.0、uv 0.11.6；全量 261 passed |
+| 2026-07-13 | A01 application request 协议完成 | plan/deploy/history/verify/rollback/state/GC 均有不可变 typed request；remote/project/side-effect/target identity/generation 显式携带且 flag 与副作用等级一致；精确门禁 3 passed |
+| 2026-07-13 | A02 application result/error 协议完成 | 结构化结果不接受 renderer/widget 对象；错误 code/category/context 稳定，消息与递归 context 自动脱敏；精确门禁 8 passed |
