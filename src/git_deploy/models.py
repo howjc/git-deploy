@@ -9,9 +9,71 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ServerConfig:
-    """Connection settings shared by configured projects."""
+    """Connection settings for one named remote environment."""
 
     values: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DockerBuildConfig:
+    """Restricted Docker runner settings resolved from TOML."""
+
+    image: str
+    platform: str = "linux/amd64"
+    network: str = "none"
+    pull_policy: str = "never"
+
+
+@dataclass(frozen=True)
+class OnePasswordConfig:
+    """Declared build environment names and opaque 1Password references."""
+
+    env: tuple[tuple[str, str], ...] = ()
+
+    def as_dict(self) -> dict[str, str]:
+        """Return a copy of the configured name-to-reference mapping."""
+
+        return dict(self.env)
+
+
+@dataclass(frozen=True)
+class BuildConfig:
+    """Validated build commands and runner policy for one project target."""
+
+    runner: str
+    commands: tuple[tuple[str, ...], ...]
+    timeout: int = 900
+    cwd: str = "."
+    env_allowlist: tuple[str, ...] = ()
+    docker: DockerBuildConfig | None = None
+    onepassword: OnePasswordConfig | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactConfig:
+    """One worktree-relative build output mapped below ``remote_root``."""
+
+    source: str
+    destination: str
+    kind: str
+
+    @property
+    def owner(self) -> str:
+        """Return a stable state owner name for this artifact mapping."""
+
+        return f"artifact:{self.destination}"
+
+
+@dataclass(frozen=True)
+class ProjectRemoteConfig:
+    """Optional project policy overrides for one named remote."""
+
+    remote_root: str | None = None
+    post_commands: tuple[str, ...] | None = None
+    health_urls: tuple[str, ...] | None = None
+    build: BuildConfig | None = None
+    build_configured: bool = False
+    artifacts: tuple[ArtifactConfig, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +89,13 @@ class ProjectConfig:
     post_commands: tuple[str, ...] = ()
     health_urls: tuple[str, ...] = ()
     local_state_dir: Path | None = None
+    remote: str = "default"
+    remotes: dict[str, ProjectRemoteConfig] = field(default_factory=dict)
+    target_id: str | None = None
+    build: BuildConfig | None = None
+    artifacts: tuple[ArtifactConfig, ...] = ()
+    build_origin: str = "none"
+    artifacts_origin: str = "project"
 
 
 @dataclass(frozen=True)
@@ -34,8 +103,9 @@ class AppConfig:
     """Fully resolved deployment configuration and its source path."""
 
     path: Path
-    server: ServerConfig
+    remotes: dict[str, ServerConfig]
     projects: dict[str, ProjectConfig]
+    default_remote: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +177,18 @@ class DeploymentManifest:
     snapshots: list[FileSnapshot] = field(default_factory=list)
     error: str | None = None
     revision_specs: list[str] = field(default_factory=list)
+    remote: str = "default"
+    # v0.2 optional state lineage (absent on v0.1.5 manifests).
+    before_state_id: str | None = None
+    after_state_id: str | None = None
+    before_generation: int | None = None
+    after_generation: int | None = None
+    introduced_transition_ids: list[str] = field(default_factory=list)
+    physical_fingerprint: str | None = None
+    policy_fingerprint: str | None = None
+    transaction_id: str | None = None
+    target_id: str | None = None
+    state: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the complete manifest as JSON-compatible primitives."""
@@ -125,5 +207,34 @@ class DeploymentManifest:
         """
 
         values = dict(payload)
-        values["snapshots"] = [FileSnapshot(**row) for row in payload.get("snapshots", [])]
-        return cls(**values)
+        values["snapshots"] = [
+            FileSnapshot(**{k: v for k, v in row.items() if k in FileSnapshot.__dataclass_fields__})
+            for row in payload.get("snapshots", [])
+        ]
+        # Drop unknown keys so older/newer fixtures remain readable.
+        allowed = set(cls.__dataclass_fields__)
+        filtered = {key: value for key, value in values.items() if key in allowed}
+        # Preserve legacy readability: missing lineage stays empty/None.
+        if filtered.get("state") is None and not any(
+            filtered.get(key) is not None
+            for key in (
+                "before_state_id",
+                "after_state_id",
+                "before_generation",
+                "after_generation",
+                "transaction_id",
+            )
+        ):
+            filtered["state"] = None
+        return cls(**filtered)
+
+    def lineage_label(self) -> str:
+        """Return a human-readable lineage marker for history/verify output.
+
+        Returns:
+            ``legacy`` when no v0.2 state lineage is present, otherwise ``v1``.
+        """
+
+        if self.state == "v1" or self.before_state_id or self.after_state_id or self.transaction_id:
+            return "v1"
+        return "legacy"

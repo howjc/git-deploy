@@ -6,22 +6,31 @@ import json
 import os
 from pathlib import Path
 
+from .durable_io import durable_publish
 from .errors import ConfigurationError
 from .models import DeploymentManifest, ProjectConfig
 
 
 class DeploymentStore:
-    """Persist deployment metadata below a project-specific state directory."""
+    """Persist deployment metadata below a project or physical-target root."""
 
-    def __init__(self, project: ProjectConfig):
+    def __init__(self, project: ProjectConfig, *, root: Path | None = None):
         """Resolve the state location without creating it.
 
         Args:
             project: Project whose deployment history is stored.
+            root: Optional physical target root (preferred for v0.2). When set,
+                manifests/backups live under this root so dev/prod targets isolate.
+                When omitted, falls back to legacy project/remote layout.
         """
 
         self.project = project
-        self.root = project.local_state_dir or _default_state_root(project.name)
+        if root is not None:
+            self.root = Path(root)
+        else:
+            base = project.local_state_dir or _default_state_root(project.name)
+            # Named remotes must never share deployment history or rollback backups.
+            self.root = base if project.remote == "default" else base / "remotes" / project.remote
 
     def deployment_dir(self, deployment_id: str) -> Path:
         """Return a validated deployment record directory.
@@ -191,20 +200,14 @@ def _validate_deployment_id(deployment_id: str) -> None:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """Write bytes through a sibling temporary file and atomic replace.
+    """Write bytes through the durable atomic publisher (S05A).
+
+    Deployment backups and manifests share the same write→fsync→replace→dir-fsync
+    contract as state/CAS/current/journal so crash recovery never sees half writes.
 
     Args:
         path: Final local path.
         data: Bytes to persist.
     """
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    try:
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    durable_publish(path, data)

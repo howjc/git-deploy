@@ -370,6 +370,7 @@ class DeploymentExecutor:
             status="prepared",
             snapshots=snapshots,
             revision_specs=list(plan.revision_specs),
+            remote=self.project.remote,
         )
 
     def _new_deployment_id(self, target_commit: str) -> str:

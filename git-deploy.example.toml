@@ -1,4 +1,12 @@
-[server]
+# Name multiple remote environments and select one with --remote dev|prod.
+[remotes.dev]
+protocol = "sftp"
+ssh_host_alias = "development"
+ssh_config_file = "~/.ssh/config"
+strict_host_key_checking = true
+timeout = 15
+
+[remotes.prod]
 protocol = "sftp"
 ssh_host_alias = "production"
 ssh_config_file = "~/.ssh/config"
@@ -7,11 +15,65 @@ timeout = 15
 
 [projects.application]
 repository = "."
-remote_root = "/srv/application"
 include = ["src/**", "public/**", "config/**"]
 exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**"]
 protected = [".env", "runtime/**", "storage/cert/**"]
+
+[projects.application.remotes.dev]
+remote_root = "/srv/dev/application"
+post_commands = [
+  "cd /srv/dev/application && ./bin/clear-cache",
+]
+health_urls = ["https://dev.example.com/health"]
+
+[projects.application.remotes.prod]
+remote_root = "/srv/application"
 post_commands = [
   "cd /srv/application && ./bin/clear-cache",
 ]
 health_urls = ["https://example.com/health"]
+
+# v0.2 Docker + 1Password Composer artifact example. Remote build tables are
+# complete replacements: dev intentionally has no production secret mapping.
+[projects.official-v2]
+repository = "."
+include = ["app/**", "config/**", "public/**"]
+exclude = ["tests/**", "docs/**", "runtime/**", "tmp/**"]
+protected = [".env", "runtime/**", "storage/cert/**"]
+
+[[projects.official-v2.artifacts]]
+source = "vendor"
+destination = "vendor"
+kind = "tree"
+
+[projects.official-v2.remotes.dev]
+remote_root = "/srv/dev/official-v2"
+
+[projects.official-v2.remotes.dev.build]
+runner = "docker"
+commands = [["composer", "install", "--no-dev", "--no-interaction"]]
+timeout = 900
+
+[projects.official-v2.remotes.dev.build.docker]
+image = "composer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+platform = "linux/amd64"
+network = "none"
+pull_policy = "never"
+
+[projects.official-v2.remotes.prod]
+remote_root = "/srv/official-v2"
+
+[projects.official-v2.remotes.prod.build]
+runner = "docker"
+commands = [["composer", "install", "--no-dev", "--classmap-authoritative", "--no-interaction"]]
+timeout = 900
+env_allowlist = ["COMPOSER_AUTH"]
+
+[projects.official-v2.remotes.prod.build.docker]
+image = "composer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+platform = "linux/amd64"
+network = "bridge"
+pull_policy = "never"
+
+[projects.official-v2.remotes.prod.build.onepassword.env]
+COMPOSER_AUTH = "op://build/composer/auth"

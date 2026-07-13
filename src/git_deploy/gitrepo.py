@@ -149,6 +149,7 @@ class GitRepository:
         base: str,
         commits: Sequence[str],
         base_is_empty: bool = False,
+        extra_alternates: Sequence[str] | None = None,
     ) -> Iterator[tuple[str, dict[str, str]]]:
         """Replay selected first-parent patches into an isolated Git index.
 
@@ -156,6 +157,8 @@ class GitRepository:
             base: Commit or empty-tree object supplying the initial snapshot.
             commits: Resolved commits ordered from oldest to newest.
             base_is_empty: Initialize an empty index and temporary empty-tree object.
+            extra_alternates: Additional object directories (e.g. durable target store)
+                searched after the temporary compose directory.
 
         Yields:
             Target tree identifier and environment able to read its temporary objects.
@@ -172,6 +175,10 @@ class GitRepository:
                 main_objects = (self.path / main_objects).resolve()
             environment = os.environ.copy()
             alternates = [str(main_objects)]
+            if extra_alternates:
+                for item in extra_alternates:
+                    if item and item not in alternates:
+                        alternates.append(str(item))
             inherited_alternates = environment.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             if inherited_alternates:
                 alternates.append(inherited_alternates)
