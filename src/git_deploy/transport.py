@@ -473,6 +473,96 @@ class SftpTransport:
             )
 
 
+def ftps_tls_trust_digest(server: dict[str, Any]) -> str:
+    """Return a secret-free digest of FTPS trust-boundary settings.
+
+    Includes verification mode, CA file path, and client cert path presence —
+    never private key material or passwords. Used for identity/policy summaries.
+
+    Args:
+        server: Effective FTPS connection mapping.
+
+    Returns:
+        Lowercase hex SHA-256 digest of the trust configuration.
+    """
+
+    import json
+
+    verify = _ftps_tls_verify_enabled(server)
+    ca_file = str(server.get("tls_ca_file") or server.get("ca_file") or "").strip()
+    cert_file = str(server.get("tls_cert_file") or server.get("cert_file") or "").strip()
+    payload = {
+        "schema_version": 1,
+        "tls_ca_file": ca_file,
+        "tls_cert_file": cert_file,
+        "tls_verify": verify,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _ftps_tls_verify_enabled(server: dict[str, Any]) -> bool:
+    """Return whether FTPS must verify server certificates (default true).
+
+    Args:
+        server: Effective FTPS connection mapping.
+
+    Returns:
+        True when verification is required.
+    """
+
+    if "tls_verify" in server:
+        return bool(server.get("tls_verify"))
+    if "ssl_verify" in server:
+        return bool(server.get("ssl_verify"))
+    # Default fail-closed: only explicit false opts out.
+    return True
+
+
+def build_ftps_ssl_context(server: dict[str, Any]) -> Any:
+    """Build an SSLContext for FTPS with verified defaults.
+
+    Default: CERT_REQUIRED + hostname checking, system/default CA trust, optional
+    custom CA and client certificate. Explicit ``tls_verify=false`` creates an
+    unverified context and must only be used for legacy servers.
+
+    Args:
+        server: Effective FTPS connection mapping.
+
+    Returns:
+        Configured ``ssl.SSLContext`` for ``ftplib.FTP_TLS``.
+    """
+
+    import ssl
+    import warnings
+
+    verify = _ftps_tls_verify_enabled(server)
+    ca_file = str(server.get("tls_ca_file") or server.get("ca_file") or "").strip() or None
+    cert_file = str(server.get("tls_cert_file") or server.get("cert_file") or "").strip() or None
+    key_file = str(server.get("tls_key_file") or server.get("key_file") or "").strip() or None
+
+    if not verify:
+        warnings.warn(
+            "FTPS tls_verify=false disables server certificate and hostname "
+            "verification; credentials and payloads are exposed to MITM",
+            UserWarning,
+            stacklevel=2,
+        )
+        context = ssl._create_unverified_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        if cert_file:
+            context.load_cert_chain(cert_file, key_file)
+        return context
+
+    context = ssl.create_default_context(cafile=ca_file)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    if cert_file:
+        context.load_cert_chain(cert_file, key_file)
+    return context
+
+
 class FtpTransport:
     """FTP/FTPS transport implementing the same backup-friendly file API."""
 
@@ -492,11 +582,17 @@ class FtpTransport:
         username = str(server.get("username", "")).strip()
         if not host or not username:
             raise ConfigurationError("FTP requires host and username")
-        client_type = ftplib.FTP_TLS if use_tls else ftplib.FTP
-        self._ftp = client_type()
         # Identity and connect must share the same default-port source of truth.
         protocol = "ftps" if use_tls else "ftp"
         connect_port = effective_port(protocol, server.get("port"))
+        if use_tls:
+            context = build_ftps_ssl_context(server)
+            # FTP_TLS(context=...) is supported on CPython 3.9+.
+            self._ftp = ftplib.FTP_TLS(context=context)
+            self._tls_trust_digest = ftps_tls_trust_digest(server)
+        else:
+            self._ftp = ftplib.FTP()
+            self._tls_trust_digest = ""
         try:
             self._ftp.connect(
                 host,

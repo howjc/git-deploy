@@ -225,13 +225,24 @@ class StateRollbackService:
                     f"expected={snapshot.before_sha256[:12]} actual={actual[:12]}"
                 )
 
-    def rollback_latest(self, *, fail_after_writes: int | None = None) -> RollbackResult:
+    def rollback_latest(
+        self,
+        *,
+        force: bool = False,
+        fail_after_writes: int | None = None,
+    ) -> RollbackResult:
         """Restore remote before bytes and CAS a new generation reflecting before lineage.
 
         Durable transaction evidence is written before the first remote mutation so
         a partial multi-file crash can be recovered via ``state recover``.
 
+        Under target lock and before journal/remote mutation, remote bytes are
+        compared to each snapshot's after-state (exists/hash/mode). Default
+        refuses third-party content with zero mutations; ``force=True`` continues
+        and persists the real pre-rollback remote bytes as recovery backup.
+
         Args:
+            force: Allow remote after-state drift (third-party content).
             fail_after_writes: Test-only injection for partial rollback crash.
 
         Returns:
@@ -247,6 +258,8 @@ class StateRollbackService:
             pointer, current_state = loaded
             # Same gates as CLI pre-connect path (after_state match + before readable).
             manifest = self.assert_rollback_eligible()
+            # Lock-held after-state check before any durable write or mutation.
+            self._require_remote_after_state(manifest, force=force)
             # v1 / lineage: before immutable state already validated; load for after build.
             # Snapshot-only fallback is limited to true legacy/no-lineage manifests.
             after = None
@@ -300,8 +313,8 @@ class StateRollbackService:
                     "before_exists": True,
                     "executable": bool(snapshot.after_executable),
                 }
-                # Capture current remote bytes so crash recovery can restore
-                # the pre-rollback (current) remote state.
+                # Capture real remote bytes (possibly third-party when force)
+                # so crash recovery restores pre-rollback remote, not manifest after.
                 data = self.transport.read_file(snapshot.remote_path)
                 if data is not None:
                     rel = self.deploy_store.write_backup(
@@ -328,6 +341,7 @@ class StateRollbackService:
                     "rollback_of": manifest.deployment_id,
                     "backup_entries": backup_entries,
                     "paths": [snap.path for snap in manifest.snapshots],
+                    "force": bool(force),
                 },
             )
             journal = self.tx_store.advance(journal, "remote_mutating")
@@ -373,6 +387,64 @@ class StateRollbackService:
                 after_state_id=after.state_id(),
                 restored_paths=tuple(restored),
             )
+
+    def _require_remote_after_state(
+        self,
+        manifest: DeploymentManifest,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Verify remote matches each snapshot after-state before mutation.
+
+        Args:
+            manifest: Eligible latest deployment being rolled back.
+            force: When true, allow third-party content and continue.
+
+        Returns:
+            None.
+
+        Raises:
+            PolicyError: When remote drifts from after-state and force is false.
+            RemoteDriftError: Alias-style drift when force is false (stable code path).
+        """
+
+        import hashlib
+
+        from .errors import RemoteDriftError
+
+        drifts: list[str] = []
+        for snapshot in manifest.snapshots:
+            actual = self.transport.read_file(snapshot.remote_path)
+            if snapshot.after_exists:
+                if actual is None:
+                    drifts.append(f"{snapshot.path}: missing (expected after content)")
+                    continue
+                if snapshot.after_sha256 is not None:
+                    actual_hash = hashlib.sha256(actual).hexdigest()
+                    if actual_hash != snapshot.after_sha256:
+                        drifts.append(
+                            f"{snapshot.path}: hash drift "
+                            f"expected={snapshot.after_sha256[:12]} actual={actual_hash[:12]}"
+                        )
+                checker = getattr(self.transport, "is_executable", None)
+                if (
+                    callable(checker)
+                    and snapshot.after_executable is not None
+                ):
+                    mode = checker(snapshot.remote_path)
+                    if mode is not None and bool(mode) != bool(snapshot.after_executable):
+                        drifts.append(f"{snapshot.path}: mode drift")
+            else:
+                if actual is not None:
+                    drifts.append(f"{snapshot.path}: unexpectedly present after delete")
+
+        if drifts and not force:
+            detail = "; ".join(drifts)
+            raise RemoteDriftError(
+                "rollback refused: remote after-state drift "
+                f"(use --force to overwrite third-party content): {detail}"
+            )
+
 
     def _verify_rollback_snapshot(self, snapshot: Any) -> None:
         """Read-back verify one restored path against manifest before state.

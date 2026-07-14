@@ -204,6 +204,140 @@ def test_latest_rollback_restores_bytes_and_generation(tmp_path: Path) -> None:
     assert "t0" in state.applied_transition_ids
 
 
+def test_rollback_after_match_allows_default(tmp_path: Path) -> None:
+    """When remote matches after-state, default rollback proceeds."""
+
+    service, transport, store, _identity, _older, _latest = _setup(tmp_path)
+    assert transport.files["/srv/a.txt"].data == b"after"
+    result = service.rollback_latest(force=False)
+    assert result.status == "succeeded"
+    assert transport.files["/srv/a.txt"].data == b"before"
+    assert store.read_current().generation == 3  # type: ignore[union-attr]
+
+
+def test_rollback_hash_drift_refused_with_zero_mutation(tmp_path: Path) -> None:
+    """Third-party hash drift is refused by default with zero remote/journal mutation."""
+
+    from git_deploy.errors import RemoteDriftError
+    from git_deploy.transaction import TransactionStore
+
+    service, transport, store, _identity, _older, _latest = _setup(tmp_path)
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"hotfix-third-party")
+    gen = store.read_current().generation  # type: ignore[union-attr]
+    writes = transport.write_calls
+    deletes = transport.delete_calls
+    tx_before = len(TransactionStore(service.target_root).list_all())
+
+    with pytest.raises(RemoteDriftError, match="after-state drift|hash drift"):
+        service.rollback_latest(force=False)
+
+    assert transport.write_calls == writes
+    assert transport.delete_calls == deletes
+    assert transport.files["/srv/a.txt"].data == b"hotfix-third-party"
+    assert store.read_current().generation == gen  # type: ignore[union-attr]
+    assert len(TransactionStore(service.target_root).list_all()) == tx_before
+    assert TransactionStore(service.target_root).list_open() == []
+
+
+def test_rollback_missing_file_refused(tmp_path: Path) -> None:
+    """Missing remote file expected by after-state is refused by default."""
+
+    from git_deploy.errors import RemoteDriftError
+
+    service, transport, store, _identity, _older, _latest = _setup(tmp_path)
+    del transport.files["/srv/a.txt"]
+    gen = store.read_current().generation  # type: ignore[union-attr]
+    with pytest.raises(RemoteDriftError, match="missing|after-state drift"):
+        service.rollback_latest()
+    assert store.read_current().generation == gen  # type: ignore[union-attr]
+
+
+def test_rollback_mode_drift_refused(tmp_path: Path) -> None:
+    """Executable mode drift against after-state is refused by default."""
+
+    from git_deploy.errors import RemoteDriftError
+    from git_deploy.models import DeploymentManifest, FileSnapshot
+    from git_deploy.state import DeploymentStore
+
+    service, transport, store, identity, _older, latest = _setup(tmp_path)
+    # Rewrite latest snapshot with after_executable=False while remote is executable.
+    deploy = DeploymentStore(service.project, root=service.target_root)
+    snap = latest.snapshots[0]
+    rewritten = DeploymentManifest(
+        deployment_id=latest.deployment_id,
+        project=latest.project,
+        repository=latest.repository,
+        remote_root=latest.remote_root,
+        from_commit=latest.from_commit,
+        to_commit=latest.to_commit,
+        created_at=latest.created_at,
+        status="succeeded",
+        snapshots=[
+            FileSnapshot(
+                path=snap.path,
+                remote_path=snap.remote_path,
+                before_exists=snap.before_exists,
+                before_sha256=snap.before_sha256,
+                backup_file=snap.backup_file,
+                after_exists=True,
+                after_sha256=snap.after_sha256,
+                before_executable=snap.before_executable,
+                after_executable=False,
+            )
+        ],
+        state="v1",
+        before_state_id=latest.before_state_id,
+        after_state_id=latest.after_state_id,
+        before_generation=latest.before_generation,
+        after_generation=latest.after_generation,
+        introduced_transition_ids=list(latest.introduced_transition_ids),
+        target_id=identity.target_id,
+    )
+    deploy.write_manifest(rewritten)
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"after", executable=True)
+    with pytest.raises(RemoteDriftError, match="mode drift|after-state drift"):
+        service.rollback_latest(force=False)
+
+
+def test_rollback_force_allows_third_party_and_restores_on_partial_fail(
+    tmp_path: Path,
+) -> None:
+    """force=True allows third-party content; mid-fail recovery keeps third-party bytes."""
+
+    from git_deploy.transaction import TransactionStore
+
+    service, transport, store, _identity, _older, _latest = _setup(tmp_path)
+    third = b"panel-hotfix"
+    transport.files["/srv/a.txt"] = FakeRemotePath(third)
+    # Force path must succeed end-to-end when no failure is injected.
+    ok = service.rollback_latest(force=True)
+    assert ok.status == "succeeded"
+    assert transport.files["/srv/a.txt"].data == b"before"
+
+    # Fresh fixture: force + mid-failure persists third-party bytes as recovery backup.
+    partial_root = tmp_path / "force_partial"
+    partial_root.mkdir()
+    service2, transport2, store2, _id2, _o2, latest2 = _setup(partial_root)
+    transport2.files["/srv/a.txt"] = FakeRemotePath(third)
+    with pytest.raises(PolicyError, match="partial failure|state recover"):
+        service2.rollback_latest(force=True, fail_after_writes=1)
+    open_tx = TransactionStore(service2.target_root).list_open()
+    assert open_tx
+    assert open_tx[0].stage == "remote_mutating"
+    entries = open_tx[0].meta.get("backup_entries") or []
+    assert entries
+    entry = entries[0]
+    assert entry.get("backup_file")
+    # Recovery backup must be the real third-party content, not manifest after bytes.
+    recovered = service2.deploy_store.read_backup(
+        f"rb-{latest2.deployment_id}",
+        entry["backup_file"],
+    )
+    assert recovered == third
+    # Generation must not have advanced past the pre-rollback current.
+    assert store2.read_current().generation == 2  # type: ignore[union-attr]
+
+
 def test_corrupt_before_backup_blocks_rollback_before_remote_io(
     tmp_path: Path,
 ) -> None:
@@ -871,8 +1005,9 @@ def test_rollback_read_error_fails_closed(tmp_path: Path) -> None:
 
     def flaky_read(remote_path: str):
         calls["n"] += 1
-        # Allow pre-rollback backup reads; fail during post-write verify.
-        if calls["n"] > 1:
+        # Allow after-state check + pre-rollback recovery backup reads;
+        # fail during post-write verify (third read of the same path).
+        if calls["n"] > 2:
             raise OSError("injected readback failure")
         return real_read(remote_path)
 

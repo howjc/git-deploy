@@ -31,6 +31,10 @@ class SourceDiffPlan:
         remote_unverified: True when plan is static/local-only (no remote check).
         static_noop: True when no file mutations and only already-applied transitions.
         revision_specs: Durable selectors with HEAD expressions frozen to commit IDs.
+        expected_before_state_id: Plan-time current state id (lock-held stale guard).
+        expected_generation: Plan-time current generation (lock-held stale guard).
+        expected_before_tree_id: Optional explicit freeze of before tree (defaults to before_tree_id).
+        expected_before_applied_transition_ids: Plan-time applied transition set.
     """
 
     before_tree_id: str
@@ -42,6 +46,10 @@ class SourceDiffPlan:
     remote_unverified: bool = False
     static_noop: bool = False
     revision_specs: tuple[str, ...] = ()
+    expected_before_state_id: str | None = None
+    expected_generation: int | None = None
+    expected_before_tree_id: str | None = None
+    expected_before_applied_transition_ids: tuple[str, ...] | None = None
 
 
 class StatePlanner:

@@ -185,24 +185,28 @@ class DeployService:
                 )
                 sequence += 1
 
-            if static_noop:
+            # Static no-op still runs the executor so domain can re-read current
+            # under target lock and reject a stale plan (zero remote mutation).
+            result = self._executor(request, plan, emit_transaction)
+            if static_noop and result.status is ResultStatus.SUCCEEDED:
+                # Domain adapters may report success for already-deployed; normalize.
                 result = ApplicationResult(
                     operation=request.operation,
                     remote=request.remote,
                     project=request.project,
                     side_effect=request.side_effect,
                     status=ResultStatus.NOOP,
-                    summary=(
+                    summary=result.summary
+                    or (
                         "No changes: target generation already matches "
                         f"{plan.after_tree_id}"
                     ),
-                    fields=(
+                    fields=result.fields
+                    or (
                         ResultField("generation", plan.generation),
                         ResultField("target_tree_id", plan.after_tree_id),
                     ),
                 )
-            else:
-                result = self._executor(request, plan, emit_transaction)
             _validate_result(request, result, transaction_ids)
             emit(
                 TerminalResultEvent(

@@ -6,7 +6,7 @@ import argparse
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import __version__
@@ -874,6 +874,14 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
             applied_transition_ids=state.applied_transition_ids,
             static_only=is_dry_run,
         )
+        # Freeze plan-time before-boundary so lock-held deploy rejects TOCTOU races.
+        source_plan = replace(
+            source_plan,
+            expected_before_state_id=state.state_id(),
+            expected_generation=state.generation,
+            expected_before_tree_id=state.source_tree_id,
+            expected_before_applied_transition_ids=tuple(state.applied_transition_ids),
+        )
         object_env = planner.object_env()
         print(
             f"  source tree {source_plan.before_tree_id[:12]} -> {source_plan.after_tree_id[:12]}"
@@ -934,8 +942,31 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         for item in stateful_items
         if item[0].build is not None or item[3].files or item[3].introduced_transition_ids
     ]
-    if not actionable_legacy and not actionable_state:
+    # Static no-op plans still enter the domain executor under target lock so a
+    # concurrent generation advance is reported as stale_plan (zero remote I/O).
+    noop_state = [
+        item
+        for item in stateful_items
+        if item not in actionable_state and item[3].static_noop
+    ]
+    if not actionable_legacy and not actionable_state and not noop_state:
         print("No selected tracked-file changes; nothing deployed.")
+        return 0
+    if not actionable_legacy and not actionable_state and noop_state:
+        for project, identity, target_root, source_plan, _object_env, _git_store in noop_state:
+            from .state_executor import InMemoryTransport, StateDeploymentExecutor
+
+            executor = StateDeploymentExecutor(
+                project,
+                identity,
+                target_root,
+                transport=InMemoryTransport(),
+            )
+            result = executor.deploy(source_plan, list(source_plan.files), force=False)
+            print(
+                f"[{project.name}] {result.get('status', 'already deployed')} "
+                f"(generation={result.get('generation')})"
+            )
         return 0
     _confirm(
         args.yes,
@@ -1034,6 +1065,17 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
                         raise ConfigurationError(
                             "artifact baseline state transition wrote remote"
                         )
+                    # Baseline advances generation/state_id without source mutations;
+                    # re-freeze the deploy plan boundary to the post-baseline current.
+                    source_plan = replace(
+                        source_plan,
+                        expected_before_state_id=current_state.state_id(),
+                        expected_generation=current_state.generation,
+                        expected_before_tree_id=current_state.source_tree_id,
+                        expected_before_applied_transition_ids=tuple(
+                            current_state.applied_transition_ids
+                        ),
+                    )
                     artifact_plan = artifact_planner.plan(
                         project, current_state, target_build.entry
                     )
@@ -1467,7 +1509,7 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
         transport = open_cli_transport(dict(server.values))
         try:
             service.transport = transport  # type: ignore[assignment]
-            result = service.rollback_latest()
+            result = service.rollback_latest(force=bool(args.force))
         finally:
             close = getattr(transport, "close", None)
             if callable(close):

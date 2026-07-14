@@ -143,10 +143,10 @@ def test_application_deploy_requires_token_confirmation_and_is_idempotent(
     assert events[-1].result is first
 
 
-def test_application_deploy_static_noop_skips_confirmation_and_executor(
+def test_application_deploy_static_noop_skips_confirmation_runs_executor(
     tmp_path: Path,
 ) -> None:
-    """Return a successful no-op without transaction, write, or confirmation."""
+    """Static no-op skips confirmation but still runs executor for freshness."""
 
     signer, request, planned = _planned_deploy(tmp_path)
     plan = replace(
@@ -158,11 +158,25 @@ def test_application_deploy_static_noop_skips_confirmation_and_executor(
     )
     calls = {"executor": 0}
 
-    def executor(*_args):
-        """Fail the test if a static no-op crosses the executor boundary."""
+    def executor(req, reviewed, _emit):
+        """Domain adapter returns already-deployed NOOP after lock-held guard."""
 
         calls["executor"] += 1
-        raise AssertionError("static no-op must not execute")
+        return ApplicationResult(
+            operation=req.operation,
+            remote=req.remote,
+            project=req.project,
+            side_effect=req.side_effect,
+            status=ResultStatus.NOOP,
+            summary=(
+                "No changes: target generation already matches "
+                f"{reviewed.after_tree_id}"
+            ),
+            fields=(
+                ResultField("generation", reviewed.generation),
+                ResultField("target_tree_id", reviewed.after_tree_id),
+            ),
+        )
 
     events = []
     result = DeployService(signer, executor).execute(
@@ -177,7 +191,7 @@ def test_application_deploy_static_noop_skips_confirmation_and_executor(
     assert result.summary == (
         "No changes: target generation already matches " f"{plan.after_tree_id}"
     )
-    assert calls == {"executor": 0}
+    assert calls == {"executor": 1}
     assert not any(isinstance(item, TransactionStageEvent) for item in events)
     assert isinstance(events[-1], TerminalResultEvent)
 

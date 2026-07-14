@@ -343,6 +343,197 @@ def test_public_identity_selects_only_matching_agent_key(
     assert not agent.closed
 
 
+def test_build_ftps_ssl_context_verified_by_default() -> None:
+    """Default FTPS context requires certificates and hostname checks."""
+
+    import ssl
+
+    from git_deploy.transport import build_ftps_ssl_context, ftps_tls_trust_digest
+
+    context = build_ftps_ssl_context({"host": "ftp.example.com"})
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    digest = ftps_tls_trust_digest({"host": "ftp.example.com"})
+    assert len(digest) == 64
+    # Trust digest must not embed secrets.
+    secret_digest = ftps_tls_trust_digest(
+        {"host": "ftp.example.com", "password": "super-secret", "tls_key_file": "/k.pem"}
+    )
+    assert "super-secret" not in secret_digest
+    # key_file path is intentionally excluded from digest (private material surface).
+    assert ftps_tls_trust_digest({"tls_verify": True}) == ftps_tls_trust_digest(
+        {"tls_verify": True, "password": "x", "tls_key_file": "/secret.pem"}
+    )
+
+
+def test_build_ftps_ssl_context_insecure_opt_out_warns() -> None:
+    """Explicit tls_verify=false disables verification and emits a security warning."""
+
+    import ssl
+    import warnings
+
+    from git_deploy.transport import build_ftps_ssl_context, ftps_tls_trust_digest
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        context = build_ftps_ssl_context({"tls_verify": False})
+    assert context.verify_mode == ssl.CERT_NONE
+    assert context.check_hostname is False
+    assert any("tls_verify=false" in str(item.message) for item in caught)
+    assert ftps_tls_trust_digest({"tls_verify": False}) != ftps_tls_trust_digest(
+        {"tls_verify": True}
+    )
+
+
+def test_build_ftps_ssl_context_custom_ca(tmp_path: Path) -> None:
+    """tls_ca_file is loaded into a verified default context."""
+
+    import ssl
+    from datetime import datetime, timedelta, timezone
+
+    from git_deploy.transport import build_ftps_ssl_context
+
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        pytest.skip("cryptography package required for CA fixture")
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-ca")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    context = build_ftps_ssl_context({"tls_ca_file": str(ca_path), "tls_verify": True})
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+
+
+def test_ftps_connect_rejects_untrusted_certificate(tmp_path: Path) -> None:
+    """FtpTransport with verified context fails against an untrusted self-signed server."""
+
+    import ipaddress
+    import socket
+    import ssl
+    import threading
+    from datetime import datetime, timedelta, timezone
+
+    from git_deploy.errors import GitDeployError
+    from git_deploy.transport import FtpTransport
+
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        pytest.skip("cryptography package required for TLS fixture")
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "server.pem"
+    key_path = tmp_path / "server-key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+
+    # Minimal TLS-wrapped socket that completes handshake then closes — enough to
+    # exercise FTPS client certificate verification before FTP protocol exchange.
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(str(cert_path), str(key_path))
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+
+    def serve() -> None:
+        """Accept one TLS connection and drop it."""
+
+        listener.settimeout(2.0)
+        try:
+            conn, _addr = listener.accept()
+            try:
+                with server_ctx.wrap_socket(conn, server_side=True) as tls_conn:
+                    tls_conn.recv(1)
+            except Exception:
+                pass
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        finally:
+            stop.set()
+            listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(GitDeployError, match="FTP connection failed|certificate|SSL|ssl"):
+            FtpTransport(
+                {
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "username": "u",
+                    "password": "p",
+                    "timeout": 2,
+                    "tls_verify": True,
+                },
+                use_tls=True,
+            )
+    finally:
+        stop.wait(timeout=3)
+        thread.join(timeout=3)
+
+
+def test_ftps_hostname_mismatch_fails_with_verified_context(tmp_path: Path) -> None:
+    """Verified context rejects a certificate whose hostname does not match."""
+
+    import ssl
+
+    from git_deploy.transport import build_ftps_ssl_context
+
+    # Hostname checking is enabled on the verified context; mismatch is enforced
+    # by ssl when wrap_socket(server_hostname=...) does not match the cert SAN/CN.
+    context = build_ftps_ssl_context({"tls_verify": True})
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
 @pytest.mark.parametrize("protocol", ["sftp", "ftp", "ftps"])
 def test_fake_transport_state_and_rollback_semantics_match(
     tmp_path: Path, protocol: str

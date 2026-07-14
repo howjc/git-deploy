@@ -386,6 +386,155 @@ def test_repeated_noop_zero_writes(tmp_path: Path) -> None:
     assert transport.write_calls == writes
 
 
+def test_stale_plan_rejected_after_concurrent_non_overlapping_advance(
+    tmp_path: Path,
+) -> None:
+    """Lock-held guard rejects actor A after B advances generation on disjoint paths.
+
+    Scenario:
+    - A plans at generation N against before-boundary B_N
+    - B deploys a non-overlapping path to generation N+1
+    - A then executes the stale plan under lock
+    Assert: A is rejected with stale_plan; zero remote writes; zero transaction /
+    manifest side effects; current stays at N+1 with B's tree and transitions.
+    """
+
+    from git_deploy.state_executor import FakeRemotePath
+
+    executor_a, transport, identity, root, project = _setup(tmp_path)
+    before = _seed_current(root, identity, generation=1, transitions=("t0",))
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"old-a")
+    transport.files["/srv/b.txt"] = FakeRemotePath(b"old-b")
+    ContentAddressedStore = __import__(
+        "git_deploy.object_store", fromlist=["ContentAddressedStore"]
+    ).ContentAddressedStore
+    ContentAddressedStore(root).put(b"old-b")
+    ContentAddressedStore(root).put(b"new-b")
+    ContentAddressedStore(root).put(b"new-a")
+
+    # Freeze A's plan at generation N (touches only a.txt).
+    old_a = hashlib.sha256(b"old-a").hexdigest()
+    new_a = hashlib.sha256(b"new-a").hexdigest()
+    plan_a = SourceDiffPlan(
+        before_tree_id=before.source_tree_id,
+        after_tree_id="tree-a",
+        files=(),
+        excluded=(),
+        introduced_transition_ids=("t-a",),
+        applied_transition_ids=("t0", "t-a"),
+        expected_before_state_id=before.state_id(),
+        expected_generation=before.generation,
+        expected_before_tree_id=before.source_tree_id,
+        expected_before_applied_transition_ids=tuple(before.applied_transition_ids),
+    )
+
+    # B advances generation N+1 on disjoint path b.txt.
+    old_b = hashlib.sha256(b"old-b").hexdigest()
+    new_b = hashlib.sha256(b"new-b").hexdigest()
+    executor_b = StateDeploymentExecutor(
+        project,
+        identity,
+        root,
+        transport=transport,
+        content_provider=lambda p: { "a.txt": b"new-a", "b.txt": b"new-b" }.get(p, b""),
+    )
+    plan_b = SourceDiffPlan(
+        before_tree_id=before.source_tree_id,
+        after_tree_id="tree-b",
+        files=(),
+        excluded=(),
+        introduced_transition_ids=("t-b",),
+        applied_transition_ids=("t0", "t-b"),
+        expected_before_state_id=before.state_id(),
+        expected_generation=before.generation,
+        expected_before_tree_id=before.source_tree_id,
+        expected_before_applied_transition_ids=tuple(before.applied_transition_ids),
+    )
+    result_b = executor_b.deploy(
+        plan_b,
+        [_file("b.txt", before=old_b, after=new_b)],
+    )
+    assert result_b["status"] == "succeeded"
+    assert result_b["generation"] == 2
+    current_after_b = ExpectedStateStore(root, identity).load_current_state()
+    assert current_after_b is not None
+    assert current_after_b[1].generation == 2
+    assert "t-b" in current_after_b[1].applied_transition_ids
+    b_tree = current_after_b[1].source_tree_id
+    b_transitions = tuple(current_after_b[1].applied_transition_ids)
+
+    writes_before = transport.write_calls
+    delete_before = transport.delete_calls
+    tx_before = len(list((root / "transactions").glob("*.json"))) if (root / "transactions").exists() else 0
+    dep_before = len(list((root / "deployments").iterdir())) if (root / "deployments").exists() else 0
+
+    with pytest.raises(PolicyError, match="stale_plan"):
+        executor_a.deploy(
+            plan_a,
+            [_file("a.txt", before=old_a, after=new_a)],
+        )
+
+    assert transport.write_calls == writes_before
+    assert transport.delete_calls == delete_before
+    assert transport.files["/srv/b.txt"].data == b"new-b"
+    assert transport.files["/srv/a.txt"].data == b"old-a"
+    tx_after = len(list((root / "transactions").glob("*.json"))) if (root / "transactions").exists() else 0
+    dep_after = len(list((root / "deployments").iterdir())) if (root / "deployments").exists() else 0
+    assert tx_after == tx_before
+    assert dep_after == dep_before
+    assert TransactionStore(root).list_open() == []
+    current = ExpectedStateStore(root, identity).load_current_state()
+    assert current is not None
+    assert current[1].generation == 2
+    assert current[1].source_tree_id == b_tree
+    assert tuple(current[1].applied_transition_ids) == b_transitions
+
+
+def test_static_noop_stale_plan_under_lock(tmp_path: Path) -> None:
+    """Static no-op still acquires lock and rejects a stale before-boundary."""
+
+    executor, transport, identity, root, _p = _setup(tmp_path)
+    before = _seed_current(root, identity)
+    from git_deploy.state_executor import FakeRemotePath
+
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"old-a")
+    # Advance generation with a second actor so A's frozen boundary is stale.
+    from git_deploy.target_identity import policy_fingerprint_for_project
+
+    store = ExpectedStateStore(root, identity)
+    advanced = build_expected_state(
+        generation=2,
+        parent_state_id=before.state_id(),
+        source_tree_id=before.source_tree_id,
+        applied_transition_ids=("t0", "t-extra"),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(
+            ProjectConfig(name="demo", repository=root.parent / "repo", remote_root="/srv")
+        ),
+        files=before.files,
+    )
+    store.cas_advance(expected_generation=1, state=advanced)
+
+    plan = SourceDiffPlan(
+        before_tree_id=before.source_tree_id,
+        after_tree_id=before.source_tree_id,
+        files=(),
+        excluded=(),
+        introduced_transition_ids=(),
+        applied_transition_ids=tuple(before.applied_transition_ids),
+        static_noop=True,
+        expected_before_state_id=before.state_id(),
+        expected_generation=before.generation,
+        expected_before_tree_id=before.source_tree_id,
+        expected_before_applied_transition_ids=tuple(before.applied_transition_ids),
+    )
+    writes = transport.write_calls
+    with pytest.raises(PolicyError, match="stale_plan"):
+        executor.deploy(plan, [])
+    assert transport.write_calls == writes
+    assert ExpectedStateStore(root, identity).read_current().generation == 2  # type: ignore[union-attr]
+
+
 def test_partial_target_filters_satisfied(tmp_path: Path) -> None:
     """Only unsatisfied paths are mutated; after state expresses full target."""
 

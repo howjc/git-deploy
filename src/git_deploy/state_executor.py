@@ -13,7 +13,7 @@ from .expected_state import ExpectedState, ExpectedStateStore, FileEntry, build_
 from .models import DeploymentManifest, FileSnapshot, PlannedFile, ProjectConfig
 from .object_store import ContentAddressedStore
 from .state import DeploymentStore
-from .state_guards import StateGuards
+from .state_guards import StateGuards, require_plan_matches_current
 from .state_planner import SourceDiffPlan
 from .target_identity import TargetIdentity, policy_fingerprint_for_project
 from .target_lock import TargetLock
@@ -646,6 +646,9 @@ class StateDeploymentExecutor:
             loaded = self.state_store.load_current_state()
             before_state = loaded[1] if loaded else None
             before_gen = before_state.generation if before_state else None
+            # Lock-held TOCTOU guard: plan must still match live before-boundary
+            # before any remote read, journal, CAS, or manifest write.
+            require_plan_matches_current(before_state, plan)
             decisions = self.evaluate_drift(files)
             self.reject_third_content(decisions, force=force)
 
