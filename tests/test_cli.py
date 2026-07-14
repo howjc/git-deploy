@@ -1049,6 +1049,159 @@ local_state_dir = ".state/demo"
         set_cli_transport_factory(None)
 
 
+def test_application_deploy_static_noop_rejects_stale_generation_via_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Default ``git-deploy deploy`` static no-op must not skip lock/freshness.
+
+    Ships the real CLI entry: application plan → DeployService → domain path.
+    After the reviewed plan is produced at generation N, current is advanced to
+    N+1 (non-overlapping state-only lineage change). The same deploy command must
+    refuse with stale_plan / non-zero exit, zero remote writes, and current kept
+    at N+1.
+    """
+
+    import hashlib
+    import subprocess
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.target_identity import (
+        default_state_base,
+        policy_fingerprint_for_project,
+    )
+    from git_deploy.config import resolve_project_target
+    from git_deploy.application.plan_service import RevisionPlanService
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "file.txt").write_text("same\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "deploy.example"
+[projects.demo]
+repository = "{repo}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    PersistentGitStore(root, repo).ensure_layout()
+    PersistentGitStore(root, repo)._publish_repository_identity()
+    body = b"same\n"
+    ContentAddressedStore(root).put(body)
+    store = ExpectedStateStore(root, identity)
+    from git_deploy.state_composer import StateComposer
+
+    # Real applied transition for HEAD + source tree == HEAD tree ⇒ static no-op.
+    head_tid = StateComposer(repo).transition_id_for_commit(head).as_str()
+    gen1 = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=(head_tid,),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(
+            FileEntry(
+                path="file.txt",
+                owner="source",
+                content_sha256=hashlib.sha256(body).hexdigest(),
+                exists=True,
+            ),
+        ),
+    )
+    store.cas_advance(expected_generation=None, state=gen1)
+
+    transport = InMemoryTransport()
+    transport.files["/srv/demo/file.txt"] = FakeRemotePath(body)
+    writes_before = transport.write_calls
+    factory_calls = {"count": 0}
+
+    def factory(_server: dict[str, object]) -> InMemoryTransport:
+        factory_calls["count"] += 1
+        return transport
+
+    set_cli_transport_factory(factory)
+
+    real_plan = RevisionPlanService.plan
+
+    def plan_then_advance(self, request):  # type: ignore[no-untyped-def]
+        """Produce a static no-op plan at gen N, then advance current to N+1."""
+
+        planned = real_plan(self, request)
+        assert planned.static_noop is True
+        current = store.load_current_state()
+        assert current is not None
+        pointer, state = current
+        # Generation-only advance keeps the same tree so the reviewed plan is
+        # still a static no-op of the files, but the frozen generation is stale.
+        advanced = build_expected_state(
+            generation=pointer.generation + 1,
+            parent_state_id=pointer.state_id,
+            source_tree_id=state.source_tree_id,
+            applied_transition_ids=tuple(state.applied_transition_ids),
+            physical_fingerprint=identity.physical_fingerprint,
+            policy_fingerprint=policy_fingerprint_for_project(project),
+            files=state.files,
+            artifacts=({"mode": "probe", "note": "concurrent-advance"},),
+        )
+        store.cas_advance(expected_generation=pointer.generation, state=advanced)
+        return planned
+
+    monkeypatch.setattr(RevisionPlanService, "plan", plan_then_advance)
+    try:
+        code = run(["deploy", "demo", "--revisions", head, "--yes"])
+        captured = capsys.readouterr()
+        err = captured.err
+        out = captured.out
+        assert code != 0, f"expected stale rejection, got 0\nout={out}\nerr={err}"
+        assert "stale_plan" in err, f"expected stale_plan in stderr, got:\n{err}\nstdout:\n{out}"
+        assert transport.write_calls == writes_before
+        # Static no-op must not open a real transport for remote mutation.
+        assert factory_calls["count"] == 0
+        current = store.read_current()
+        assert current is not None and current.generation == 2
+        state = store.read_state(current.state_id)
+        assert state.artifacts and state.artifacts[0].get("mode") == "probe"
+    finally:
+        set_cli_transport_factory(None)
+
+
 def test_stateful_rollback_non_latest_refused_before_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

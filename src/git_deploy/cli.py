@@ -535,6 +535,7 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         ApplicationConfigService,
         ApplicationResult,
         ApplicationWorker,
+        ConfirmationGrant,
         DeployRequest,
         DeployService,
         PlanTokenSigner,
@@ -542,7 +543,6 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         ResultStatus,
         RevisionPlanService,
         SideEffectLevel,
-        StalePlanError,
         StateInspectService,
         confirmation_policy_for,
     )
@@ -602,28 +602,29 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
                 f"  risks: force={bool(args.force)} secret={plan.build.uses_secret} "
                 f"network=True auto_rollback={generation is not None}"
             )
-            if (
+            # Static no-op must still enter DeployService → domain executor under
+            # target lock so require_plan_matches_current can reject a stale plan.
+            # Skipping confirmation only; never short-circuit past the lock guard.
+            is_static_noop = bool(
                 plan.static_noop
                 and not plan.build.enabled
                 and not plan.source_changes
                 and not plan.introduced_transition_ids
-            ):
-                print(
-                    "No changes: target generation already matches "
-                    f"{plan.after_tree_id}"
+            )
+            if is_static_noop:
+                grant = ConfirmationGrant(confirmed=False)
+            else:
+                policy = confirmation_policy_for(
+                    request,
+                    environment_risk=selection.environment_risk,
+                    uses_secret=plan.build.uses_secret,
                 )
-                continue
-            policy = confirmation_policy_for(
-                request,
-                environment_risk=selection.environment_risk,
-                uses_secret=plan.build.uses_secret,
-            )
-            grant = _cli_confirmation_grant(
-                policy,
-                assume_yes=bool(args.yes),
-                supplied_phrase=getattr(args, "confirm_phrase", None),
-                prompt=f"Deploy project {project_name} to remote {remote_name}?",
-            )
+                grant = _cli_confirmation_grant(
+                    policy,
+                    assume_yes=bool(args.yes),
+                    supplied_phrase=getattr(args, "confirm_phrase", None),
+                    prompt=f"Deploy project {project_name} to remote {remote_name}?",
+                )
             nested_args = argparse.Namespace(**vars(args))
             nested_args.targets = [project_name]
             nested_args.revisions = plan.resolved_revisions
@@ -642,19 +643,35 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
                     != request.expected_physical_fingerprint
                     or current_generation != request.expected_generation
                 ):
-                    raise StalePlanError(
-                        "target identity or generation changed before deployment"
+                    # PolicyError maps to the shipped CLI exit path (not bare ValueError).
+                    raise PolicyError(
+                        "stale_plan: target identity or generation changed before "
+                        "deployment; re-plan required"
                     )
                 code = _run_plan_or_deploy(config, _args)
                 if code:
                     raise PolicyError(f"deployment failed with exit code {code}")
+                summary = "deployment command completed"
+                status = ResultStatus.SUCCEEDED
+                if (
+                    _plan.static_noop
+                    and not _plan.build.enabled
+                    and not _plan.source_changes
+                    and not _plan.introduced_transition_ids
+                ):
+                    summary = (
+                        "No changes: target generation already matches "
+                        f"{_plan.after_tree_id}"
+                    )
+                    status = ResultStatus.NOOP
+                    print(summary)
                 return ApplicationResult(
                     operation=request.operation,
                     remote=request.remote,
                     project=request.project,
                     side_effect=request.side_effect,
-                    status=ResultStatus.SUCCEEDED,
-                    summary="deployment command completed",
+                    status=status,
+                    summary=summary,
                     fields=(ResultField("exit_code", code),),
                 )
 
