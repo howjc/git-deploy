@@ -20,6 +20,7 @@ from .models import (
     ProjectRemoteConfig,
     ServerConfig,
 )
+from .remote_permissions import load_sftp_permission_policy
 
 
 _REMOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -84,6 +85,7 @@ def load_config(path: Path) -> AppConfig:
     if server is not None:
         if not isinstance(server, dict):
             raise ConfigurationError("server must be a table")
+        load_sftp_permission_policy(server, location="server")
         remotes = {"default": ServerConfig(dict(server))}
         default_remote: str | None = "default"
     else:
@@ -94,6 +96,7 @@ def load_config(path: Path) -> AppConfig:
             _validate_remote_name(name)
             if not isinstance(values, dict):
                 raise ConfigurationError(f"remotes.{name} must be a table")
+            load_sftp_permission_policy(values, location=f"remotes.{name}")
             remotes[name] = ServerConfig(dict(values))
         configured_default = raw.get("default_remote")
         default_remote = str(configured_default).strip() if configured_default is not None else None

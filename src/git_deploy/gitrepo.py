@@ -15,6 +15,15 @@ from .errors import ConfigurationError, PolicyError
 from .models import DeploymentPlan, GitChange, PlannedFile, ProjectConfig
 
 
+def _is_head_expression(value: str) -> bool:
+    """Return whether a revision endpoint is derived from the current HEAD."""
+
+    candidate = value.strip()
+    return candidate == "HEAD" or candidate.startswith(
+        ("HEAD^", "HEAD~", "HEAD@{")
+    )
+
+
 @dataclass(frozen=True)
 class GitBlob:
     """Blob metadata and bytes stored at one commit path."""
@@ -66,6 +75,41 @@ class GitRepository:
         if not revision.strip():
             raise ConfigurationError("empty Git revision")
         return self._run_text("rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+
+    def freeze_head_revision_specs(self, revisions: Sequence[str]) -> tuple[str, ...]:
+        """Replace HEAD-based selector endpoints with immutable commit IDs.
+
+        Args:
+            revisions: Singleton or range selectors supplied by the user.
+
+        Returns:
+            Selectors suitable for durable history records. Non-HEAD endpoints
+            retain their original spelling, while HEAD expressions are resolved
+            to the full commit IDs selected at planning time.
+        """
+
+        return tuple(self._freeze_head_revision_spec(item) for item in revisions)
+
+    def _freeze_head_revision_spec(self, revision: str) -> str:
+        """Freeze HEAD expressions in one singleton or range selector.
+
+        Args:
+            revision: One trimmed or untrimmed Git revision selector.
+
+        Returns:
+            Selector with HEAD-based endpoints replaced by full commit IDs.
+        """
+
+        raw = revision.strip()
+        if "..." in raw:
+            left, separator, right = raw.partition("...")
+        elif ".." in raw:
+            left, separator, right = raw.partition("..")
+        else:
+            return self.resolve_commit(raw) if _is_head_expression(raw) else raw
+        frozen_left = self.resolve_commit(left) if _is_head_expression(left) else left
+        frozen_right = self.resolve_commit(right) if _is_head_expression(right) else right
+        return f"{frozen_left}{separator}{frozen_right}"
 
     def require_ancestor(self, older: str, newer: str) -> None:
         """Require a forward commit range by default.
@@ -529,6 +573,7 @@ class GitDeploymentPlanner:
         requested = tuple(revision.strip() for revision in revisions)
         if not requested or any(not revision for revision in requested):
             raise ConfigurationError("--revisions requires at least one non-empty selector")
+        requested = self.repository.freeze_head_revision_specs(requested)
 
         selected: set[str] = set()
         for revision in requested:

@@ -188,6 +188,26 @@ def test_continuous_revision_range_uses_real_target_commit(tmp_path: Path) -> No
     assert {operation.path for operation in plan.files} == {"one.txt", "two.txt"}
 
 
+def test_head_range_is_frozen_to_commit_hashes_for_history(tmp_path: Path) -> None:
+    """Persist the commits selected by HEAD instead of its movable spelling."""
+
+    repository = _repository(tmp_path)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    _commit(repository, "base")
+    (repository / "one.txt").write_text("one\n", encoding="utf-8")
+    older = _commit(repository, "one")
+    (repository / "two.txt").write_text("two\n", encoding="utf-8")
+    newer = _commit(repository, "two")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    plan = planner.build_revisions(["HEAD^..HEAD"])
+
+    assert plan.revision_specs == (f"{older}..{newer}",)
+    assert plan.to_commit == newer
+
+
 def test_non_contiguous_revisions_exclude_omitted_commit_files(tmp_path: Path) -> None:
     """Compose selected patches without leaking files from skipped commits."""
 

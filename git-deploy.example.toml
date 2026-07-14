@@ -5,6 +5,11 @@ ssh_host_alias = "development"
 ssh_config_file = "~/.ssh/config"
 strict_host_key_checking = true
 timeout = 15
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [remotes.prod]
 protocol = "sftp"
@@ -12,6 +17,11 @@ ssh_host_alias = "production"
 ssh_config_file = "~/.ssh/config"
 strict_host_key_checking = true
 timeout = 15
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [projects.application]
 repository = "."

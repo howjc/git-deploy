@@ -700,7 +700,17 @@ local_state_dir = ".state/demo"
 
     set_cli_transport_factory(forbid_remote)
     try:
-        recover_code = run(["state", "recover", "demo", "--execute", "--yes"])
+        recover_code = run(
+            [
+                "state",
+                "recover",
+                "demo",
+                "--execute",
+                "--yes",
+                "--confirm-phrase",
+                f"CONFIRM STATE {identity.target_id}",
+            ]
+        )
     finally:
         set_cli_transport_factory(None)
     assert recover_code == 0

@@ -2,7 +2,7 @@
 
 `git-deploy` 是一个基于 Git revision 的增量部署、状态管理与回滚工具。它从提交、连续范围或非连续提交组合中计算精确文件变化，通过 SFTP、FTP 或 FTPS 部署，并用持久化 expected state、事务日志和部署前备份保证重复部署、失败恢复及最新版本回滚的一致性。
 
-v0.2.0 支持 named remote、多环境切换、Host/Docker 构建产物，以及通过 1Password CLI 为构建过程注入环境变量。源码和构建产物进入同一个部署事务，任一步失败时共同恢复。
+v0.2.1 支持 named remote、多环境切换、Host/Docker 构建产物，以及通过 1Password CLI 为构建过程注入环境变量。源码和构建产物进入同一个部署事务，任一步失败时共同恢复。
 
 > `deploy.py` 是旧版全量上传入口；新的 `git-deploy` CLI 位于 `src/git_deploy`，不会读取旧版 `deploy.example.toml`。
 
@@ -50,11 +50,11 @@ v0.2.0 支持 named remote、多环境切换、Host/Docker 构建产物，以及
 
 ### 从 GitHub Release 安装
 
-当前稳定版本为 `v0.2.0`：
+当前稳定版本为 `v0.2.1`：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v0.2.0/git_deploy-0.2.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v0.2.1/git_deploy-0.2.1-py3-none-any.whl
 
 git-deploy --version
 git-deploy --help
@@ -63,20 +63,20 @@ git-deploy --help
 下载并验证发布产物：
 
 ```bash
-gh release download v0.2.0 \
+gh release download v0.2.1 \
   --repo howjc/git-deploy \
-  --pattern "git_deploy-0.2.0*" \
+  --pattern "git_deploy-0.2.1*" \
   --pattern "SHA256SUMS"
 
 sha256sum -c SHA256SUMS
-uv tool install ./git_deploy-0.2.0-py3-none-any.whl
+uv tool install ./git_deploy-0.2.1-py3-none-any.whl
 ```
 
 升级或重新安装：
 
 ```bash
 uv tool install --force \
-  https://github.com/howjc/git-deploy/releases/download/v0.2.0/git_deploy-0.2.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v0.2.1/git_deploy-0.2.1-py3-none-any.whl
 ```
 
 卸载：
@@ -171,6 +171,11 @@ ssh_host_alias = "application-prod"
 ssh_config_file = "~/.ssh/config"
 strict_host_key_checking = true
 timeout = 15
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [projects.application]
 repository = "."
@@ -202,12 +207,22 @@ protocol = "sftp"
 host = "dev.example.invalid"
 username = "deploy-dev"
 strict_host_key_checking = true
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [remotes.prod]
 protocol = "sftp"
 host = "prod.example.invalid"
 username = "deploy-prod"
 strict_host_key_checking = true
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
 
 [projects.application]
 repository = "."
@@ -232,6 +247,30 @@ health_urls = ["https://example.invalid/health"]
 - remote 层的 `build` 和 `artifacts` 是整体替换，不进行深合并。
 - 相同 canonical protocol/host/port/project/root 的 alias 共享 target、state 和 lock；不同目标隔离。
 - 显式 `target_id` 不能跨不同 physical payload 复用。
+
+### SFTP 所属者与权限
+
+SFTP remote 可以声明部署文件和新建目录的 POSIX ownership/mode：
+
+```toml
+[remotes.prod]
+protocol = "sftp"
+host = "prod.example.invalid"
+username = "root"
+owner = "www-data"
+group = "www-data"
+file_mode = "0644"
+executable_mode = "0755"
+directory_mode = "0755"
+```
+
+- 默认普通文件为 `0644`、Git 可执行文件为 `0755`、新建目录为 `0755`。
+- `owner`、`group` 接受安全的用户/组名称或数字 UID/GID；两者均可单独配置。
+- mode 推荐写成字符串（如 `"0644"`），也可用 TOML 八进制整数（如 `0o644`）；十进制 `644` 会被拒绝，避免误设权限。
+- 文件先在临时路径完成 chmod 和 chown/chgrp，再执行原子替换；设置失败会终止部署，不会把错误 ownership 的临时文件发布为目标文件。
+- ownership 设置需要登录账号具备对应权限；以 `root` 登录并希望由 Web 用户运行时，必须显式配置 `owner`/`group`。省略时保留 SFTP 登录用户 ownership。
+- 只调整本次新建的目录，不递归修改既有目录或远端根目录；既有 `remote_root` 应在首次部署前正确预置。
+- FTP/FTPS 无法可靠保证 POSIX ownership/mode，因此配置这些字段会直接报错。
 
 ### 项目字段
 
@@ -424,6 +463,8 @@ git-deploy deploy all \
 
 `all` 对每个仓库独立解析同一 selector。不同项目需要不同 revision 时应分别运行。`rollback all` / `verify all` 使用 `--latest`。
 
+部署计划中的 `HEAD`、`HEAD^`、`HEAD~N` 等表达式会在写入 deployment history 时冻结为当时解析出的完整 commit hash；之后仓库继续提交不会改变历史记录的含义。
+
 ### 6. 历史、验证与回滚
 
 ```bash
@@ -547,7 +588,7 @@ uvx ty check src
 uv build --clear
 ```
 
-当前 v0.2.0 GA 基线为 261 个自动测试，包含 Host、真实本地 Docker scratch image 和 fake 1Password contract 门禁。
+当前 v0.2.1 GA 基线为 321 个自动测试，包含 Host、真实本地 Docker scratch image 和 fake 1Password contract 门禁。
 
 ### 2. 更新版本
 
@@ -564,15 +605,18 @@ uv lock
 ```bash
 uv build --clear
 
-sha256sum \
-  dist/git_deploy-0.2.0-py3-none-any.whl \
-  dist/git_deploy-0.2.0.tar.gz \
-  > dist/SHA256SUMS
+(
+  cd dist
+  sha256sum \
+    git_deploy-0.2.1-py3-none-any.whl \
+    git_deploy-0.2.1.tar.gz \
+    > SHA256SUMS
+)
 
 uv venv --clear tmp/release-smoke
 uv pip install \
   --python tmp/release-smoke/bin/python \
-  dist/git_deploy-0.2.0-py3-none-any.whl
+  dist/git_deploy-0.2.1-py3-none-any.whl
 
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
@@ -584,18 +628,18 @@ tmp/release-smoke/bin/git-deploy --help
 
 ```bash
 git add README.md pyproject.toml uv.lock src tests docs git-deploy.example.toml
-git commit -m "release v0.2.0"
+git commit -m "release v0.2.1"
 git push
 
-git tag -a v0.2.0 -m "git-deploy v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "git-deploy v0.2.1"
+git push origin v0.2.1
 
-gh release create v0.2.0 \
-  dist/git_deploy-0.2.0-py3-none-any.whl \
-  dist/git_deploy-0.2.0.tar.gz \
+gh release create v0.2.1 \
+  dist/git_deploy-0.2.1-py3-none-any.whl \
+  dist/git_deploy-0.2.1.tar.gz \
   dist/SHA256SUMS \
   --verify-tag \
-  --title "git-deploy v0.2.0" \
+  --title "git-deploy v0.2.1" \
   --notes-file /path/to/release-notes.md
 ```
 

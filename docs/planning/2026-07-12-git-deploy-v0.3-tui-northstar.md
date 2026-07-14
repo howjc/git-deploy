@@ -106,7 +106,7 @@ Textual TUI ──┘             │
 
 - 所有 mutation 先生成不可变 operation plan，显示 source/artifact 增删改、hooks、health、build runner、secret 变量名、generation 与警告。
 - 普通环境至少经过 review 屏和一次明确激活。
-- prod、非最新回滚、GC delete 和 transaction recovery 必须输入界面显示的确认短语；鼠标只能聚焦/提交已填写的短语，不能替代它。
+- 非最新回滚、GC delete 和 transaction recovery 必须输入界面显示的确认短语；日常 deploy（包括 prod、`--force` 和 secret build）只需普通确认，CLI 可用 `--yes` 跳过交互。
 - plan 生成后 target identity、generation 或 managed policy 变化时，执行必须拒绝并要求重新计划。
 - `--force`、secret build、Docker network、历史回滚和 GC 都作为单独风险项展示，不得藏在滚动日志中。
 
@@ -174,7 +174,7 @@ Textual 官方提供鼠标事件、滚轮事件和 headless Pilot 点击/按键�
 4. remote verify 明确标为远端只读，fake transport 写调用为 0。
 5. remote/project 切换会清除旧 plan 和确认，physical target 信息始终可见。
 6. 键盘和鼠标对每个主要 action 生成相同 request；没有 mouse-only action。
-7. prod、非最新回滚、GC delete 和 transaction recovery 必须通过确认短语，单击不能绕过。
+7. 非最新回滚、GC delete 和 transaction recovery 必须通过确认短语；日常 deploy 可用普通确认或 CLI `--yes`。
 8. mutation worker 不阻塞 UI；重复点击、切屏和并发提交不会创建重复 transaction。
 9. Ctrl+C、关闭 TUI 和断言失败不会把未知远端状态显示为成功或已回滚。
 10. 未完成 transaction 存在时，TUI 禁止新 deploy/rollback/GC 并提供 inspect/recover 导航。
@@ -191,7 +191,7 @@ Textual 官方提供鼠标事件、滚轮事件和 headless Pilot 点击/按键�
 |---|---|
 | UI 与 CLI 行为分叉 | 先抽应用服务；适配器 parity contract test |
 | async UI 包装同步远端操作后卡死 | worker + 结构化事件；禁止在 widget handler 直接调用 transport |
-| 鼠标误触生产 | 列表点击只选择；review + 确认短语；执行时复核 generation/target |
+| 鼠标误触生产 | 列表点击只选择；review + 普通确认；执行时复核 generation/target |
 | 用户误解关闭窗口等于取消/回滚 | transaction 阶段常驻显示；协调取消与恢复结果显式化 |
 | TUI 依赖扩大基础安装面 | optional dependency + lazy import |
 | snapshot 泄漏 secret | sentinel 全通道扫描；不把 secret/reference 放进 view model |
@@ -205,5 +205,6 @@ Textual 官方提供鼠标事件、滚轮事件和 headless Pilot 点击/按键�
 | 2026-07-12 | TUI 是可选适配器，CLI 和领域服务仍为稳定核心 | 保持 CI/脚本兼容，避免两套部署逻辑 |
 | 2026-07-12 | 采用键盘优先、鼠标等价而非鼠标优先 | 兼容 SSH/tmux/无鼠标终端并降低误触风险 |
 | 2026-07-12 | Gate A-C 先交付日常 TUI，历史回滚与 GC 后接 | 先释放多环境选择、计划审阅和部署可观测性收益 |
-| 2026-07-12 | 高风险操作使用确认短语且执行时复核 plan | 鼠标点击不能成为生产变更的唯一授权 |
+| 2026-07-12 | 不可逆操作使用确认短语且执行时复核 plan | 鼠标点击不能成为破坏性变更的唯一授权 |
+| 2026-07-14 | 日常 deploy 简化为普通确认，CLI `--yes` 可覆盖 prod、force、secret 风险 | 个人脚本和小团队内部使用优先保持自动化命令简洁；底层 identity、integrity、generation、transaction 门禁不变 |
 | 2026-07-12 | 首选 Textual，最终版本在 T00/P01 通过 Python 3.11 与打包测试后冻结 | 其输入与 headless 测试能力符合鼠标、键盘和自动门禁要求 |
