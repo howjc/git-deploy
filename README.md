@@ -2,7 +2,7 @@
 
 `git-deploy` 是一个基于 Git revision 的增量部署、状态管理与回滚工具。它从提交、连续范围或非连续提交组合中计算精确文件变化，通过 SFTP、FTP 或 FTPS 部署，并用持久化 expected state、事务日志和部署前备份保证重复部署、失败恢复及最新版本回滚的一致性。
 
-v0.2.0 支持 named remote、多环境切换、Host/Docker 构建产物，以及通过 1Password CLI 为构建过程注入环境变量。源码和构建产物进入同一个部署事务，任一步失败时共同恢复。
+v0.2.1 支持 named remote、多环境切换、Host/Docker 构建产物，以及通过 1Password CLI 为构建过程注入环境变量。源码和构建产物进入同一个部署事务，任一步失败时共同恢复。
 
 > `deploy.py` 是旧版全量上传入口；新的 `git-deploy` CLI 位于 `src/git_deploy`，不会读取旧版 `deploy.example.toml`。
 
@@ -50,11 +50,11 @@ v0.2.0 支持 named remote、多环境切换、Host/Docker 构建产物，以及
 
 ### 从 GitHub Release 安装
 
-当前稳定版本为 `v0.2.0`：
+当前稳定版本为 `v0.2.1`：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v0.2.0/git_deploy-0.2.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v0.2.1/git_deploy-0.2.1-py3-none-any.whl
 
 git-deploy --version
 git-deploy --help
@@ -63,20 +63,20 @@ git-deploy --help
 下载并验证发布产物：
 
 ```bash
-gh release download v0.2.0 \
+gh release download v0.2.1 \
   --repo howjc/git-deploy \
-  --pattern "git_deploy-0.2.0*" \
+  --pattern "git_deploy-0.2.1*" \
   --pattern "SHA256SUMS"
 
 sha256sum -c SHA256SUMS
-uv tool install ./git_deploy-0.2.0-py3-none-any.whl
+uv tool install ./git_deploy-0.2.1-py3-none-any.whl
 ```
 
 升级或重新安装：
 
 ```bash
 uv tool install --force \
-  https://github.com/howjc/git-deploy/releases/download/v0.2.0/git_deploy-0.2.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v0.2.1/git_deploy-0.2.1-py3-none-any.whl
 ```
 
 卸载：
@@ -463,6 +463,8 @@ git-deploy deploy all \
 
 `all` 对每个仓库独立解析同一 selector。不同项目需要不同 revision 时应分别运行。`rollback all` / `verify all` 使用 `--latest`。
 
+部署计划中的 `HEAD`、`HEAD^`、`HEAD~N` 等表达式会在写入 deployment history 时冻结为当时解析出的完整 commit hash；之后仓库继续提交不会改变历史记录的含义。
+
 ### 6. 历史、验证与回滚
 
 ```bash
@@ -586,7 +588,7 @@ uvx ty check src
 uv build --clear
 ```
 
-当前 v0.2.0 GA 基线为 261 个自动测试，包含 Host、真实本地 Docker scratch image 和 fake 1Password contract 门禁。
+当前 v0.2.1 GA 基线为 321 个自动测试，包含 Host、真实本地 Docker scratch image 和 fake 1Password contract 门禁。
 
 ### 2. 更新版本
 
@@ -603,15 +605,18 @@ uv lock
 ```bash
 uv build --clear
 
-sha256sum \
-  dist/git_deploy-0.2.0-py3-none-any.whl \
-  dist/git_deploy-0.2.0.tar.gz \
-  > dist/SHA256SUMS
+(
+  cd dist
+  sha256sum \
+    git_deploy-0.2.1-py3-none-any.whl \
+    git_deploy-0.2.1.tar.gz \
+    > SHA256SUMS
+)
 
 uv venv --clear tmp/release-smoke
 uv pip install \
   --python tmp/release-smoke/bin/python \
-  dist/git_deploy-0.2.0-py3-none-any.whl
+  dist/git_deploy-0.2.1-py3-none-any.whl
 
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
@@ -623,18 +628,18 @@ tmp/release-smoke/bin/git-deploy --help
 
 ```bash
 git add README.md pyproject.toml uv.lock src tests docs git-deploy.example.toml
-git commit -m "release v0.2.0"
+git commit -m "release v0.2.1"
 git push
 
-git tag -a v0.2.0 -m "git-deploy v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "git-deploy v0.2.1"
+git push origin v0.2.1
 
-gh release create v0.2.0 \
-  dist/git_deploy-0.2.0-py3-none-any.whl \
-  dist/git_deploy-0.2.0.tar.gz \
+gh release create v0.2.1 \
+  dist/git_deploy-0.2.1-py3-none-any.whl \
+  dist/git_deploy-0.2.1.tar.gz \
   dist/SHA256SUMS \
   --verify-tag \
-  --title "git-deploy v0.2.0" \
+  --title "git-deploy v0.2.1" \
   --notes-file /path/to/release-notes.md
 ```
 

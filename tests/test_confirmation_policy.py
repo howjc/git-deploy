@@ -57,8 +57,8 @@ def test_read_only_and_ordinary_mutation_confirmation_levels() -> None:
     )
 
 
-def test_production_risk_is_explicit_and_never_guessed_from_alias() -> None:
-    """Keep environment classification independent from remote alias spelling."""
+def test_production_risk_is_explicit_without_requiring_a_phrase() -> None:
+    """Keep production visible while allowing routine automation via ``--yes``."""
 
     misleading_alias = DeployRequest(
         **_target_context(SideEffectLevel.REMOTE_MUTATION, remote="prod"),
@@ -80,13 +80,13 @@ def test_production_risk_is_explicit_and_never_guessed_from_alias() -> None:
 
     assert standard.requirement is ConfirmationRequirement.CONFIRM
     assert RiskFactor.PRODUCTION not in {item.factor for item in standard.risks}
-    assert production.requirement is ConfirmationRequirement.PHRASE
+    assert production.requirement is ConfirmationRequirement.CONFIRM
     assert RiskFactor.PRODUCTION in {item.factor for item in production.risks}
-    assert production.phrase == "CONFIRM DEPLOY tgt-example"
+    assert production.phrase is None
 
 
-def test_force_and_secret_mutations_require_phrase_without_secret_material() -> None:
-    """Elevate force and secret execution without retaining secret values."""
+def test_force_and_secret_mutations_remain_visible_without_phrase_entry() -> None:
+    """Report force and secret risk while keeping routine deploys script-friendly."""
 
     request = DeployRequest(
         **_target_context(SideEffectLevel.REMOTE_MUTATION),
@@ -99,13 +99,13 @@ def test_force_and_secret_mutations_require_phrase_without_secret_material() -> 
         uses_secret=True,
     )
 
-    assert policy.requirement is ConfirmationRequirement.PHRASE
+    assert policy.requirement is ConfirmationRequirement.CONFIRM
     assert policy.level is RiskLevel.HIGH
     assert {item.factor for item in policy.risks} >= {
         RiskFactor.FORCE,
         RiskFactor.SECRET,
     }
-    assert "secret" not in policy.phrase.lower()
+    assert policy.phrase is None
 
 
 @pytest.mark.parametrize(

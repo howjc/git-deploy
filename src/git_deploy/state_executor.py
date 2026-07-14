@@ -393,6 +393,7 @@ class StateDeploymentExecutor:
             backup_refs=backup_refs,
             meta={
                 "introduced": list(plan.introduced_transition_ids),
+                "revision_specs": list(plan.revision_specs),
                 "paths": [item.path for item in files],
                 "backup_entries": backup_entries,
             },
@@ -1011,6 +1012,7 @@ class StateDeploymentExecutor:
             status=status,
             snapshots=snapshots,
             error=error,
+            revision_specs=list(journal.meta.get("revision_specs", [])),
             remote=self.project.remote,
             before_state_id=before_state.state_id() if before_state else None,
             after_state_id=after_state.state_id() if after_state else None,

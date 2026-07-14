@@ -17,7 +17,7 @@
 - TUI 是 optional dependency 和现有 CLI 之上的适配器；不得在 widget/event handler 中直接访问 transport、state store 或 executor。
 - CLI/TUI 共用不可变 request/result、结构化 error 和 operation event；同一 action 的业务结果与安全门禁必须一致。
 - TUI 所有 mouse action 都必须有 keyboard 等价路径；点击列表只选择，不直接执行 mutation。
-- prod、非最新回滚、GC delete、transaction recovery 必须输入确认短语；单击不能替代确认。
+- 非最新回滚、GC delete、transaction recovery 必须输入确认短语；日常 deploy 使用普通确认，CLI `--yes` 可跳过交互。
 - mutation 进入 `remote_mutating` 后只能协调取消；关闭界面、Esc 或 Ctrl+C 不等于远端回滚。
 - 只读 local-only 流程不得创建 worktree/cache/state，不得连接远端；remote verify 允许连接但写调用必须为 0。
 - secret/reference/token/value 不得进入 view model、widget、notification、snapshot、日志或剪贴板。
@@ -32,7 +32,7 @@
 | A02 | 定义 application result 与 error 协议 | application models/errors、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k 'result or error'` 通过；结果不含 renderer 对象，错误具有稳定 code/category/context 且 context 自动脱敏 | A01 | 已完成 |
 | T01P | 增加 SFTP 文件 ownership 与权限策略 | `config.py`、`transport.py`、配置文档与 fake transport tests | `uv run pytest tests/test_config.py tests/test_transport.py -q -k 'sftp_permission or sftp_ownership'` 通过；默认文件 `0644`/可执行文件 `0755`/目录 `0755`，可按 remote 配置 owner/group/mode，文件在原子替换前完成 chmod/chown，FTP/FTPS 不静默接受该策略 | T00 | 已完成 |
 | A03 | 扩展 operation/progress/transaction 事件协议 | `progress.py`、application events、`tests/test_progress.py` | `uv run pytest tests/test_progress.py -q -k operation_event` 通过；事件覆盖 operation/target/warning/transaction stage/terminal result，旧 `ProgressEvent` 消费者保持可用 | A02 | 已完成 |
-| A04 | 实现确认策略模型 | application policy、`tests/test_confirmation_policy.py` | `uv run pytest tests/test_confirmation_policy.py -q` 通过；普通 mutation、prod、force、secret、历史回滚、GC/recover 分级，风险来自显式策略而非 alias 猜测 | A01 | 已完成 |
+| A04 | 实现确认策略模型 | application policy、`tests/test_confirmation_policy.py` | `uv run pytest tests/test_confirmation_policy.py -q` 通过；普通 mutation、prod、force、secret、历史回滚、GC/recover 分级，只有 critical 操作要求短语，风险来自显式策略而非 alias 猜测 | A01 | 已完成 |
 | A05 | 实现 operation plan 防重放凭据 | application plan token、`tests/test_application_contract.py` | `uv run pytest tests/test_application_contract.py -q -k stale_plan` 通过；token 绑定 request、target identity、policy fingerprint、generation 和 plan digest，任一变化使执行拒绝 | A04 | 已完成 |
 | A06 | 定义协调取消状态机 | application cancellation、`tests/test_cancellation.py` | `uv run pytest tests/test_cancellation.py -q -k state_machine` 通过；区分可立即取消、等待 executor 协调、已提交和 manual recovery，不把 UI 关闭映射为成功回滚 | A03 | 已完成 |
 
@@ -49,7 +49,7 @@
 | S07 | 抽取最新回滚应用服务 | rollback facade、fake transport、`tests/test_application_rollback.py` | `uv run pytest tests/test_application_rollback.py -q -k latest` 通过；预览与执行分离，identity/generation/confirmation 复核，事件与派生 state 一致 | S03, S05, A05, A06 | 已完成 |
 | S08 | 实现 application worker 适配器 | worker/operation controller、`tests/test_application_worker.py` | `uv run pytest tests/test_application_worker.py -q` 通过；同步服务在 worker 执行，事件有序投递；同 target mutation 互斥，重复提交被拒绝 | S06, S07 | 已完成 |
 | C01 | 让 argparse CLI 改用只读应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'plan or history or verify or state'` 通过；parser/help/stdout/stderr/exit code snapshot 兼容，CLI 不直接调用 planner/store/transport | S02, S03, S04, S05 | 已完成 |
-| C02 | 让 argparse CLI 改用变更应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'deploy or rollback or recover'` 通过；`--yes` 仅映射允许的确认策略，prod/高风险不能因适配器差异绕过 | S06, S07, S08, C01 | 已完成 |
+| C02 | 让 argparse CLI 改用变更应用服务 | `cli.py`、CLI renderer、`tests/test_cli.py` | `uv run pytest tests/test_cli.py -q -k 'deploy or rollback or recover'` 通过；日常 deploy 的 prod/force/secret 风险允许 `--yes`，critical 操作仍要求短语 | S06, S07, S08, C01 | 已完成 |
 | V3A | Gate A：CLI 与应用服务兼容门禁 | application/CLI/既有回归 | `uv run pytest tests/test_application_*.py tests/test_cli.py tests/test_progress.py -q` 与 `uv run pytest -q` 通过；未安装 TUI 依赖时基础 CLI 仍可运行 | C02 | 已完成 |
 
 ## C. Gate B：只读 TUI 与鼠标基础
@@ -75,7 +75,7 @@
 | ID | 任务 | 涉及范围 | 完成定义（DoD） | 依赖 | 状态 |
 |---|---|---|---|---|---|
 | M01 | 实现不可变 review/confirmation 屏 | TUI confirmation view model、`tests/tui/test_confirmation.py` | `uv run pytest tests/tui/test_confirmation.py -q -k review` 通过；显示 identity/generation/diff/hooks/build/risk，plan token 变化立即禁用执行 | V3B, A04, A05 | 待办 |
-| M02 | 实现高风险确认短语组件 | TUI confirmation widget、`tests/tui/test_confirmation.py` | `uv run pytest tests/tui/test_confirmation.py -q -k phrase` 通过；prod/force/secret/recover 必须精确输入短语，粘贴/点击/Enter 都不能在短语错误时提交 | M01 | 待办 |
+| M02 | 实现 critical 确认短语组件 | TUI confirmation widget、`tests/tui/test_confirmation.py` | `uv run pytest tests/tui/test_confirmation.py -q -k phrase` 通过；非最新回滚/GC/recover 必须精确输入短语，日常 deploy 使用普通确认 | M01 | 待办 |
 | M03 | 接入 deploy worker | TUI deploy controller、fake transport、`tests/tui/test_deploy.py` | `uv run pytest tests/tui/test_deploy.py -q -k execute` 通过；执行调用 S06/S08，重复点击只产生一个 transaction，切屏不取消 mutation | M02, S08 | 待办 |
 | M04 | 实现部署实时进度屏 | TUI progress widgets、`tests/tui/test_deploy.py` | `uv run pytest tests/tui/test_deploy.py -q -k progress` 通过；阶段/计数/字节/路径/transaction 有序显示，路径脱敏，完成后 manifest/state 与服务结果一致 | M03, A03 | 待办 |
 | M05 | 实现取消与退出协调提示 | TUI lifecycle、`tests/tui/test_cancellation.py` | `uv run pytest tests/tui/test_cancellation.py -q` 通过；计划可立即取消，remote_mutating 只请求协调取消；退出显示 transaction ID/阶段/recover 命令且不伪报回滚 | M04, A06 | 待办 |
@@ -129,7 +129,7 @@
 - [x] 已包含验证纪律、受阻留言、禁止绕过、熔断、状态同步和用户代验约定。
 - [x] 应用服务、CLI 兼容、只读 TUI、mutation TUI、高级 core 和高级 TUI 分 Gate 汇合。
 - [x] 键盘/鼠标等价、焦点、滚轮、尺寸矩阵均有 headless 自动门禁。
-- [x] prod/历史回滚/GC/recover 的确认短语与 stale-plan 拒绝有独立任务。
+- [x] 历史回滚/GC/recover 的确认短语与 stale-plan 拒绝有独立任务。
 - [x] 非最新回滚和 GC 先完成 core/CLI，再接 TUI，依赖方向无反转。
 - [x] 自动 fixture 与真实终端人工增强分离；人工项不读取真实秘密、不写真实服务器。
 - [x] 文末包含变更记录。
@@ -159,3 +159,5 @@
 | 2026-07-13 | S08 application worker 完成 | 同步 service 后台执行且事件 sequence 严格有序；同 target mutation 互斥、重复 operation ID 在提交阶段拒绝，并复用协调取消状态机；精确门禁 2 passed |
 | 2026-07-13 | C02 mutation argparse adapter 完成 | deploy/latest rollback 经签名计划、确认策略、application service 与 worker 执行；recover 经显式 StateRequest 风险策略与 worker 执行；新增 `--confirm-phrase`，production/force/secret/recover 不可被 `--yes` 单独绕过；精确门禁 12 passed、完整 CLI 40 passed |
 | 2026-07-13 | V3A CLI/application Gate A 完成 | application/CLI/progress 聚合门禁 76 passed，全项目 320 passed；ruff/ty/diff check 通过，基础 `git-deploy --help` 在未引入 TUI 依赖时正常启动 |
+| 2026-07-14 | 简化日常部署确认 | prod、force、secret 风险仍被识别和展示，但 deploy 只需普通确认，CLI `--yes` 可直接自动化；历史回滚、GC、recover 的 critical 短语及全部底层安全门禁不变 |
+| 2026-07-14 | history 冻结 HEAD selector | legacy/stateful 部署统一把 `HEAD`、`HEAD^`、`HEAD~N` 范围端点解析为完整 commit hash 后写入 manifest，避免 HEAD 移动后历史含义混淆 |

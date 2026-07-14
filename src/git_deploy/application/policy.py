@@ -139,7 +139,10 @@ def confirmation_policy_for(
     if not is_mutation:
         requirement = ConfirmationRequirement.NONE
         phrase = None
-    elif level >= RiskLevel.HIGH:
+    elif level >= RiskLevel.CRITICAL:
+        # Phrase entry is reserved for destructive/recovery operations. Routine
+        # deploys and latest rollbacks remain script-friendly: ``--yes`` can
+        # acknowledge production, force, and secret-related warnings.
         requirement = ConfirmationRequirement.PHRASE
         phrase = f"CONFIRM {request.operation.value.upper()} {request.expected_target_id}"
     else:

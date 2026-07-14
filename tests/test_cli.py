@@ -832,6 +832,7 @@ def test_stateful_deploy_creates_journal_and_advances_generation(
     from git_deploy.models import ProjectConfig
     from git_deploy.object_store import ContentAddressedStore
     from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state import DeploymentStore
     from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
     from git_deploy.target_identity import (
         default_state_base,
@@ -913,7 +914,7 @@ local_state_dir = ".state/demo"
 
     set_cli_transport_factory(factory)
     try:
-        code = run(["deploy", "demo", "--revisions", newer, "--yes"])
+        code = run(["deploy", "demo", "--revisions", "HEAD", "--yes"])
         out = capsys.readouterr().out
         assert code == 0, out + capsys.readouterr().err
         assert "succeeded" in out or "generation=" in out
@@ -924,6 +925,13 @@ local_state_dir = ".state/demo"
         assert transport.files["/srv/demo/file.txt"].data == b"two\n"
         # Target-scoped deployment store under target root.
         assert (root / "deployments").is_dir()
+        manifest = DeploymentStore(project, root=root).latest_successful()
+        assert manifest.revision_specs == [newer]
+
+        assert run(["history", "demo"]) == 0
+        history_output = capsys.readouterr().out
+        assert newer in history_output
+        assert " HEAD " not in history_output
     finally:
         set_cli_transport_factory(None)
 
@@ -3469,26 +3477,9 @@ kind = "tree"
 
     set_cli_transport_factory(factory)
     try:
-        # Secret-backed deploy is high-risk: --yes alone must not bypass the
-        # application confirmation policy or invoke the secret provider.
-        assert run(["deploy", "demo", "--revisions", head, "--yes"]) == 2
-        assert calls.read_text().splitlines() == ["run"]
-        assert connection_calls["count"] == 0
-        capsys.readouterr()
-        assert (
-            run(
-                [
-                    "deploy",
-                    "demo",
-                    "--revisions",
-                    head,
-                    "--yes",
-                    "--confirm-phrase",
-                    f"CONFIRM DEPLOY {identity.target_id}",
-                ]
-            )
-            == 0
-        )
+        # Routine deploy automation uses --yes even when a build injects secrets;
+        # secret references and values remain excluded from output and state.
+        assert run(["deploy", "demo", "--revisions", head, "--yes"]) == 0
     finally:
         set_cli_transport_factory(None)
     deploy_output = capsys.readouterr().out
@@ -3523,8 +3514,6 @@ kind = "tree"
                     "--revisions",
                     head,
                     "--yes",
-                    "--confirm-phrase",
-                    f"CONFIRM DEPLOY {identity.target_id}",
                 ]
             )
             != 0

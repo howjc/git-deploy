@@ -30,6 +30,7 @@ class SourceDiffPlan:
         applied_transition_ids: Full applied set after success.
         remote_unverified: True when plan is static/local-only (no remote check).
         static_noop: True when no file mutations and only already-applied transitions.
+        revision_specs: Durable selectors with HEAD expressions frozen to commit IDs.
     """
 
     before_tree_id: str
@@ -40,6 +41,7 @@ class SourceDiffPlan:
     applied_transition_ids: tuple[str, ...]
     remote_unverified: bool = False
     static_noop: bool = False
+    revision_specs: tuple[str, ...] = ()
 
 
 class StatePlanner:
@@ -87,6 +89,7 @@ class StatePlanner:
         *,
         remote_unverified: bool = False,
         close_ephemeral: bool = True,
+        revision_specs: Sequence[str] = (),
     ) -> SourceDiffPlan:
         """Build a source diff plan from a composition result.
 
@@ -99,6 +102,7 @@ class StatePlanner:
             compose: Composer output.
             remote_unverified: Mark plan as local-only static.
             close_ephemeral: Close owned ephemeral object dir after planning.
+            revision_specs: Immutable selectors recorded in deployment history.
 
         Returns:
             Source diff plan with before=current tree semantics.
@@ -122,6 +126,7 @@ class StatePlanner:
                     applied_transition_ids=compose.applied_transition_ids,
                     remote_unverified=remote_unverified,
                     static_noop=True,
+                    revision_specs=tuple(revision_specs),
                 )
 
             changes = self.repo.changes(
@@ -149,6 +154,7 @@ class StatePlanner:
                 applied_transition_ids=compose.applied_transition_ids,
                 remote_unverified=remote_unverified,
                 static_noop=not planned and not compose.introduced_transition_ids,
+                revision_specs=tuple(revision_specs),
             )
         finally:
             # Lifecycle covers all tree/blob reads above; drop env if it pointed
@@ -178,12 +184,17 @@ class StatePlanner:
             Source diff plan.
         """
 
+        revision_specs = self.repo.freeze_head_revision_specs(selectors)
         compose = self.composer.compose(
-            selectors=selectors,
+            selectors=revision_specs,
             current_tree_id=current_tree_id,
             applied_transition_ids=applied_transition_ids,
         )
-        return self.plan_from_compose(compose, remote_unverified=static_only)
+        return self.plan_from_compose(
+            compose,
+            remote_unverified=static_only,
+            revision_specs=revision_specs,
+        )
 
     def file_entries_for_tree(self, tree_id: str, paths: Sequence[str] | None = None) -> tuple[FileEntry, ...]:
         """Materialize managed file entries from a Git tree.

@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--yes", action="store_true", help="skip the mutation confirmation")
     deploy.add_argument(
         "--confirm-phrase",
-        help="exact confirmation phrase required for production or high-risk mutation",
+        help=argparse.SUPPRESS,
     )
 
     build = subparsers.add_parser("build", help="build configured artifacts locally (no remote)")
@@ -88,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--yes", action="store_true", help="skip the mutation confirmation")
     rollback.add_argument(
         "--confirm-phrase",
-        help="exact confirmation phrase required for production or high-risk mutation",
+        help="exact confirmation phrase required for critical rollback operations",
     )
     _add_remote_argument(rollback)
 
