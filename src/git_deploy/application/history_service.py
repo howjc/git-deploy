@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 from git_deploy.errors import ConfigurationError
 from git_deploy.expected_state import ExpectedStateStore
@@ -49,6 +51,7 @@ class HistoryResult:
     total: int
     offset: int
     next_offset: int | None
+    corrupt_records: tuple[str, ...] = ()
 
 
 class HistoryService:
@@ -100,6 +103,14 @@ class HistoryService:
             )
 
         manifests = _merged_manifests(project, target_root)
+        corrupt_records = tuple(
+            sorted(
+                {
+                    *_corrupt_manifest_paths(DeploymentStore(project).root),
+                    *_corrupt_manifest_paths(target_root),
+                }
+            )
+        )
         if request.deployment_id is not None:
             selected = _select_manifest(manifests, request.deployment_id)
             page = (selected,)
@@ -116,6 +127,7 @@ class HistoryService:
             total=len(manifests),
             offset=offset,
             next_offset=next_offset,
+            corrupt_records=corrupt_records,
         )
 
 
@@ -146,6 +158,29 @@ def _select_manifest(
     if len(matches) > 1:
         raise ConfigurationError(f"deployment prefix is ambiguous: {deployment_id}")
     return matches[0]
+
+
+def _corrupt_manifest_paths(root: Path) -> tuple[str, ...]:
+    """Return every unreadable deployment record path instead of hiding it."""
+
+    deployment_root = root / "deployments"
+    if not deployment_root.is_dir():
+        return ()
+    corrupt: list[str] = []
+    for directory in sorted(deployment_root.glob("*")):
+        if not directory.is_dir():
+            continue
+        path = directory / "manifest.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("manifest root is not an object")
+            manifest = DeploymentManifest.from_dict(payload)
+            if manifest.deployment_id != directory.name:
+                raise ValueError("deployment ID does not match directory")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            corrupt.append(str(path))
+    return tuple(corrupt)
 
 
 def _history_entry(manifest: DeploymentManifest) -> HistoryEntry:

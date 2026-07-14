@@ -1,5 +1,15 @@
 # git-deploy v0.3 TUI 与高级状态运维 TODO 清单
 
+> [!CAUTION]
+> **FROZEN / 已冻结：禁止继续执行本文档中的未完成任务。**
+>
+> v0.3 产品方向已收敛为个人和小团队使用的简化稳定 CLI。新的唯一实施依据是：
+>
+> - [v0.3 简化稳定版北极星](2026-07-14-git-deploy-v0.3-simplified-northstar.md)
+> - [v0.3 简化稳定版原子 TODO](../git-deploy-v0.3-simplified-atomic-todo.md)
+>
+> 本文仅保留 Gate A 已完成记录和历史设计证据；P01～E07 等未完成任务不得由 Agent 自动拾取。
+
 > 依据：`docs/planning/2026-07-12-git-deploy-v0.3-tui-northstar.md`（Gate A-E）。
 > 前置：v0.2 Gate A/B/C 与 GA 门禁完成；本清单不替代 v0.2 未完成任务。
 >

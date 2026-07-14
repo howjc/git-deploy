@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,45 @@ def test_application_deploy_requires_token_confirmation_and_is_idempotent(
     assert {item.transaction_id for item in transaction_events} == {"txn-1"}
     assert isinstance(events[-1], TerminalResultEvent)
     assert events[-1].result is first
+
+
+def test_application_deploy_static_noop_skips_confirmation_and_executor(
+    tmp_path: Path,
+) -> None:
+    """Return a successful no-op without transaction, write, or confirmation."""
+
+    signer, request, planned = _planned_deploy(tmp_path)
+    plan = replace(
+        planned,
+        before_tree_id=planned.after_tree_id,
+        source_changes=(),
+        introduced_transition_ids=(),
+        static_noop=True,
+    )
+    calls = {"executor": 0}
+
+    def executor(*_args):
+        """Fail the test if a static no-op crosses the executor boundary."""
+
+        calls["executor"] += 1
+        raise AssertionError("static no-op must not execute")
+
+    events = []
+    result = DeployService(signer, executor).execute(
+        request,
+        plan,
+        token=plan.plan_token,
+        confirmation=ConfirmationGrant(False),
+        event_sink=events.append,
+    )
+
+    assert result.status is ResultStatus.NOOP
+    assert result.summary == (
+        "No changes: target generation already matches " f"{plan.after_tree_id}"
+    )
+    assert calls == {"executor": 0}
+    assert not any(isinstance(item, TransactionStageEvent) for item in events)
+    assert isinstance(events[-1], TerminalResultEvent)
 
 
 def test_application_deploy_rejects_token_for_changed_request(tmp_path: Path) -> None:

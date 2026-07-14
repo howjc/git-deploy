@@ -111,6 +111,22 @@ def test_protected_environment_file_change_is_rejected(tmp_path: Path) -> None:
         planner.build(older, newer)
 
 
+def test_protected_environment_file_delete_is_rejected(tmp_path: Path) -> None:
+    """Reject deleting a protected source path just like uploading it."""
+
+    repository = _repository(tmp_path)
+    (repository / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    older = _commit(repository, "with env")
+    (repository / ".env").unlink()
+    newer = _commit(repository, "delete env")
+    planner = GitDeploymentPlanner(
+        ProjectConfig(name="demo", repository=repository, remote_root="/srv/demo")
+    )
+
+    with pytest.raises(PolicyError, match="protected path"):
+        planner.build(older, newer)
+
+
 def test_symlink_change_is_rejected(tmp_path: Path) -> None:
     """Reject target symlinks because transports cannot preserve their semantics safely."""
 

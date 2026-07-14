@@ -1,146 +1,139 @@
 # git-deploy
 
-`git-deploy` 是一个基于 Git revision 的增量部署、状态管理与回滚工具。它从提交、连续范围或非连续提交组合中计算精确文件变化，通过 SFTP、FTP 或 FTPS 部署，并用持久化 expected state、事务日志和部署前备份保证重复部署、失败恢复及最新版本回滚的一致性。
+`git-deploy` 是给个人和小团队使用的 Git 增量发布工具。它从可信的本地
+current state 自动计算到当前 `HEAD` 的变化，通过 SFTP、FTP 或 FTPS 发布，
+并在修改远端前保存真实备份。日常发布不需要复制 commit range，也不需要输入
+冗长确认短语。
 
-v0.2.1 支持 named remote、多环境切换、Host/Docker 构建产物，以及通过 1Password CLI 为构建过程注入环境变量。源码和构建产物进入同一个部署事务，任一步失败时共同恢复。
+它适合仍通过 SSH/FTP 发布普通目录、希望保留清晰 Git 来源和最新版本回滚能力
+的项目。它不是 CI 平台、服务器面板或数据库 migration 系统；v0.3.0 也不提供
+TUI、历史版本派生回滚或自动 GC。
 
-> `deploy.py` 是旧版全量上传入口；新的 `git-deploy` CLI 位于 `src/git_deploy`，不会读取旧版 `deploy.example.toml`。
+## 安装
 
-## 文档导航
-
-- [功能概览](#功能概览)
-- [系统要求](#系统要求)
-- [安装指南](#安装指南)
-- [快速开始](#快速开始)
-- [配置指南](#配置指南)
-- [Revision 选择规则](#revision-选择规则)
-- [完整使用指南](#完整使用指南)
-- [命令说明表](#命令说明表)
-- [打包和发布](#打包和发布)
-- [安全模型](#安全模型)
-- [深入文档](#深入文档)
-
-## 功能概览
-
-- 选择单个提交、`FROM..TO` 连续范围或多个非连续 selector。
-- 支持 SFTP、FTP、FTPS，以及 SSH config、SSH Agent、密码环境变量。
-- 支持 `dev`、`prod` 等多个 named remote，并可设置安全的默认环境。
-- 按 physical target 隔离或共享 state、lock、部署历史和构建缓存。
-- 持久化 current generation、Git tree、CAS 内容和 transaction journal。
-- 上传前检查远端漂移，部署前保存真实 bytes，部署后逐文件验证。
-- 支持 Host 或 Docker 构建，并收集 file/tree artifact。
-- 支持 `op run` 向 Host/Docker 构建注入白名单环境变量。
-- source 与 artifact 统一规划、流式传输、事务提交和最新回滚。
-- plan/dry-run 默认不连接远端、不构建、不调用 Docker/op、不写 state。
-
-## 系统要求
-
-| 组件 | 要求 | 用途 |
-|---|---|---|
-| Python | 3.11 或更高 | 运行 git-deploy |
-| Git | 可用的命令行客户端 | 解析 revision、tree 和 blob |
-| uv | 推荐当前稳定版 | 安装、开发、测试和打包 |
-| Docker | 可选 | 使用 `runner = "docker"` 时需要 |
-| 1Password CLI | 可选 | 配置 `build.onepassword` 时需要 |
-| Composer / Node / Go 等 | 可选 | Host runner 需要的项目构建工具 |
-
-远端只需要对应协议和目标目录权限，不需要安装 Python、Git、Docker 或 git-deploy。
-
-## 安装指南
-
-### 从 GitHub Release 安装
-
-当前稳定版本为 `v0.2.1`：
+需要 Python 3.11+ 和 Git。推荐直接安装 v0.3.0 wheel：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v0.2.1/git_deploy-0.2.1-py3-none-any.whl
-
+  https://github.com/howjc/git-deploy/releases/download/v0.3.0/git_deploy-0.3.0-py3-none-any.whl
 git-deploy --version
-git-deploy --help
 ```
 
-下载并验证发布产物：
+开发安装：
 
 ```bash
-gh release download v0.2.1 \
-  --repo howjc/git-deploy \
-  --pattern "git_deploy-0.2.1*" \
-  --pattern "SHA256SUMS"
-
-sha256sum -c SHA256SUMS
-uv tool install ./git_deploy-0.2.1-py3-none-any.whl
-```
-
-升级或重新安装：
-
-```bash
-uv tool install --force \
-  https://github.com/howjc/git-deploy/releases/download/v0.2.1/git_deploy-0.2.1-py3-none-any.whl
-```
-
-卸载：
-
-```bash
-uv tool uninstall git-deploy
-```
-
-### 从源码安装
-
-```bash
-git clone https://github.com/howjc/git-deploy.git
-cd git-deploy
-
-# 普通安装
-uv tool install .
-
-# 开发环境
 uv sync
 uv tool install --editable .
 ```
 
-也可以直接安装另一个工作区中的项目目录：
+Docker 仅在使用 Docker build runner 时需要；1Password CLI 仅在显式配置
+secret-enabled build 时需要。远端不需要安装 Python 或 git-deploy。
 
-```bash
-uv tool install --editable /path/to/git-deploy
+## 最小配置
+
+在项目根目录创建不提交到 Git 的 `deploy.toml`：
+
+```toml
+[server]
+protocol = "sftp"
+host = "app.example.com"
+username = "deploy"
+strict_host_key_checking = true
+
+[projects.application]
+repository = "."
+remote_root = "/srv/application"
+include = ["**"]
+exclude = ["runtime/**", "uploads/**"]
+protected = [".env", "**/*.key", "storage/cert/**"]
 ```
 
-## 快速开始
+多环境项目可配置 `[remotes.dev]`、`[remotes.prod]` 和
+`default_remote = "dev"`；生产 remote 建议设置 `risk = "production"`。
+
+## 首次建立可信 state
+
+先运行本地诊断：
 
 ```bash
-cp git-deploy.example.toml deploy.toml
-
-# 预览
-git-deploy plan application \
-  --revisions COMMIT_A..COMMIT_B \
-  --remote dev
-
-# dry-run
-git-deploy deploy application \
-  --revisions COMMIT_A..COMMIT_B \
-  --remote dev \
-  --dry-run
-
-# 正式部署
-git-deploy deploy application \
-  --revisions COMMIT_A..COMMIT_B \
-  --remote dev \
-  --yes
+git-deploy doctor application
 ```
 
-确认开发环境后，将同一 selector 部署到生产：
+如果远端当前内容对应某个已知 Git commit：
 
 ```bash
-git-deploy deploy application \
-  --revisions COMMIT_A..COMMIT_B \
-  --remote prod \
-  --dry-run --check-remote
-
-git-deploy deploy application \
-  --revisions COMMIT_A..COMMIT_B \
-  --remote prod \
-  --yes
+git-deploy state bootstrap application --revision COMMIT --yes
 ```
+
+只有在确认所有受管远端路径都不存在时，才使用空基线：
+
+```bash
+git-deploy state bootstrap application --empty --yes
+```
+
+bootstrap 是一次显式 mutation。不要为了绕过检查而删除 state 文件或 lock。
+
+## 日常发布
+
+建立 current 后，最短流程就是：
+
+```bash
+git-deploy plan application
+git-deploy deploy application --dry-run
+git-deploy deploy application --yes
+```
+
+未传 `--revisions` 时，工具按每个项目自己的可信 current 选择缺失提交直到当时的
+`HEAD`。plan 会把 `HEAD` 冻结为完整 commit hash；正式 deploy 复用相同 plan 并在
+执行前复核 target identity 和 generation。已经部署到 HEAD 时返回 0，并显示
+`No changes`，不会连接远端或新建 transaction/manifest。
+
+需要部署显式提交或范围时仍可使用：
+
+```bash
+git-deploy deploy application --revisions COMMIT_A..HEAD --yes
+```
+
+history 记录的是 plan 当时解析出的完整 HEAD commit hash，而不是易移动的指针。
+
+## Doctor 和远端核对
+
+`doctor` 默认只读本地配置、Git 和 state，不连接服务器：
+
+```bash
+git-deploy doctor application
+git-deploy doctor all --remote dev
+git-deploy doctor application --remote prod --check-remote
+```
+
+`--check-remote` 只做远端读取/目录检查。完整路径核对使用：
+
+```bash
+git-deploy state verify application --check-remote
+```
+
+## 最新版本回滚
+
+回滚默认选择最新成功 deployment，不再要求 `--latest`：
+
+```bash
+git-deploy rollback application --dry-run
+git-deploy rollback application --yes
+```
+
+v0.3.0 只自动回滚最新 deployment。backup、current lineage 或远端状态无法证明时，
+工具会停止并保留 transaction evidence，不会猜测。
+
+## 深入文档
+
+- [v0.3 简化设计](docs/planning/2026-07-14-git-deploy-v0.3-simplified-northstar.md)
+- [application contract](docs/application-contract-v0.3.md)
+- [从手工 FTP 发布迁移](docs/migrate-from-manual-ftp.md)
+- [故障恢复手册](docs/recovery-playbook.md)
+- [target lock 审计](docs/audit/v0.3-target-lock-audit.md)
+
+> `deploy.py` 是旧版全量上传入口；新 CLI 不读取旧版
+> `deploy.example.toml`。
 
 ## 配置指南
 
@@ -485,7 +478,7 @@ git-deploy rollback application \
   --yes
 ```
 
-`--deployment` 接受完整 ID 或唯一前缀。v0.2 stateful 路径只允许回滚最新成功 deployment；非最新回滚会在连接远端前拒绝。回滚恢复文件 bytes/mode 和 state，不回滚数据库或其他外部副作用。
+`--deployment` 接受完整 ID 或唯一前缀。当前 stateful 路径只允许回滚最新成功 deployment；非最新回滚会在连接远端前拒绝。回滚恢复文件 bytes/mode 和 state，不回滚数据库或其他外部副作用。
 
 ### 7. State 检查与恢复
 
@@ -539,7 +532,7 @@ git-deploy state policy-migrate application --remote prod --execute --yes
 | `state recover TARGET` | 显示或执行 transaction 恢复 | execute 可能读写远端 | execute 更新 journal/state |
 | `state migrate TARGET` | 迁移 legacy/named-remote 历史 | 无 | stage/yes 写本地历史 |
 | `state policy-migrate TARGET` | 迁移 managed policy | execute 时远端只读 | `--execute --yes` CAS 推进 |
-| `state gc` | v0.2 保留全部对象 | 不支持并返回错误 | 无 |
+| `state gc` | v0.3.0 保留全部对象 | 不支持并返回错误 | 无 |
 
 ### 常用参数
 
@@ -588,7 +581,7 @@ uvx ty check src
 uv build --clear
 ```
 
-当前 v0.2.1 GA 基线为 321 个自动测试，包含 Host、真实本地 Docker scratch image 和 fake 1Password contract 门禁。
+当前 v0.3.0 GA 基线为 347 个自动测试，包含 Host、真实 OpenSSH/SFTP 容器和 fake FTP/FTPS contract 门禁。
 
 ### 2. 更新版本
 
@@ -608,15 +601,15 @@ uv build --clear
 (
   cd dist
   sha256sum \
-    git_deploy-0.2.1-py3-none-any.whl \
-    git_deploy-0.2.1.tar.gz \
+    git_deploy-0.3.0-py3-none-any.whl \
+    git_deploy-0.3.0.tar.gz \
     > SHA256SUMS
 )
 
 uv venv --clear tmp/release-smoke
 uv pip install \
   --python tmp/release-smoke/bin/python \
-  dist/git_deploy-0.2.1-py3-none-any.whl
+  dist/git_deploy-0.3.0-py3-none-any.whl
 
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
@@ -628,19 +621,19 @@ tmp/release-smoke/bin/git-deploy --help
 
 ```bash
 git add README.md pyproject.toml uv.lock src tests docs git-deploy.example.toml
-git commit -m "release v0.2.1"
+git commit -m "release v0.3.0"
 git push
 
-git tag -a v0.2.1 -m "git-deploy v0.2.1"
-git push origin v0.2.1
+git tag -a v0.3.0 -m "git-deploy v0.3.0"
+git push origin v0.3.0
 
-gh release create v0.2.1 \
-  dist/git_deploy-0.2.1-py3-none-any.whl \
-  dist/git_deploy-0.2.1.tar.gz \
+gh release create v0.3.0 \
+  dist/git_deploy-0.3.0-py3-none-any.whl \
+  dist/git_deploy-0.3.0.tar.gz \
   dist/SHA256SUMS \
   --verify-tag \
-  --title "git-deploy v0.2.1" \
-  --notes-file /path/to/release-notes.md
+  --title "git-deploy v0.3.0" \
+  --notes-file docs/release-notes-v0.3.0.md
 ```
 
 仓库当前通过 GitHub Release 分发 wheel/sdist，尚未配置 PyPI 自动发布。未来接入 PyPI 时应使用 trusted publishing 或受保护的 registry credential，不能把 token 写入仓库、命令历史或文档。
@@ -661,7 +654,7 @@ gh release create v0.2.1 \
 - Host runner 具有当前用户权限；Docker daemon 管理员可读取存活容器环境变量。
 - 1Password reference、认证 token 和解析值不会写入 fingerprint、manifest、state 或日志。
 - 回滚不处理数据库、消息、支付或其他外部系统副作用。
-- v0.2 不删除 state/CAS/Git 对象；引用可达性 GC 和非最新回滚计划在 v0.3 实现。
+- v0.3 继续保留 state/CAS/Git 历史对象；自动 GC 与非最新回滚已冻结，不进入当前版本。
 
 ## 深入文档
 
@@ -669,4 +662,5 @@ gh release create v0.2.1 \
 - [v0.2 构建产物与秘密安全](docs/v0.2-build-artifacts.md)
 - [v0.2 北极星设计](docs/planning/2026-07-10-git-deploy-build-artifacts-northstar.md)
 - [v0.2 原子 TODO](docs/planning/2026-07-10-git-deploy-v0.2-state-build-todo.md)
-- [v0.3 TUI 北极星](docs/planning/2026-07-12-git-deploy-v0.3-tui-northstar.md)
+- [v0.3 简化稳定版北极星](docs/planning/2026-07-14-git-deploy-v0.3-simplified-northstar.md)
+- [已冻结的 v0.3 TUI 设计记录](docs/planning/2026-07-12-git-deploy-v0.3-tui-northstar.md)

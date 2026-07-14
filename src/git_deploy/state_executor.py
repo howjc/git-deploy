@@ -436,6 +436,12 @@ class StateDeploymentExecutor:
                     self.transport.delete_file(item.remote_path)
                 else:
                     stream_writer = getattr(self.transport, "write_file_stream", None)
+                    if not callable(stream_writer):
+                        stream_writer = getattr(
+                            self.transport,
+                            "replace_file_stream",
+                            None,
+                        )
                     if callable(stream_writer):
                         stream_writer(
                             item.remote_path,
@@ -443,7 +449,10 @@ class StateDeploymentExecutor:
                             executable=item.executable,
                         )
                     else:
-                        self.transport.write_file(
+                        writer = getattr(self.transport, "write_file", None)
+                        if not callable(writer):
+                            writer = getattr(self.transport, "replace_file")
+                        writer(
                             item.remote_path,
                             self._content_bytes(item.path),
                             executable=item.executable,
@@ -560,7 +569,10 @@ class StateDeploymentExecutor:
             backup_file = entry.get("backup_file")
             if backup_file:
                 data = self.deploy_store.read_backup(journal.deployment_id, str(backup_file))
-                self.transport.write_file(
+                writer = getattr(self.transport, "write_file", None)
+                if not callable(writer):
+                    writer = getattr(self.transport, "replace_file")
+                writer(
                     remote_path,
                     data,
                     executable=bool(entry.get("executable")),
@@ -1083,5 +1095,7 @@ def _new_deployment_id() -> str:
     import secrets
     from datetime import UTC, datetime
 
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    # Microseconds make lexical history order equal creation order even when a
+    # fast script completes multiple deployments inside the same wall-clock second.
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{stamp}-{secrets.token_hex(4)}"

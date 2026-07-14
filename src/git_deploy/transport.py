@@ -435,9 +435,14 @@ class SftpTransport:
         try:
             self._sftp.stat(remote_dir)
         except FileNotFoundError:
-            self._sftp.mkdir(remote_dir)
-            self._sftp.chmod(remote_dir, self._permissions.directory_mode)
-            self._set_ownership(remote_dir)
+            try:
+                self._sftp.mkdir(remote_dir)
+                self._sftp.chmod(remote_dir, self._permissions.directory_mode)
+                self._set_ownership(remote_dir)
+            except OSError as exc:
+                raise GitDeployError(
+                    f"cannot prepare remote directory {remote_dir}: {exc}"
+                ) from exc
         self._directories.add(remote_dir)
 
     def _set_ownership(self, remote_path: str) -> None:

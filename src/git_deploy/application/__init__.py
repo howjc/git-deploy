@@ -27,6 +27,16 @@ from .deploy_service import (
     ConfirmationGrant,
     DeployService,
 )
+from .doctor_service import (
+    DoctorCheckCategory,
+    DoctorCheckResult,
+    DoctorCheckStatus,
+    DoctorContextItem,
+    DoctorRequest,
+    DoctorResult,
+    DoctorService,
+)
+from .doctor_checks import ProjectDoctorChecks, standard_doctor_service
 from .history_service import (
     HistoryEntry,
     HistoryLineage,
@@ -67,6 +77,7 @@ from .plan_service import (
     BuildPlanSummary,
     PlannedChange,
     RevisionPlanResult,
+    RevisionSelectionOrigin,
     RevisionPlanService,
 )
 from .errors import (
@@ -119,6 +130,14 @@ __all__ = [
     "ConfirmationGrant",
     "DeployRequest",
     "DeployService",
+    "DoctorCheckCategory",
+    "DoctorCheckResult",
+    "DoctorCheckStatus",
+    "DoctorContextItem",
+    "DoctorRequest",
+    "DoctorResult",
+    "DoctorService",
+    "ProjectDoctorChecks",
     "DuplicateOperationError",
     "ErrorCategory",
     "ErrorContextItem",
@@ -147,6 +166,7 @@ __all__ = [
     "ResultField",
     "ResultStatus",
     "RevisionPlanResult",
+    "RevisionSelectionOrigin",
     "RevisionPlanService",
     "RiskFactor",
     "RiskItem",
@@ -176,4 +196,5 @@ __all__ = [
     "application_error_from_exception",
     "confirmation_policy_for",
     "confirmation_policy_fingerprint",
+    "standard_doctor_service",
 ]

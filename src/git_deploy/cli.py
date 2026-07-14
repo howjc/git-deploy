@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
+from .application.errors import ApplicationError, ErrorCategory
 from .config import discover_config, load_config, select_remote
 from .errors import ConfigurationError, GitDeployError, PolicyError
 from .executor import DeploymentExecutor, RemoteCheck
@@ -75,9 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_deployment_selector(verify)
     _add_remote_argument(verify)
 
-    rollback = subparsers.add_parser("rollback", help="restore an exact pre-deployment snapshot")
+    rollback = subparsers.add_parser(
+        "rollback",
+        help="restore the latest successful deployment snapshot by default",
+    )
     rollback.add_argument("target", help="project name or all")
-    _add_deployment_selector(rollback)
+    _add_deployment_selector(rollback, required=False)
     rollback.add_argument("--dry-run", action="store_true", help="preview without remote writes")
     rollback.add_argument(
         "--check-remote",
@@ -91,6 +95,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact confirmation phrase required for critical rollback operations",
     )
     _add_remote_argument(rollback)
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="check local configuration/state (remote reads are opt-in)",
+    )
+    doctor.add_argument("target", help="project name or all")
+    doctor.add_argument(
+        "--check-remote",
+        action="store_true",
+        help="add read-only remote connectivity/root checks",
+    )
+    doctor.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="output format (default: text)",
+    )
+    _add_remote_argument(doctor)
 
     state = subparsers.add_parser("state", help="inspect, verify, bootstrap, and recover target state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
@@ -127,8 +149,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_remote_argument(recover)
 
-    # Explicitly reject GC in v0.2.
-    state_sub.add_parser("gc", help="not supported in v0.2 (objects are fully retained)")
+    # Explicitly reject GC in v0.3.0.
+    state_sub.add_parser("gc", help="not supported in v0.3.0 (objects are fully retained)")
 
     migrate = state_sub.add_parser("migrate", help="legacy/named-remote history migration")
     migrate.add_argument("target", help="project name")
@@ -157,9 +179,12 @@ def _add_plan_arguments(parser: argparse.ArgumentParser, include_dry_run: bool) 
     parser.add_argument(
         "--revisions",
         nargs="+",
-        required=True,
+        default=(),
         metavar="COMMIT_OR_FROM..TO",
-        help="single commits or continuous ranges; separate multiple selectors with spaces",
+        help=(
+            "single commits or continuous ranges; defaults to trusted current state "
+            "through HEAD"
+        ),
     )
     parser.add_argument(
         "--check-remote",
@@ -185,16 +210,25 @@ def _add_remote_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--remote", help="named remote environment, for example dev or prod")
 
 
-def _add_deployment_selector(parser: argparse.ArgumentParser) -> None:
+def _add_deployment_selector(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool = True,
+) -> None:
     """Add mutually exclusive deployment record selectors.
 
     Args:
         parser: Subcommand parser receiving the selector.
+        required: Require an explicit selector instead of allowing command defaults.
     """
 
-    selector = parser.add_mutually_exclusive_group(required=True)
+    selector = parser.add_mutually_exclusive_group(required=required)
     selector.add_argument("--deployment", help="exact deployment ID or unique prefix")
-    selector.add_argument("--latest", action="store_true", help="latest successful deployment")
+    selector.add_argument(
+        "--latest",
+        action="store_true",
+        help="latest successful deployment (rollback default)",
+    )
 
 
 def run(argv: Sequence[str] | None = None) -> int:
@@ -222,11 +256,29 @@ def run(argv: Sequence[str] | None = None) -> int:
             return _run_verify(config, args)
         if args.command == "rollback":
             return _run_rollback(config, args)
+        if args.command == "doctor":
+            return _run_doctor(config, args)
         if args.command == "state":
             return _run_state(config, args)
         raise ConfigurationError(f"unsupported command: {args.command}")
+    except ApplicationError as exc:
+        print(f"error [{exc.code}]: {exc.message}", file=sys.stderr)
+        for item in exc.context:
+            print(f"  {item.key}: {item.value}", file=sys.stderr)
+        return 4 if exc.category is ErrorCategory.CONFIGURATION else 1
     except GitDeployError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        from .application import application_error_from_exception
+
+        wrapped = application_error_from_exception(
+            exc,
+            context=_cli_error_context(args, str(exc)),
+        )
+        print(f"error: {wrapped.message}", file=sys.stderr)
+        for item in wrapped.context:
+            print(f"  {item.key}: {item.value}", file=sys.stderr)
+        hint = _next_action_hint(wrapped.message)
+        if hint:
+            print(f"next: {hint}", file=sys.stderr)
         return exc.exit_code
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)
@@ -237,6 +289,105 @@ def main() -> None:
     """Run the console entry point and terminate with its exit code."""
 
     raise SystemExit(run())
+
+
+def _next_action_hint(message: str) -> str | None:
+    """Return a safe read-only next action for common operational failures."""
+
+    lowered = message.lower()
+    if "lock unavailable" in lowered or "unfinished transaction" in lowered:
+        return "run 'git-deploy state recover PROJECT' to inspect transaction state; do not delete locks"
+    if "drift" in lowered or "changed" in lowered:
+        return "run 'git-deploy state verify PROJECT --check-remote' before considering --force"
+    if "backup" in lowered or "manifest" in lowered:
+        return "run 'git-deploy doctor PROJECT' and preserve all state evidence"
+    if "host key" in lowered or "known_hosts" in lowered or "connection failed" in lowered:
+        return "run 'git-deploy doctor PROJECT --check-remote' and verify host-key configuration"
+    if "permission" in lowered or "ownership" in lowered:
+        return "run 'git-deploy doctor PROJECT --check-remote' and inspect target permissions"
+    if "health" in lowered or "hook" in lowered:
+        return "run 'git-deploy state recover PROJECT' in inspect mode before retrying"
+    return None
+
+
+def _cli_error_context(args: argparse.Namespace, message: str) -> dict[str, object]:
+    """Derive sanitized phase/target/path context for a domain CLI failure."""
+
+    import re
+
+    lowered = message.lower()
+    phase = "execution"
+    for candidate in (
+        "config",
+        "plan",
+        "connect",
+        "observe",
+        "backup",
+        "upload",
+        "delete",
+        "hook",
+        "health",
+        "verify",
+        "commit",
+        "recover",
+        "rollback",
+    ):
+        if candidate in lowered:
+            phase = candidate
+            break
+    target = getattr(args, "target", None)
+    if target is None:
+        targets = getattr(args, "targets", ())
+        target = ",".join(targets) if targets else None
+    context: dict[str, object] = {"phase": phase, "target": target}
+    matched = re.search(r"(?:path=| at )([^\s,;]+)", message)
+    if matched:
+        context["path"] = matched.group(1)
+    return context
+
+
+def _run_doctor(config: AppConfig, args: argparse.Namespace) -> int:
+    """Render the standard application doctor report without mutation.
+
+    Args:
+        config: Successfully parsed deployment configuration.
+        args: Parsed doctor selectors and output options.
+
+    Returns:
+        Zero when ready (warnings allowed), otherwise a stable failure code.
+    """
+
+    import json
+
+    from .application import (
+        ApplicationConfigService,
+        DoctorRequest,
+        standard_doctor_service,
+    )
+
+    request = DoctorRequest(
+        remote=args.remote,
+        target=args.target,
+        check_remote=bool(args.check_remote),
+    )
+    report = standard_doctor_service(ApplicationConfigService(config)).run(request)
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), sort_keys=True, ensure_ascii=False))
+        return report.exit_code
+    print(f"Config: {config.path}")
+    for category in ("local", "state", "remote"):
+        selected = [
+            item for item in report.checks if item.category.value == category
+        ]
+        if not selected:
+            continue
+        print(f"{category.upper()}:")
+        for item in selected:
+            print(f"  {item.status.value.upper():7} {item.check_id}: {item.summary}")
+            if item.suggested_action:
+                print(f"           action: {item.suggested_action}")
+    print(report.ready_label)
+    return report.exit_code
 
 
 def _run_application_plan(
@@ -316,11 +467,31 @@ def _run_application_plan(
             )
             print(f"  commands: {[list(item) for item in result.build.commands]}")
             if result.build.uses_secret:
-                print("  secret provider=1password (dry-run: op calls=0)")
+                _alias, _server, domain_project, _identity = (
+                    config_service._resolve_domain_project(
+                        selection.remote_alias,
+                        selection.project,
+                    )
+                )
+                build = domain_project.build
+                names = (
+                    sorted(build.onepassword.as_dict())
+                    if build is not None and build.onepassword is not None
+                    else []
+                )
+                print(
+                    "  secret provider=1password "
+                    f"env_names={names} (dry-run: op calls=0)"
+                )
             for warning in result.warnings:
                 print(f"  warning: {warning}")
         print(f"[{selection.project}] target_id={selection.target_id}")
-        print(f"[{selection.project}] revisions: {' '.join(args.revisions)}")
+        display_revisions = tuple(args.revisions) or result.resolved_revisions
+        print(
+            f"[{selection.project}] revisions: "
+            f"{' '.join(display_revisions) or '(no missing commits)'} "
+            f"({result.selection_origin.value})"
+        )
         print(
             f"  baseline {result.before_tree_id[:12]} -> "
             f"target {result.after_tree_id[:12]}"
@@ -328,7 +499,10 @@ def _run_application_plan(
         if result.introduced_transition_ids:
             print(f"  introduced transitions: {len(result.introduced_transition_ids)}")
         if result.static_noop:
-            print("  static no-op (already applied transitions)")
+            print(
+                "  No changes: target generation already matches "
+                f"{result.after_tree_id}"
+            )
         if not result.source_changes:
             print("  no selected tracked-file changes")
         for operation in result.source_changes:
@@ -368,6 +542,7 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         ResultStatus,
         RevisionPlanService,
         SideEffectLevel,
+        StalePlanError,
         StateInspectService,
         confirmation_policy_for,
     )
@@ -399,6 +574,45 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
             )
             signer = PlanTokenSigner(secrets.token_bytes(32))
             plan = RevisionPlanService(config_service, signer).plan(request)
+            _alias, _server, project, _identity = config_service._resolve_domain_project(
+                request.remote,
+                request.project,
+            )
+            uploads = [item for item in plan.source_changes if item.action == "upload"]
+            deletes = [item for item in plan.source_changes if item.action == "delete"]
+            print(f"Config: {config.path}")
+            print(
+                f"[{selection.project}] remote={selection.remote_alias} "
+                f"risk={selection.environment_risk.value} endpoint={selection.endpoint}"
+            )
+            print(
+                f"  root={selection.remote_root} target={selection.target_id[:16]} "
+                f"generation={generation}"
+            )
+            print(
+                f"  tree {plan.before_tree_id[:12]} -> {plan.after_tree_id[:12]} "
+                f"upload={len(uploads)} delete={len(deletes)} "
+                f"bytes={sum(item.target_size for item in uploads)}"
+            )
+            print(
+                f"  build={plan.build.runner or 'none'} artifacts={len(plan.artifacts)} "
+                f"hooks={len(project.post_commands)} health={len(project.health_urls)}"
+            )
+            print(
+                f"  risks: force={bool(args.force)} secret={plan.build.uses_secret} "
+                f"network=True auto_rollback={generation is not None}"
+            )
+            if (
+                plan.static_noop
+                and not plan.build.enabled
+                and not plan.source_changes
+                and not plan.introduced_transition_ids
+            ):
+                print(
+                    "No changes: target generation already matches "
+                    f"{plan.after_tree_id}"
+                )
+                continue
             policy = confirmation_policy_for(
                 request,
                 environment_risk=selection.environment_risk,
@@ -412,12 +626,25 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
             )
             nested_args = argparse.Namespace(**vars(args))
             nested_args.targets = [project_name]
+            nested_args.revisions = plan.resolved_revisions
             nested_args.yes = True
             nested_args._application_gated = True
 
             def execute_domain(_request, _plan, _emit, *, _args=nested_args):
                 """Run the existing transaction adapter behind the application facade."""
 
+                current_selection, current_generation = StateInspectService(
+                    config_service
+                ).current_generation(request.remote, request.project)
+                if (
+                    current_selection.target_id != request.expected_target_id
+                    or current_selection.physical_fingerprint
+                    != request.expected_physical_fingerprint
+                    or current_generation != request.expected_generation
+                ):
+                    raise StalePlanError(
+                        "target identity or generation changed before deployment"
+                    )
                 code = _run_plan_or_deploy(config, _args)
                 if code:
                     raise PolicyError(f"deployment failed with exit code {code}")
@@ -506,7 +733,10 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         Process exit code.
     """
 
-    if args.command == "plan" and not args.check_remote:
+    local_preview = args.command == "plan" or (
+        args.command == "deploy" and bool(getattr(args, "dry_run", False))
+    )
+    if local_preview and not args.check_remote:
         application_result = _run_application_plan(config, args)
         if application_result is not None:
             return application_result
@@ -650,7 +880,10 @@ def _run_plan_or_deploy(config: AppConfig, args: argparse.Namespace) -> int:
         )
         print(f"  introduced transitions: {len(source_plan.introduced_transition_ids)}")
         if source_plan.static_noop:
-            print("  static no-op (already applied transitions)")
+            print(
+                "  No changes: target generation already matches "
+                f"{source_plan.after_tree_id}"
+            )
         if not source_plan.files:
             print("  no selected managed-file changes")
         for operation in source_plan.files:
@@ -1028,9 +1261,14 @@ def _run_history(config: AppConfig, args: argparse.Namespace) -> int:
                 f" target={selection.target_id}"
             )
         print(
-            f"  {entry.deployment_id}  {entry.status:<18}  "
+            f"  {entry.created_at}  {entry.status:<18}  {entry.deployment_id}  "
             f"{revision_selection}  {entry.file_count} file(s)  {state_note}"
         )
+    if result.corrupt_records:
+        print(f"  warning: {len(result.corrupt_records)} corrupt deployment record(s)")
+        for path in result.corrupt_records:
+            print(f"    CORRUPT {path}")
+        print(f"  action: git-deploy doctor {selection.project} --remote {selection.remote_alias}")
     return 0
 
 
@@ -1099,6 +1337,10 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
     Returns:
         Process exit code.
     """
+
+    # Rollback is intentionally latest-only for the common path. Normalizing the
+    # omitted selector here keeps old ``--latest`` requests byte-for-byte equal.
+    args.latest = bool(args.latest or not args.deployment)
 
     if (
         bool(args.latest)
@@ -1392,7 +1634,7 @@ def _run_state(config: AppConfig, args: argparse.Namespace) -> int:
     command = args.state_command
     if command == "gc":
         raise ConfigurationError(
-            "state gc is not supported in v0.2; all state/CAS/Git objects are retained"
+            "state gc is not supported in v0.3.0; all state/CAS/Git objects are retained"
         )
 
     if command == "inspect":
@@ -1886,6 +2128,7 @@ def _state_recover(
     from .remote_verify import open_cli_transport, remote_path_for
     from .state import DeploymentStore
     from .state_executor import StateDeploymentExecutor
+    from .target_lock import TargetLock
     from .transaction_recovery import TransactionRecoveryService
 
     service = TransactionRecoveryService(target_root, identity)
@@ -1896,6 +2139,60 @@ def _state_recover(
 
     state_store = ExpectedStateStore(target_root, identity)
     deploy_store = DeploymentStore(project, root=target_root)
+    observed_hashes: dict[str, dict[str, str]] = {}
+
+    def _print_manual_recovery(journal) -> None:
+        """Print hash-only manual recovery evidence and safe next actions."""
+
+        import hashlib
+
+        after_by_path: dict[str, str | None] = {}
+        if journal.after_state_id:
+            try:
+                after_state = state_store.read_state(journal.after_state_id)
+                after_by_path = {
+                    item.path: item.content_sha256 if item.exists else None
+                    for item in after_state.files
+                }
+            except Exception:
+                after_by_path = {}
+        entries = tuple(journal.meta.get("backup_entries") or ())
+        print(
+            "  manual_recovery_required: "
+            f"transaction={journal.transaction_id} stage={journal.stage}"
+        )
+        if not entries:
+            print("    conflict path=(unknown; inspect journal) before=unknown after=unknown actual=not-read")
+        for entry in entries:
+            path = str(entry.get("path", "(unknown)"))
+            before_hash = None
+            backup_file = entry.get("backup_file")
+            if entry.get("before_exists") and backup_file and journal.deployment_id:
+                try:
+                    body = deploy_store.read_backup(
+                        journal.deployment_id,
+                        str(backup_file),
+                    )
+                    before_hash = hashlib.sha256(body).hexdigest()
+                except Exception:
+                    before_hash = "unreadable"
+            actual = observed_hashes.get(journal.transaction_id, {}).get(
+                path,
+                "not-read",
+            )
+            print(
+                f"    conflict path={path} "
+                f"before={before_hash or 'absent'} "
+                f"after={after_by_path.get(path) or 'absent'} actual={actual}"
+            )
+        print(
+            "    inspect: "
+            f"git-deploy state recover {project.name} --remote {project.remote}"
+        )
+        print(
+            "    do not deploy, rollback, delete target.lock, journals, states, or backups "
+            "until the conflict is understood"
+        )
 
     def _classify(journal, transport) -> dict[str, bool]:
         """Classify remote vs journal before/after/current using durable evidence.
@@ -1946,11 +2243,13 @@ def _state_recover(
         match_before = True
         match_after = True
         match_current = True
+        observed_hashes[journal.transaction_id] = {}
         for rel, remote in paths:
             actual = transport.read_file(remote)
             import hashlib
 
             actual_hash = hashlib.sha256(actual).hexdigest() if actual is not None else None
+            observed_hashes[journal.transaction_id][rel] = actual_hash or "absent"
 
             def _expected_hash(state_obj, relative: str) -> str | None:
                 if state_obj is None:
@@ -1991,93 +2290,103 @@ def _state_recover(
             flags["remote_third"] = True
         return flags
 
-    for journal in open_tx:
-        if not args.execute:
-            decision = service.decide_for_journal(journal)
-            print(
-                f"transaction {journal.transaction_id}: stage={journal.stage} "
-                f"decision={decision.decision} reason={decision.reason}"
-            )
-            if decision.decision == "manual":
+    recovery_lock = TargetLock(target_root) if args.execute else None
+    if recovery_lock is not None:
+        recovery_lock.acquire()
+    try:
+        for journal in open_tx:
+            if not args.execute:
+                decision = service.decide_for_journal(journal)
                 print(
-                    "  manual_recovery_required: inspect journal and backups; no secrets printed"
+                    f"transaction {journal.transaction_id}: stage={journal.stage} "
+                    f"decision={decision.decision} reason={decision.reason}"
                 )
-            continue
+                if decision.decision == "manual":
+                    _print_manual_recovery(journal)
+                continue
 
-        if not args.yes:
-            raise PolicyError("state recover --execute requires --yes")
+            if not args.yes:
+                raise PolicyError("state recover --execute requires --yes")
 
-        if journal.stage == "prepared" and journal.meta.get("kind") in {
-            "bootstrap",
-            "state_only",
-        }:
-            # These transaction kinds have no remote mutation at prepared.
-            # Their recovery is decided entirely from durable current/staged state;
-            # do not make local publication recovery depend on remote availability.
-            decision = service.decide_for_journal(journal)
-            print(
-                f"transaction {journal.transaction_id}: stage={journal.stage} "
-                f"decision={decision.decision} reason={decision.reason}"
-            )
-            service.execute(decision, journal)
-            continue
-
-        transport = open_cli_transport(dict(server.values))
-        try:
-            flags = _classify(journal, transport)
-            decision = service.decide_for_journal(journal, **flags)
-            print(
-                f"transaction {journal.transaction_id}: stage={journal.stage} "
-                f"decision={decision.decision} reason={decision.reason}"
-            )
-            if decision.decision == "manual":
+            if journal.stage == "prepared" and journal.meta.get("kind") in {
+                "bootstrap",
+                "state_only",
+            }:
+                # These transaction kinds have no remote mutation at prepared.
+                # Their recovery is decided entirely from durable current/staged state;
+                # do not make local publication recovery depend on remote availability.
+                decision = service.decide_for_journal(journal)
                 print(
-                    "  manual_recovery_required: inspect journal and backups; no secrets printed"
+                    f"transaction {journal.transaction_id}: stage={journal.stage} "
+                    f"decision={decision.decision} reason={decision.reason}"
                 )
                 service.execute(decision, journal)
                 continue
 
-            executor = StateDeploymentExecutor(
-                project,
-                identity,
-                target_root,
-                transport=transport,  # type: ignore[arg-type]
-            )
+            transport = open_cli_transport(dict(server.values))
+            try:
+                flags = _classify(journal, transport)
+                decision = service.decide_for_journal(journal, **flags)
+                print(
+                    f"transaction {journal.transaction_id}: stage={journal.stage} "
+                    f"decision={decision.decision} reason={decision.reason}"
+                )
+                if decision.decision == "manual":
+                    _print_manual_recovery(journal)
+                    service.execute(decision, journal)
+                    continue
 
-            def restore_callback(j, *, _executor=executor):
-                _executor.restore_from_backups(j)
+                executor = StateDeploymentExecutor(
+                    project,
+                    identity,
+                    target_root,
+                    transport=transport,  # type: ignore[arg-type]
+                )
 
-            def finalize_callback(j, *, _executor=executor, _store=state_store):
-                # Re-check identity/generation/after then complete idempotently.
-                if j.after_state_id:
-                    after = _store.read_state(j.after_state_id)
-                    if after.physical_fingerprint != identity.physical_fingerprint:
-                        raise PolicyError("finalize refused: identity mismatch")
-                    current = _store.read_current()
-                    expected_gen = j.before_generation
-                    if current is not None and expected_gen is not None:
-                        if current.generation not in {expected_gen, j.after_generation}:
-                            raise PolicyError("finalize refused: generation race")
-                    if current is None or (
-                        j.after_generation is not None
-                        and current.generation != j.after_generation
-                    ):
-                        _store.cas_advance(
-                            expected_generation=j.before_generation,
-                            state=after,
-                        )
+                def restore_callback(j, *, _executor=executor):
+                    """Restore proven before bytes while holding the target lock."""
 
-            updated = service.execute(
-                decision,
-                journal,
-                restore_callback=restore_callback,
-                finalize_callback=finalize_callback,
-            )
-            print(f"  executed -> stage={updated.stage}")
-        finally:
-            close = getattr(transport, "close", None)
-            if callable(close):
-                close()
+                    _executor.restore_from_backups(j)
+
+                def finalize_callback(j, *, _store=state_store):
+                    """CAS-finalize a proven after state while holding the target lock."""
+
+                    # Re-check identity/generation/after then complete idempotently.
+                    if j.after_state_id:
+                        after = _store.read_state(j.after_state_id)
+                        if after.physical_fingerprint != identity.physical_fingerprint:
+                            raise PolicyError("finalize refused: identity mismatch")
+                        current = _store.read_current()
+                        expected_gen = j.before_generation
+                        if current is not None and expected_gen is not None:
+                            if current.generation not in {
+                                expected_gen,
+                                j.after_generation,
+                            }:
+                                raise PolicyError("finalize refused: generation race")
+                        if current is None or (
+                            j.after_generation is not None
+                            and current.generation != j.after_generation
+                        ):
+                            _store.cas_advance(
+                                expected_generation=j.before_generation,
+                                state=after,
+                            )
+
+                updated = service.execute(
+                    decision,
+                    journal,
+                    restore_callback=restore_callback,
+                    finalize_callback=finalize_callback,
+                )
+                print(f"  executed -> stage={updated.stage}")
+            finally:
+                close = getattr(transport, "close", None)
+                if callable(close):
+                    close()
+    finally:
+        if recovery_lock is not None:
+            recovery_lock.release()
     return 0
 
 

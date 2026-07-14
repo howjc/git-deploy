@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from .build_cache import BuildCacheEntry
 from .errors import PolicyError
 from .expected_state import ExpectedState, FileEntry
+from .gitrepo import assert_managed_path_allowed
 from .models import PlannedFile, ProjectConfig
 from .remote_verify import remote_path_for
 
@@ -81,6 +82,9 @@ class ArtifactPlanner:
             for item in target.artifacts
         }
         target_sizes = {item.destination: item.size for item in target.artifacts}
+        for path in set(current_entries) | set(target_entries):
+            # Artifacts share the same remote namespace and protected policy as source.
+            assert_managed_path_allowed(project, path)
         operations: list[PlannedFile] = []
         for path in sorted(set(current_entries) | set(target_entries)):
             before = current_entries.get(path)

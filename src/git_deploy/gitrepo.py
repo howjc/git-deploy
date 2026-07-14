@@ -850,6 +850,35 @@ class GitDeploymentPlanner:
         if any(_match(path, pattern) for pattern in patterns):
             raise PolicyError(f"protected path cannot be deployed: {path}")
 
+    def assert_managed_path_allowed(self, path: str) -> None:
+        """Reject unsafe or protected source/artifact upload/delete paths.
+
+        Args:
+            path: Candidate managed path relative to the remote root.
+
+        Returns:
+            None.
+        """
+
+        assert_managed_path_allowed(self.project, path)
+
+
+def assert_managed_path_allowed(project: ProjectConfig, path: str) -> None:
+    """Reject one unsafe or protected managed path without opening its repository.
+
+    Args:
+        project: Project supplying configured protected globs.
+        path: Candidate source/artifact path relative to the remote root.
+
+    Returns:
+        None.
+    """
+
+    _validate_repo_path(path)
+    patterns = (*GitDeploymentPlanner.ALWAYS_PROTECTED, *project.protected)
+    if any(_match(path, pattern) for pattern in patterns):
+        raise PolicyError(f"protected path cannot be deployed: {path}")
+
 
 def _validate_repo_path(path: str) -> None:
     """Reject absolute and parent-traversing repository paths.
@@ -859,7 +888,16 @@ def _validate_repo_path(path: str) -> None:
     """
 
     pure = PurePosixPath(path)
-    if not path or pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
+    raw_parts = path.split("/")
+    if (
+        not path
+        or "\\" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or pure.is_absolute()
+        or ".." in raw_parts
+        or "." in raw_parts
+        or "" in raw_parts
+    ):
         raise PolicyError(f"unsafe repository path: {path!r}")
 
 
