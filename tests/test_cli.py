@@ -94,6 +94,52 @@ remote_root = "/srv/second"
     assert not (tmp_path / "state").exists()
 
 
+def test_doctor_is_local_by_default_and_renders_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Run standard checks without opening transport and report missing current."""
+
+    from git_deploy.remote_verify import set_cli_transport_factory
+
+    repository = tmp_path / "repository"
+    _two_commit_repository(repository, "app.txt")
+    (tmp_path / "deploy.toml").write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "doctor.example.invalid"
+
+[projects.application]
+repository = "{repository}"
+remote_root = "/srv/application"
+local_state_dir = "{tmp_path / 'state'}"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def forbidden(_server: dict[str, object]):
+        """Fail if default doctor attempts a remote connection."""
+
+        raise AssertionError("doctor must not connect without --check-remote")
+
+    set_cli_transport_factory(forbidden)
+    try:
+        code = run(["doctor", "application"])
+    finally:
+        set_cli_transport_factory(None)
+    output = capsys.readouterr().out
+
+    assert code == 4
+    assert "LOCAL:" in output
+    assert "STATE:" in output
+    assert "state.current" in output
+    assert "NOT READY" in output
+    assert not (tmp_path / "state").exists()
+
+
 def test_removed_from_and_to_options_are_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -237,6 +283,41 @@ remote_root = "/srv/demo"
     assert "UPLOAD one.txt" in output
     assert "UPLOAD three.txt" in output
     assert "skipped.txt" not in output
+
+
+def test_plan_without_revisions_reaches_application_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Treat omitted revisions as an application decision, not an argparse error."""
+
+    repository = tmp_path / "repo"
+    _two_commit_repository(repository, "file.txt")
+    (tmp_path / "deploy.toml").write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "example.invalid"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+local_state_dir = "{tmp_path / 'state'}"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(["plan", "demo"])
+
+    error = capsys.readouterr().err
+    assert code == 4
+    assert "usage:" not in error
+    assert "project 'demo' on remote 'default' has no trusted current state" in error
+    assert "state bootstrap demo --revision COMMIT --remote default --yes" in error
+    assert "state bootstrap demo --empty --remote default --yes" in error
+    assert "Explicit --revisions" in error
 
 
 def test_cli_selects_a_named_remote_for_plan(
@@ -706,11 +787,17 @@ def test_state_recover_lists_decisions(
     )
     identity = resolve_target_identity({"protocol": "sftp", "host": "cli.example"}, project)
     root = identity.state_root(default_state_base("demo", project.local_state_dir))
-    TransactionStore(root).create(target_id=identity.target_id, stage="prepared")
+    transaction_store = TransactionStore(root)
+    journal = transaction_store.create(target_id=identity.target_id, stage="prepared")
+    transaction_store.advance(journal, "manual_recovery_required")
     code = run(["state", "recover", "demo"])
     out = capsys.readouterr().out
     assert code == 0
     assert "state_recover" in out or "decision=" in out
+    assert "manual_recovery_required" in out
+    assert "transaction=" in out and "stage=" in out
+    assert "conflict path=" in out and "actual=not-read" in out
+    assert "do not deploy" in out
     assert "password" not in out.lower()
     assert "token" not in out.lower()
 
@@ -813,15 +900,20 @@ local_state_dir = ".state/demo"
             transaction_id="tx1",
         )
     )
+    corrupt = store.root / "deployments" / "20200101T000002Z-bad1" / "manifest.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text("{not-json", encoding="utf-8")
     code = run(["history", "demo"])
     out = capsys.readouterr().out
     assert code == 0
     assert "state: legacy" in out
     assert "state: v1" in out
     assert "target_id:" in out
+    assert "1 corrupt deployment record(s)" in out
+    assert str(corrupt) in out
 
 
-def test_stateful_deploy_creates_journal_and_advances_generation(
+def test_stateful_implicit_deploy_creates_journal_and_advances_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -908,16 +1000,23 @@ local_state_dir = ".state/demo"
 
     transport = InMemoryTransport()
     transport.files["/srv/demo/file.txt"] = FakeRemotePath(old_bytes)
+    factory_calls = {"count": 0}
 
     def factory(_server: dict[str, object]) -> InMemoryTransport:
+        """Count connections so repeated no-op deploys prove zero remote access."""
+
+        factory_calls["count"] += 1
         return transport
 
     set_cli_transport_factory(factory)
     try:
-        code = run(["deploy", "demo", "--revisions", "HEAD", "--yes"])
+        code = run(["deploy", "demo", "--yes"])
         out = capsys.readouterr().out
         assert code == 0, out + capsys.readouterr().err
         assert "succeeded" in out or "generation=" in out
+        assert "risk=standard" in out
+        assert "upload=1 delete=0 bytes=" in out
+        assert "auto_rollback=True" in out
         loaded = store.load_current_state()
         assert loaded is not None
         pointer, after = loaded
@@ -932,6 +1031,20 @@ local_state_dir = ".state/demo"
         history_output = capsys.readouterr().out
         assert newer in history_output
         assert " HEAD " not in history_output
+
+        generation = store.read_current().generation  # type: ignore[union-attr]
+        manifests = len(DeploymentStore(project, root=root).list_manifests())
+        writes = transport.write_calls
+        assert run(["deploy", "demo", "--yes"]) == 0
+        implicit_output = capsys.readouterr().out
+        assert run(["deploy", "demo", "--revisions", newer, "--yes"]) == 0
+        explicit_output = capsys.readouterr().out
+        assert "No changes: target generation already matches" in implicit_output
+        assert "No changes: target generation already matches" in explicit_output
+        assert factory_calls["count"] == 1
+        assert transport.write_calls == writes
+        assert store.read_current().generation == generation  # type: ignore[union-attr]
+        assert len(DeploymentStore(project, root=root).list_manifests()) == manifests
     finally:
         set_cli_transport_factory(None)
 
@@ -2261,7 +2374,7 @@ local_state_dir = ".state/demo"
     assert after == before, f"plan mutated target_root: {set(after) ^ set(before)}"
 
 
-def test_dry_run_target_state_unchanged(
+def test_implicit_dry_run_matches_plan_and_leaves_target_state_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2334,8 +2447,18 @@ local_state_dir = ".state/demo"
         ),
     )
     before = _snapshot_tree(root)
-    code = run(["deploy", "demo", "--revisions", newer, "--dry-run"])
+    assert run(["plan", "demo"]) == 0
+    plan_output = capsys.readouterr().out
+    code = run(["deploy", "demo", "--dry-run"])
+    deploy_output = capsys.readouterr().out
     assert code == 0
+    assert "implicit_current_to_head" in plan_output
+    assert "implicit_current_to_head" in deploy_output
+    newer_tree = _git(repository, "rev-parse", f"{newer}^{{tree}}")
+    assert f"target {newer_tree[:12]}" in plan_output
+    assert f"target {newer_tree[:12]}" in deploy_output
+    assert "UPLOAD file.txt" in plan_output
+    assert "UPLOAD file.txt" in deploy_output
     assert _snapshot_tree(root) == before
 
 
@@ -2854,14 +2977,14 @@ local_state_dir = ".state/demo"
 
     set_cli_transport_factory(factory)
     try:
-        code1 = run(["rollback", "demo", "--latest", "--yes"])
+        code1 = run(["rollback", "demo", "--yes"])
         assert code1 == 0
         assert factory_calls["n"] == 1
         gen = store.read_current().generation  # type: ignore[union-attr]
         writes = transport.write_calls
         reads = getattr(transport, "read_calls", 0)
         # Second request: eligibility fails before factory.
-        code2 = run(["rollback", "demo", "--latest", "--yes"])
+        code2 = run(["rollback", "demo", "--yes"])
         assert code2 != 0
         assert factory_calls["n"] == 1  # no second factory call
         assert store.read_current().generation == gen  # type: ignore[union-attr]
@@ -2870,6 +2993,34 @@ local_state_dir = ".state/demo"
         assert TransactionStore(root).list_open() == []
     finally:
         set_cli_transport_factory(None)
+
+
+def test_rollback_omitted_selector_normalizes_to_explicit_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route omitted and explicit latest selectors through the same request path."""
+
+    from argparse import Namespace
+
+    import git_deploy.cli as cli
+
+    observed: list[tuple[str | None, bool]] = []
+
+    def capture(_config: object, args: Namespace) -> int:
+        """Capture the normalized selector without executing a rollback."""
+
+        observed.append((args.deployment, args.latest))
+        return 0
+
+    monkeypatch.setattr(cli, "_run_application_latest_rollback", capture)
+    common = {
+        "deployment": None,
+        "dry_run": False,
+        "_application_gated": False,
+    }
+    assert cli._run_rollback(object(), Namespace(latest=False, **common)) == 0
+    assert cli._run_rollback(object(), Namespace(latest=True, **common)) == 0
+    assert observed == [(None, True), (None, True)]
 
 
 def test_rollback_current_mismatch_refused_before_transport(

@@ -75,6 +75,12 @@ def test_application_history_pages_selects_and_distinguishes_lineage(
 
     config, project, identity = _fixture(tmp_path)
     selection = config.resolve_project("default", "demo")
+    target_root = identity.state_root(
+        default_state_base(project.name, project.local_state_dir)
+    )
+    corrupt = target_root / "deployments" / "20260715-corrupt" / "manifest.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text("{not-json", encoding="utf-8")
 
     def forbidden(*_args, **_kwargs):
         """Fail if a history read attempts a persisted write."""
@@ -105,3 +111,4 @@ def test_application_history_pages_selects_and_distinguishes_lineage(
     assert second.next_offset is None
     assert second.entries[0].lineage is HistoryLineage.LEGACY
     assert selected.entries[0].deployment_id == "20260713-legacy"
+    assert first.corrupt_records == (str(corrupt),)

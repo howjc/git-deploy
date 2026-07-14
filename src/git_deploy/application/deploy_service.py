@@ -23,7 +23,7 @@ from .policy import (
     ConfirmationRequirement,
     confirmation_policy_for,
 )
-from .results import ApplicationResult, ResultField
+from .results import ApplicationResult, ResultField, ResultStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,12 +111,14 @@ class DeployService:
             or plan.generation != request.expected_generation
         ):
             raise StalePlanError("reviewed plan does not match deploy request context")
-        policy = confirmation_policy_for(
-            request,
-            environment_risk=plan.selection.environment_risk,
-            uses_secret=plan.build.uses_secret,
-        )
-        _require_confirmation(policy, confirmation)
+        static_noop = _is_static_noop(plan)
+        if not static_noop:
+            policy = confirmation_policy_for(
+                request,
+                environment_risk=plan.selection.environment_risk,
+                uses_secret=plan.build.uses_secret,
+            )
+            _require_confirmation(policy, confirmation)
 
         with self._lock:
             cached = self._completed.get(token.value)
@@ -183,7 +185,24 @@ class DeployService:
                 )
                 sequence += 1
 
-            result = self._executor(request, plan, emit_transaction)
+            if static_noop:
+                result = ApplicationResult(
+                    operation=request.operation,
+                    remote=request.remote,
+                    project=request.project,
+                    side_effect=request.side_effect,
+                    status=ResultStatus.NOOP,
+                    summary=(
+                        "No changes: target generation already matches "
+                        f"{plan.after_tree_id}"
+                    ),
+                    fields=(
+                        ResultField("generation", plan.generation),
+                        ResultField("target_tree_id", plan.after_tree_id),
+                    ),
+                )
+            else:
+                result = self._executor(request, plan, emit_transaction)
             _validate_result(request, result, transaction_ids)
             emit(
                 TerminalResultEvent(
@@ -196,6 +215,21 @@ class DeployService:
             )
             self._completed[token.value] = result
             return result
+
+
+def _is_static_noop(plan: RevisionPlanResult) -> bool:
+    """Return whether a reviewed source-only plan requires no execution.
+
+    Artifact builds remain actionable because their outputs cannot be proven
+    unchanged from the local revision plan alone.
+    """
+
+    return bool(
+        plan.static_noop
+        and not plan.build.enabled
+        and not plan.source_changes
+        and not plan.introduced_transition_ids
+    )
 
 
 def _require_confirmation(

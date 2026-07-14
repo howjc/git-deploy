@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from git_deploy.errors import PolicyError, RemoteDriftError
+from git_deploy.errors import GitDeployError, PolicyError, RemoteDriftError
 from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
 from git_deploy.models import PlannedFile, ProjectConfig
 from git_deploy.state_executor import InMemoryTransport, StateDeploymentExecutor
@@ -219,6 +219,38 @@ def test_prepared_before_first_transport_write(tmp_path: Path) -> None:
     assert (root / "transactions" / f"{journal.transaction_id}.json").is_file()
 
 
+def test_backup_publish_failure_precedes_every_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    """Fail local backup publication with zero remote writes or visible manifest."""
+
+    executor, transport, identity, root, _project = _setup(tmp_path)
+    _seed_current(root, identity)
+    from git_deploy.errors import ConfigurationError
+    from git_deploy.state_executor import FakeRemotePath
+
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"old-a")
+    old = hashlib.sha256(b"old-a").hexdigest()
+    new = hashlib.sha256(b"new-a").hexdigest()
+
+    def fail_backup(*_args, **_kwargs) -> str:
+        """Model disk-full/fsync failure while publishing a before backup."""
+
+        raise ConfigurationError("injected backup durable-publish failure")
+
+    executor.deploy_store.write_backup = fail_backup  # type: ignore[method-assign]
+    with pytest.raises(ConfigurationError, match="backup durable-publish"):
+        executor.deploy(_plan(), [_file("a.txt", before=old, after=new)])
+
+    assert transport.write_calls == 0
+    assert transport.delete_calls == 0
+    assert transport.files["/srv/a.txt"].data == b"old-a"
+    assert not (root / "deployments").exists()
+    assert TransactionStore(root).list_open() == []
+    current = ExpectedStateStore(root, identity).read_current()
+    assert current is not None and current.generation == 1
+
+
 def test_commit_state_advances_generation(tmp_path: Path) -> None:
     """Successful deploy CAS-advances generation."""
 
@@ -275,6 +307,36 @@ def test_auto_restore_state_keeps_before(tmp_path: Path) -> None:
     journals = TransactionStore(root).list_all()
     assert journals
     assert journals[0].meta.get("backup_entries")
+
+
+def test_pre_publish_permission_failure_does_not_advance_state(
+    tmp_path: Path,
+) -> None:
+    """Treat SFTP chmod/chown-style pre-publish failure as a zero-commit deploy."""
+
+    executor, transport, identity, root, _project = _setup(tmp_path)
+    _seed_current(root, identity)
+    from git_deploy.state_executor import FakeRemotePath
+
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"old-a")
+    old = hashlib.sha256(b"old-a").hexdigest()
+    new = hashlib.sha256(b"new-a").hexdigest()
+
+    def permission_failure(*_args, **_kwargs) -> None:
+        """Model SFTP rejecting temp ownership/mode before atomic rename."""
+
+        raise GitDeployError("cannot set remote ownership: permission denied")
+
+    transport.write_file = permission_failure  # type: ignore[method-assign]
+    transport.write_file_stream = permission_failure  # type: ignore[method-assign]
+    with pytest.raises(PolicyError, match="manual_recovery_required"):
+        executor.deploy(_plan(), [_file("a.txt", before=old, after=new)])
+
+    assert transport.files["/srv/a.txt"].data == b"old-a"
+    current = ExpectedStateStore(root, identity).read_current()
+    assert current is not None and current.generation == 1
+    opened = TransactionStore(root).list_open()
+    assert opened and opened[0].stage == "manual_recovery_required"
 
 
 def test_manual_recovery_required_blocks_next_deploy(tmp_path: Path) -> None:

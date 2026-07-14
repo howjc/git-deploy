@@ -1,0 +1,10 @@
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin no
+UsePAM no
+AllowUsers deploy
+Subsystem sftp internal-sftp
+LogLevel VERBOSE

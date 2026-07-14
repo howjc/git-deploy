@@ -81,7 +81,7 @@ class StateRollbackService:
         if current is not None and resolved != latest.deployment_id:
             # Zero connect / zero write: do not touch transport.
             raise PolicyError(
-                "stateful rollback of non-latest deployment is not supported in v0.2 "
+                "stateful rollback of non-latest deployment is not supported in v0.3.0 "
                 f"(requested {resolved}, latest {latest.deployment_id}); deferred to v0.3"
             )
         if resolved != latest.deployment_id and current is None:
@@ -187,7 +187,43 @@ class StateRollbackService:
                 raise PolicyError(
                     f"rollback refused: before state source tree unreadable: {exc}"
                 ) from exc
+        self._require_valid_before_backups(manifest)
         return manifest
+
+    def _require_valid_before_backups(self, manifest: DeploymentManifest) -> None:
+        """Verify every rollback backup before transport creation or mutation.
+
+        Args:
+            manifest: Eligible latest deployment whose before bytes may be restored.
+
+        Returns:
+            None.
+        """
+
+        import hashlib
+
+        for snapshot in manifest.snapshots:
+            if not snapshot.before_exists:
+                continue
+            if not snapshot.backup_file or not snapshot.before_sha256:
+                raise PolicyError(
+                    f"rollback refused: {snapshot.path} has incomplete before backup metadata"
+                )
+            try:
+                data = self.deploy_store.read_backup(
+                    manifest.deployment_id,
+                    snapshot.backup_file,
+                )
+            except Exception as exc:
+                raise PolicyError(
+                    f"rollback refused: {snapshot.path} backup is unreadable: {exc}"
+                ) from exc
+            actual = hashlib.sha256(data).hexdigest()
+            if actual != snapshot.before_sha256:
+                raise PolicyError(
+                    f"rollback refused: {snapshot.path} backup hash mismatch "
+                    f"expected={snapshot.before_sha256[:12]} actual={actual[:12]}"
+                )
 
     def rollback_latest(self, *, fail_after_writes: int | None = None) -> RollbackResult:
         """Restore remote before bytes and CAS a new generation reflecting before lineage.
@@ -303,7 +339,10 @@ class StateRollbackService:
                         data = self.deploy_store.read_backup(
                             manifest.deployment_id, snapshot.backup_file
                         )
-                        self.transport.write_file(
+                        writer = getattr(self.transport, "write_file", None)
+                        if not callable(writer):
+                            writer = getattr(self.transport, "replace_file")
+                        writer(
                             snapshot.remote_path,
                             data,
                             executable=bool(snapshot.before_executable),

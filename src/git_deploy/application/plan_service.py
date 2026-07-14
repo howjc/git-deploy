@@ -5,17 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
-from git_deploy.errors import PolicyError
+from git_deploy.errors import ConfigurationError, PolicyError
 from git_deploy.expected_state import ExpectedStateStore
-from git_deploy.gitrepo import GitDeploymentPlanner
+from git_deploy.gitrepo import GitDeploymentPlanner, GitRepository
 from git_deploy.models import PlannedFile, ProjectConfig
+from git_deploy.state_composer import StateComposer, TransitionId
 from git_deploy.state_guards import StateGuards
 from git_deploy.state_planner import StatePlanner
 from git_deploy.target_identity import default_state_base
 
 from .config_service import ApplicationConfigService, ProjectSelection
+from .errors import ApplicationError, ErrorCategory
 from .models import DeployRequest, PlanRequest
 from .plan_token import OperationPlanToken, PlanTokenSigner, StalePlanError
 
@@ -52,11 +55,20 @@ class BuildPlanSummary:
     uses_secret: bool
 
 
+class RevisionSelectionOrigin(StrEnum):
+    """Stable origin of the effective revision selection."""
+
+    EXPLICIT = "explicit"
+    IMPLICIT_CURRENT_TO_HEAD = "implicit_current_to_head"
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionPlanResult:
     """Structured local plan shared by CLI and future TUI adapters."""
 
     selection: ProjectSelection
+    selection_origin: RevisionSelectionOrigin
+    resolved_revisions: tuple[str, ...]
     generation: int | None
     before_tree_id: str
     after_tree_id: str
@@ -138,7 +150,35 @@ class RevisionPlanService:
             )
 
         if loaded is None:
+            if not request.revisions:
+                revision_command = (
+                    f"git-deploy state bootstrap {request.project} --revision COMMIT "
+                    f"--remote {request.remote} --yes"
+                )
+                empty_command = (
+                    f"git-deploy state bootstrap {request.project} --empty "
+                    f"--remote {request.remote} --yes"
+                )
+                raise ApplicationError(
+                    code="state.current-missing",
+                    category=ErrorCategory.CONFIGURATION,
+                    message=(
+                        f"project {request.project!r} on remote {request.remote!r} has no "
+                        "trusted current state. If the remote matches a known commit, run: "
+                        f"{revision_command}. If every managed remote path is confirmed "
+                        f"absent, run: {empty_command}. Explicit --revisions can only build "
+                        "a legacy source plan and cannot bypass artifact state requirements."
+                    ),
+                    context={
+                        "project": request.project,
+                        "remote": request.remote,
+                        "bootstrap_revision_command": revision_command,
+                        "bootstrap_empty_command": empty_command,
+                    },
+                )
             source = GitDeploymentPlanner(project).build_revisions(request.revisions)
+            selection_origin = RevisionSelectionOrigin.EXPLICIT
+            resolved_revisions = source.revision_specs
             before_tree = source.from_commit
             after_tree = source.to_commit
             files = source.files
@@ -169,12 +209,19 @@ class RevisionPlanService:
                     target_root,
                     project.repository,
                 ).object_environment()
-            source = planner.plan_selectors(
+            selection_origin, effective_revisions = _effective_revisions(
+                project,
+                state.source_tree_id,
+                state.applied_transition_ids,
                 request.revisions,
+            )
+            source = planner.plan_selectors(
+                effective_revisions,
                 current_tree_id=state.source_tree_id,
                 applied_transition_ids=state.applied_transition_ids,
                 static_only=True,
             )
+            resolved_revisions = source.revision_specs
             before_tree = source.before_tree_id
             after_tree = source.after_tree_id
             files = source.files
@@ -198,6 +245,8 @@ class RevisionPlanService:
             build,
             warnings,
             introduced,
+            selection_origin,
+            resolved_revisions,
         )
         token = self._signer.issue(
             request,
@@ -206,6 +255,8 @@ class RevisionPlanService:
         )
         return RevisionPlanResult(
             selection=selection,
+            selection_origin=selection_origin,
+            resolved_revisions=resolved_revisions,
             generation=actual_generation,
             before_tree_id=before_tree,
             after_tree_id=after_tree,
@@ -220,6 +271,81 @@ class RevisionPlanService:
             plan_digest=digest,
             plan_token=token,
         )
+
+
+def _effective_revisions(
+    project: ProjectConfig,
+    current_tree_id: str,
+    applied_transition_ids: tuple[str, ...],
+    requested: tuple[str, ...],
+) -> tuple[RevisionSelectionOrigin, tuple[str, ...]]:
+    """Resolve explicit selectors or derive missing first-parent transitions to HEAD.
+
+    Args:
+        project: Selected project containing the repository path.
+        current_tree_id: Trusted source tree from current state.
+        applied_transition_ids: Durable transitions already represented by current.
+        requested: Explicit selectors, or empty for implicit current-to-HEAD.
+
+    Returns:
+        Selection origin and immutable full commit selectors to plan.
+    """
+
+    repository = GitRepository(project.repository)
+    if requested:
+        return (
+            RevisionSelectionOrigin.EXPLICIT,
+            repository.freeze_head_revision_specs(requested),
+        )
+
+    head = repository.resolve_commit("HEAD")
+    commits = tuple(reversed(repository.first_parent_chain(head)))
+    composer = StateComposer(repository)
+    head_transitions = {
+        composer.transition_id_for_commit(commit).as_str(): commit for commit in commits
+    }
+    applied = set(applied_transition_ids)
+    for value in applied:
+        TransitionId.parse(value)
+    unknown = applied - set(head_transitions)
+    if unknown:
+        sample = sorted(unknown)[0]
+        raise ConfigurationError(
+            "trusted current transition is not reachable from HEAD; "
+            f"cannot derive implicit plan ({sample[:24]})"
+        )
+
+    if current_tree_id == repository.empty_tree():
+        missing = commits
+    else:
+        matching = tuple(
+            commit
+            for commit in commits
+            if repository._run_text("rev-parse", f"{commit}^{{tree}}").strip()
+            == current_tree_id
+        )
+        if len(matching) == 1:
+            baseline = commits.index(matching[0])
+            candidates = commits[baseline + 1 :]
+            missing = tuple(
+                commit
+                for commit in candidates
+                if composer.transition_id_for_commit(commit).as_str() not in applied
+            )
+        elif applied:
+            # A composed/cherry-picked state may not equal one historical tree;
+            # durable transition IDs then remain the authoritative replay filter.
+            missing = tuple(
+                commit
+                for transition, commit in head_transitions.items()
+                if transition not in applied
+            )
+        else:
+            raise ConfigurationError(
+                "trusted current tree cannot be mapped uniquely onto HEAD history; "
+                "run state verify and restore required Git objects"
+            )
+    return RevisionSelectionOrigin.IMPLICIT_CURRENT_TO_HEAD, missing
 
 
 def _existing_object_dirs(target_root: Path) -> list[str]:
@@ -292,6 +418,8 @@ def _plan_digest(
     build: BuildPlanSummary,
     warnings: tuple[str, ...],
     introduced: tuple[str, ...],
+    selection_origin: RevisionSelectionOrigin,
+    resolved_revisions: tuple[str, ...],
 ) -> str:
     """Hash the exact renderer-neutral plan reviewed by an operator."""
 
@@ -300,6 +428,8 @@ def _plan_digest(
         "physical_fingerprint": selection.physical_fingerprint,
         "policy_fingerprint": selection.policy_fingerprint,
         "generation": generation,
+        "selection_origin": selection_origin.value,
+        "resolved_revisions": list(resolved_revisions),
         "before_tree": before_tree,
         "after_tree": after_tree,
         "source_changes": [

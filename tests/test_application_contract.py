@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
@@ -14,6 +14,9 @@ from git_deploy.application import (
     GCRequest,
     HistoryRequest,
     OperationKind,
+    OperationProgressEvent,
+    OperationStartedEvent,
+    OperationWarningEvent,
     PlanTokenSigner,
     PlanRequest,
     ResultField,
@@ -23,6 +26,9 @@ from git_deploy.application import (
     StalePlanError,
     StateAction,
     StateRequest,
+    TargetResolvedEvent,
+    TerminalResultEvent,
+    TransactionStageEvent,
     VerifyRequest,
     application_error_from_exception,
     confirmation_policy_fingerprint,
@@ -41,6 +47,99 @@ def _target_context(side_effect: SideEffectLevel) -> dict[str, object]:
         "expected_physical_fingerprint": "a" * 64,
         "expected_generation": 7,
     }
+
+
+def test_v03_public_contract_field_signatures_are_stable() -> None:
+    """Detect accidental removal or renaming of CLI-facing contract fields."""
+
+    expected = {
+        PlanRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation", "revisions",
+            "check_remote", "force",
+        ),
+        DeployRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation", "revisions",
+            "dry_run", "check_remote", "force",
+        ),
+        HistoryRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation", "limit",
+            "offset", "deployment_id",
+        ),
+        VerifyRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation",
+            "deployment_id", "latest", "remote_check",
+        ),
+        RollbackRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation",
+            "deployment_id", "latest", "dry_run", "check_remote", "force",
+        ),
+        StateRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation", "action",
+            "execute", "check_remote", "revision", "empty",
+        ),
+        GCRequest: (
+            "remote", "project", "side_effect", "expected_target_id",
+            "expected_physical_fingerprint", "expected_generation", "execute",
+            "plan_token",
+        ),
+        ApplicationResult: (
+            "operation", "remote", "project", "side_effect", "status",
+            "summary", "fields", "warnings",
+        ),
+        OperationStartedEvent: (
+            "operation", "remote", "project", "sequence", "side_effect",
+        ),
+        TargetResolvedEvent: (
+            "operation", "remote", "project", "sequence", "target_id",
+            "physical_fingerprint", "generation",
+        ),
+        OperationWarningEvent: (
+            "operation", "remote", "project", "sequence", "code", "message",
+        ),
+        OperationProgressEvent: (
+            "operation", "remote", "project", "sequence", "progress",
+        ),
+        TransactionStageEvent: (
+            "operation", "remote", "project", "sequence", "transaction_id",
+            "stage",
+        ),
+        TerminalResultEvent: (
+            "operation", "remote", "project", "sequence", "result",
+        ),
+    }
+
+    assert {
+        contract.__name__: tuple(item.name for item in fields(contract))
+        for contract in expected
+    } == {
+        contract.__name__: signature for contract, signature in expected.items()
+    }
+
+
+def test_v03_operation_and_side_effect_enum_values_are_stable() -> None:
+    """Prevent adapters from silently reinterpreting operation side effects."""
+
+    assert tuple(item.value for item in SideEffectLevel) == (
+        "local_read",
+        "remote_read",
+        "local_mutation",
+        "remote_mutation",
+    )
+    assert tuple(item.value for item in OperationKind) == (
+        "plan",
+        "deploy",
+        "history",
+        "verify",
+        "rollback",
+        "state",
+        "gc",
+    )
 
 
 def test_request_contract_covers_every_operation_family() -> None:
@@ -94,6 +193,10 @@ def test_request_contract_freezes_sequences_and_validates_side_effects() -> None
     )
     selectors.append("HEAD")
     assert request.revisions == ("HEAD~1..HEAD",)
+    assert PlanRequest(
+        **_target_context(SideEffectLevel.LOCAL_READ),
+        revisions=(),
+    ).revisions == ()
 
     with pytest.raises(ValueError, match="requires side_effect=remote_read"):
         PlanRequest(

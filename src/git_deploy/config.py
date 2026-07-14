@@ -553,12 +553,14 @@ def _validate_remote_root(value: str, field: str) -> str:
         Normalized absolute remote directory.
     """
 
-    if not value.startswith("/"):
+    if not value.startswith("/") or "\\" in value:
         raise ConfigurationError(f"{field} must be an absolute POSIX path")
-    parts = PurePosixPath(value).parts
-    if ".." in parts or "." in parts:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ConfigurationError(f"{field} cannot contain control characters")
+    raw_parts = value.split("/")
+    if ".." in raw_parts or "." in raw_parts:
         raise ConfigurationError(f"{field} cannot contain traversal segments")
-    return value.rstrip("/") or "/"
+    return PurePosixPath(value).as_posix().rstrip("/") or "/"
 
 
 def _load_build(value: Any, field: str) -> BuildConfig:

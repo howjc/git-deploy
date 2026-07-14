@@ -306,6 +306,7 @@ target_id = "shared-demo"
     assert dev_id.target_id == "shared-demo"
     assert prod_id.target_id == "shared-demo"
     assert dev_id.physical_fingerprint == prod_id.physical_fingerprint
+    assert dev_projects["demo"].remote_root == "/srv/demo"
 
     # Different protocol with the same explicit id is rejected at load time.
     other_payload = build_physical_payload(
@@ -769,3 +770,24 @@ TOKEN = "op://dev/item/token"
     assert prod is not None and prod.onepassword is not None
     assert dev.onepassword.as_dict()["TOKEN"] == "op://dev/item/token"
     assert prod.onepassword.as_dict()["TOKEN"] == "op://prod/item/token"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["relative", "/srv/../escape", "/srv/./dot", "/srv\\windows", "/srv/control\x01"],
+)
+def test_remote_root_rejects_non_posix_traversal_and_control(value: str) -> None:
+    """Reject remote roots that cannot be safely joined before any connection."""
+
+    from git_deploy.config import _validate_remote_root
+
+    with pytest.raises(ConfigurationError):
+        _validate_remote_root(value, "projects.demo.remote_root")
+
+
+def test_remote_root_normalizes_duplicate_slashes_and_allows_unicode() -> None:
+    """Canonicalize harmless separators while retaining valid Unicode segments."""
+
+    from git_deploy.config import _validate_remote_root
+
+    assert _validate_remote_root("/srv//应用///", "root") == "/srv/应用"

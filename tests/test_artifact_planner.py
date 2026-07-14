@@ -87,6 +87,35 @@ def test_trusted_diff_missing_manifest_requires_explicit_baseline(tmp_path: Path
     assert plan.files == ()
 
 
+@pytest.mark.parametrize("mode", ["upload", "delete"])
+def test_artifact_upload_and_delete_cannot_cross_protected_paths(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """Apply built-in protected policy to artifact uploads and deletions."""
+
+    digest = hashlib.sha256(b"secret").hexdigest()
+    current = _state(
+        *(
+            (FileEntry(".env", "artifact:.env", digest),)
+            if mode == "delete"
+            else ()
+        )
+    )
+    target = BuildCacheEntry(
+        "fingerprint",
+        "tree",
+        (
+            (CachedArtifact("artifact:.env", ".env", digest, 6, False),)
+            if mode == "upload"
+            else ()
+        ),
+    )
+
+    with pytest.raises(PolicyError, match="protected path"):
+        ArtifactPlanner().plan(_project(tmp_path), current, target)
+
+
 def test_baseline_known_source_requires_exact_remote_bytes(tmp_path: Path) -> None:
     """Known-source baseline adopts only reproducible bytes with zero writes."""
 

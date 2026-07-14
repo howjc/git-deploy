@@ -204,6 +204,34 @@ def test_latest_rollback_restores_bytes_and_generation(tmp_path: Path) -> None:
     assert "t0" in state.applied_transition_ids
 
 
+def test_corrupt_before_backup_blocks_rollback_before_remote_io(
+    tmp_path: Path,
+) -> None:
+    """Refuse a tampered before backup before reads, writes, journal, or CAS."""
+
+    service, transport, store, _identity, _older, latest = _setup(tmp_path)
+    snapshot = latest.snapshots[0]
+    assert snapshot.backup_file is not None
+    backup = (
+        service.deploy_store.deployment_dir(latest.deployment_id)
+        / snapshot.backup_file
+    )
+    backup.write_bytes(b"tampered")
+    generation = store.read_current().generation  # type: ignore[union-attr]
+    reads = transport.read_calls
+    writes = transport.write_calls
+
+    with pytest.raises(PolicyError, match="backup hash mismatch"):
+        service.rollback_latest()
+
+    assert transport.read_calls == reads
+    assert transport.write_calls == writes
+    assert store.read_current().generation == generation  # type: ignore[union-attr]
+    from git_deploy.transaction import TransactionStore
+
+    assert TransactionStore(service.target_root).list_open() == []
+
+
 def test_non_latest_refused_before_connect(tmp_path: Path) -> None:
     """Non-latest rollback refused with zero transport writes when current exists."""
 

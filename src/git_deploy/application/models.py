@@ -302,20 +302,20 @@ _STATE_SIDE_EFFECTS: dict[StateAction, frozenset[SideEffectLevel]] = {
 
 
 def _selectors(values: tuple[str, ...]) -> tuple[str, ...]:
-    """Return validated immutable revision selectors.
+    """Return validated immutable explicit or implicit revision selectors.
 
     Args:
         values: Candidate selector sequence.
 
     Returns:
-        Non-empty tuple of stripped selectors.
+        Tuple of stripped selectors; empty means implicit current-to-HEAD selection.
     """
 
     if isinstance(values, str):
         raise TypeError("revisions must be a sequence, not a string")
     selectors = tuple(str(value).strip() for value in values)
-    if not selectors or any(not value for value in selectors):
-        raise ValueError("revisions must contain non-empty selectors")
+    if any(not value for value in selectors):
+        raise ValueError("revisions must not contain empty selectors")
     return selectors
 
 
