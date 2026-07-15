@@ -75,10 +75,12 @@ from .plan_token import (
 from .plan_service import (
     ArtifactMappingPlan,
     BuildPlanSummary,
+    FrozenDomainFile,
     PlannedChange,
     RevisionPlanResult,
     RevisionSelectionOrigin,
     RevisionPlanService,
+    to_frozen_source_diff_plan,
 )
 from .errors import (
     ApplicationError,
@@ -162,12 +164,14 @@ __all__ = [
     "PlanRequest",
     "PlanTokenSigner",
     "PlannedChange",
+    "FrozenDomainFile",
     "ProjectSelection",
     "ResultField",
     "ResultStatus",
     "RevisionPlanResult",
     "RevisionSelectionOrigin",
     "RevisionPlanService",
+    "to_frozen_source_diff_plan",
     "RiskFactor",
     "RiskItem",
     "RiskLevel",

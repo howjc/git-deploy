@@ -1202,6 +1202,543 @@ local_state_dir = ".state/demo"
         set_cli_transport_factory(None)
 
 
+def test_application_deploy_stale_after_execute_precheck_before_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """§8.1: concurrent advance after execute precheck must not re-plan Plan B.
+
+    Race window is after the unlocked generation precheck and before domain
+    lock-held freshness. Expect stale_plan, zero remote connect/write, zero
+    transaction/manifest, current kept at concurrent N+1.
+    """
+
+    import hashlib
+    import subprocess
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state import DeploymentStore
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.target_identity import (
+        default_state_base,
+        policy_fingerprint_for_project,
+    )
+    from git_deploy.transaction import TransactionStore
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "file.txt").write_text("same\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "deploy.example"
+[projects.demo]
+repository = "{repo}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    PersistentGitStore(root, repo).ensure_layout()
+    PersistentGitStore(root, repo)._publish_repository_identity()
+    body = b"same\n"
+    ContentAddressedStore(root).put(body)
+    store = ExpectedStateStore(root, identity)
+    head_tid = StateComposer(repo).transition_id_for_commit(head).as_str()
+    gen1 = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=(head_tid,),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(
+            FileEntry(
+                path="file.txt",
+                owner="source",
+                content_sha256=hashlib.sha256(body).hexdigest(),
+                exists=True,
+            ),
+        ),
+    )
+    store.cas_advance(expected_generation=None, state=gen1)
+
+    transport = InMemoryTransport()
+    transport.files["/srv/demo/file.txt"] = FakeRemotePath(body)
+    writes_before = transport.write_calls
+    factory_calls = {"count": 0}
+
+    def factory(_server: dict[str, object]) -> InMemoryTransport:
+        factory_calls["count"] += 1
+        return transport
+
+    set_cli_transport_factory(factory)
+
+    def race_after_precheck() -> None:
+        """Advance current after unlocked precheck, before domain lock."""
+
+        current = store.load_current_state()
+        assert current is not None
+        pointer, state = current
+        advanced = build_expected_state(
+            generation=pointer.generation + 1,
+            parent_state_id=pointer.state_id,
+            source_tree_id=state.source_tree_id,
+            applied_transition_ids=tuple(state.applied_transition_ids),
+            physical_fingerprint=identity.physical_fingerprint,
+            policy_fingerprint=policy_fingerprint_for_project(project),
+            files=state.files,
+            artifacts=({"mode": "probe", "note": "post-precheck-race"},),
+        )
+        store.cas_advance(expected_generation=pointer.generation, state=advanced)
+
+    # Inject race via wrapping application deploy after parse.
+    import git_deploy.cli as cli_mod
+
+    real_app_deploy = cli_mod._run_application_deploy
+
+    def deploy_with_race(cfg, args):  # type: ignore[no-untyped-def]
+        args._post_precheck_race_hook = race_after_precheck
+        return real_app_deploy(cfg, args)
+
+    monkeypatch.setattr(cli_mod, "_run_application_deploy", deploy_with_race)
+
+    nested_replan_calls = {"count": 0}
+    real_plan_or_deploy = cli_mod._run_plan_or_deploy
+
+    def track_nested_replan(cfg, args, *a, **k):  # type: ignore[no-untyped-def]
+        # Outer entry is _run_plan_or_deploy → _run_application_deploy; only
+        # nested post-confirm re-plan sets _application_gated.
+        if bool(getattr(args, "_application_gated", False)):
+            nested_replan_calls["count"] += 1
+        return real_plan_or_deploy(cfg, args, *a, **k)
+
+    monkeypatch.setattr(cli_mod, "_run_plan_or_deploy", track_nested_replan)
+
+    try:
+        code = run(["deploy", "demo", "--revisions", head, "--yes"])
+        captured = capsys.readouterr()
+        err = captured.err
+        out = captured.out
+        assert code != 0, f"expected stale rejection, got 0\nout={out}\nerr={err}"
+        assert "stale_plan" in err, f"expected stale_plan in stderr, got:\n{err}\nstdout:\n{out}"
+        assert transport.write_calls == writes_before
+        assert factory_calls["count"] == 0
+        assert nested_replan_calls["count"] == 0, (
+            "application deploy must not nest _run_plan_or_deploy re-plan"
+        )
+        assert TransactionStore(root).list_open() == []
+        assert DeploymentStore(project, root=root).list_manifests() == []
+        current = store.read_current()
+        assert current is not None and current.generation == 2
+        state = store.read_state(current.state_id)
+        assert state.artifacts and state.artifacts[0].get("note") == "post-precheck-race"
+    finally:
+        set_cli_transport_factory(None)
+
+
+def test_application_deploy_never_replans_via_run_plan_or_deploy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§8.1: token-bound plan A must not execute through domain re-plan Plan B path."""
+
+    import hashlib
+    import subprocess
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.target_identity import (
+        default_state_base,
+        policy_fingerprint_for_project,
+    )
+    import git_deploy.cli as cli_mod
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "file.txt").write_text("same\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "deploy.example"
+[projects.demo]
+repository = "{repo}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    PersistentGitStore(root, repo).ensure_layout()
+    PersistentGitStore(root, repo)._publish_repository_identity()
+    body = b"same\n"
+    ContentAddressedStore(root).put(body)
+    store = ExpectedStateStore(root, identity)
+    head_tid = StateComposer(repo).transition_id_for_commit(head).as_str()
+    gen1 = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=tree,
+        applied_transition_ids=(head_tid,),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(
+            FileEntry(
+                path="file.txt",
+                owner="source",
+                content_sha256=hashlib.sha256(body).hexdigest(),
+                exists=True,
+            ),
+        ),
+    )
+    store.cas_advance(expected_generation=None, state=gen1)
+    transport = InMemoryTransport()
+    transport.files["/srv/demo/file.txt"] = FakeRemotePath(body)
+
+    def factory(_server: dict[str, object]) -> InMemoryTransport:
+        return transport
+
+    set_cli_transport_factory(factory)
+
+    real_plan_or_deploy = cli_mod._run_plan_or_deploy
+    nested = {"count": 0}
+
+    def track_nested(cfg, args, *a, **k):  # type: ignore[no-untyped-def]
+        if bool(getattr(args, "_application_gated", False)):
+            nested["count"] += 1
+            raise AssertionError(
+                "application deploy must not nest _run_plan_or_deploy for Plan B"
+            )
+        return real_plan_or_deploy(cfg, args, *a, **k)
+
+    monkeypatch.setattr(cli_mod, "_run_plan_or_deploy", track_nested)
+    try:
+        code = run(["deploy", "demo", "--revisions", head, "--yes"])
+        assert code == 0
+        assert nested["count"] == 0
+        assert store.read_current() is not None
+        assert store.read_current().generation == 1  # type: ignore[union-attr]
+    finally:
+        set_cli_transport_factory(None)
+
+
+def test_application_latest_rollback_stale_when_newer_deployment_becomes_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """§8.2: preview A then successful B → A token must stale; never roll back B."""
+
+    import hashlib
+    import subprocess
+
+    from git_deploy.application.rollback_service import LatestRollbackService
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.models import DeploymentManifest, FileSnapshot
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state import DeploymentStore
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.target_identity import (
+        default_state_base,
+        policy_fingerprint_for_project,
+    )
+    from git_deploy.transaction import TransactionStore
+    import git_deploy.cli as cli_mod
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "t@e"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "T"],
+        check=True,
+    )
+    empty_tree = subprocess.run(
+        ["git", "-C", str(repository), "hash-object", "-w", "-t", "tree", "--stdin"],
+        input=b"",
+        check=True,
+        capture_output=True,
+    ).stdout.decode().strip()
+
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "rollback.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    PersistentGitStore(root, repository).ensure_layout()
+    PersistentGitStore(root, repository)._publish_repository_identity()
+    before_body = b"before\n"
+    after_a = b"after-a\n"
+    after_b = b"after-b\n"
+    cas = ContentAddressedStore(root)
+    cas.put(before_body)
+    cas.put(after_a)
+    cas.put(after_b)
+    store = ExpectedStateStore(root, identity)
+    policy = policy_fingerprint_for_project(project)
+
+    # gen1 before dep-A; gen2 after dep-A (current at preview time).
+    state_before_a = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=empty_tree,
+        applied_transition_ids=(),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy,
+        files=(
+            FileEntry(
+                path="app.txt",
+                owner="source",
+                content_sha256=hashlib.sha256(before_body).hexdigest(),
+                exists=True,
+            ),
+        ),
+    )
+    store.cas_advance(expected_generation=None, state=state_before_a)
+    state_after_a = build_expected_state(
+        generation=2,
+        parent_state_id=state_before_a.state_id(),
+        source_tree_id=empty_tree,
+        applied_transition_ids=("t0",),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy,
+        files=(
+            FileEntry(
+                path="app.txt",
+                owner="source",
+                content_sha256=hashlib.sha256(after_a).hexdigest(),
+                exists=True,
+            ),
+        ),
+        deployment_id="20260101T000000Z-dep-A",
+    )
+    store.cas_advance(expected_generation=1, state=state_after_a)
+
+    deploy_store = DeploymentStore(project, root=root)
+    backup_rel = deploy_store.write_backup("20260101T000000Z-dep-A", 0, before_body)
+    deploy_store.write_manifest(
+        DeploymentManifest(
+            deployment_id="20260101T000000Z-dep-A",
+            project="demo",
+            repository=str(repository),
+            remote_root="/srv/demo",
+            created_at="2026-01-01T00:00:00Z",
+            status="succeeded",
+            from_commit="a",
+            to_commit="b",
+            snapshots=[
+                FileSnapshot(
+                    path="app.txt",
+                    remote_path="/srv/demo/app.txt",
+                    before_exists=True,
+                    before_sha256=hashlib.sha256(before_body).hexdigest(),
+                    backup_file=backup_rel,
+                    after_exists=True,
+                    after_sha256=hashlib.sha256(after_a).hexdigest(),
+                    before_executable=False,
+                    after_executable=False,
+                )
+            ],
+            before_state_id=state_before_a.state_id(),
+            after_state_id=state_after_a.state_id(),
+            before_generation=1,
+            after_generation=2,
+            state="v1",
+            introduced_transition_ids=["t0"],
+            target_id=identity.target_id,
+        )
+    )
+
+    transport = InMemoryTransport()
+    transport.files["/srv/demo/app.txt"] = FakeRemotePath(after_a)
+    writes_before = transport.write_calls
+    factory_calls = {"count": 0}
+
+    def factory(_server: dict[str, object]) -> InMemoryTransport:
+        factory_calls["count"] += 1
+        return transport
+
+    set_cli_transport_factory(factory)
+
+    real_preview = LatestRollbackService.preview
+
+    def preview_then_insert_b(self, request):  # type: ignore[no-untyped-def]
+        """Preview rolls back dep-A, then concurrent deploy B becomes latest."""
+
+        planned = real_preview(self, request)
+        assert planned.deployment_id == "20260101T000000Z-dep-A"
+        state_after_b = build_expected_state(
+            generation=3,
+            parent_state_id=state_after_a.state_id(),
+            source_tree_id=empty_tree,
+            applied_transition_ids=("t0", "t1"),
+            physical_fingerprint=identity.physical_fingerprint,
+            policy_fingerprint=policy,
+            files=(
+                FileEntry(
+                    path="app.txt",
+                    owner="source",
+                    content_sha256=hashlib.sha256(after_b).hexdigest(),
+                    exists=True,
+                ),
+            ),
+            deployment_id="20260101T000001Z-dep-B",
+        )
+        store.cas_advance(expected_generation=2, state=state_after_b)
+        backup_b = deploy_store.write_backup("20260101T000001Z-dep-B", 0, after_a)
+        deploy_store.write_manifest(
+            DeploymentManifest(
+                deployment_id="20260101T000001Z-dep-B",
+                project="demo",
+                repository=str(repository),
+                remote_root="/srv/demo",
+                created_at="2026-01-01T00:00:01Z",
+                status="succeeded",
+                from_commit="b",
+                to_commit="c",
+                snapshots=[
+                    FileSnapshot(
+                        path="app.txt",
+                        remote_path="/srv/demo/app.txt",
+                        before_exists=True,
+                        before_sha256=hashlib.sha256(after_a).hexdigest(),
+                        backup_file=backup_b,
+                        after_exists=True,
+                        after_sha256=hashlib.sha256(after_b).hexdigest(),
+                        before_executable=False,
+                        after_executable=False,
+                    )
+                ],
+                before_state_id=state_after_a.state_id(),
+                after_state_id=state_after_b.state_id(),
+                before_generation=2,
+                after_generation=3,
+                state="v1",
+                introduced_transition_ids=["t1"],
+                target_id=identity.target_id,
+            )
+        )
+        transport.files["/srv/demo/app.txt"] = FakeRemotePath(after_b)
+        return planned
+
+    monkeypatch.setattr(LatestRollbackService, "preview", preview_then_insert_b)
+
+    nested_reselect = {"count": 0}
+    real_run_rollback = cli_mod._run_rollback
+
+    def track_nested_reselect(cfg, args, *a, **k):  # type: ignore[no-untyped-def]
+        if bool(getattr(args, "_application_gated", False)):
+            nested_reselect["count"] += 1
+        return real_run_rollback(cfg, args, *a, **k)
+
+    monkeypatch.setattr(cli_mod, "_run_rollback", track_nested_reselect)
+
+    try:
+        code = run(["rollback", "demo", "--latest", "--yes"])
+        captured = capsys.readouterr()
+        err = captured.err
+        out = captured.out
+        assert code != 0, f"expected stale rejection, got 0\nout={out}\nerr={err}"
+        assert "stale_plan" in err, f"expected stale_plan in stderr, got:\n{err}\nstdout:\n{out}"
+        # B must not be rolled back: remote still after-B content.
+        assert transport.files["/srv/demo/app.txt"].data == after_b
+        assert transport.write_calls == writes_before
+        assert factory_calls["count"] == 0
+        assert nested_reselect["count"] == 0, "must not nest _run_rollback re-select"
+        assert TransactionStore(root).list_open() == []
+        current = store.read_current()
+        assert current is not None and current.generation == 3
+        assert deploy_store.latest_successful().deployment_id == "20260101T000001Z-dep-B"
+        assert "rolled back (stateful)" not in out
+    finally:
+        set_cli_transport_factory(None)
+
+
 def test_stateful_rollback_non_latest_refused_before_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

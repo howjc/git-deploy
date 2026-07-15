@@ -326,6 +326,14 @@ def _validate_rollback_result(
     derived_generation = _result_field(result.fields, "generation")
     if plan.generation is not None and derived_generation != plan.generation + 1:
         raise ValueError("rollback result generation is not the expected derived generation")
+    # Exact-deployment contract: result must report the reviewed deployment, not a
+    # concurrent newer latest that the executor must not have rolled back.
+    result_deployment = _result_field(result.fields, "deployment_id")
+    if result_deployment is not None and result_deployment != plan.deployment_id:
+        raise ValueError(
+            "rollback result deployment_id does not match the reviewed plan "
+            f"(result={result_deployment!r}, plan={plan.deployment_id!r})"
+        )
 
 
 def _result_field(fields: tuple[ResultField, ...], name: str) -> object:

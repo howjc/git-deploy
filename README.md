@@ -6,16 +6,17 @@ current state 自动计算到当前 `HEAD` 的变化，通过 SFTP、FTP 或 FTP
 冗长确认短语。
 
 它适合仍通过 SSH/FTP 发布普通目录、希望保留清晰 Git 来源和最新版本回滚能力
-的项目。它不是 CI 平台、服务器面板或数据库 migration 系统；v0.3.0 也不提供
+的项目。它不是 CI 平台、服务器面板或数据库 migration 系统；v0.3.2 也不提供
 TUI、历史版本派生回滚或自动 GC。
 
 ## 安装
 
-需要 Python 3.11+ 和 Git。推荐直接安装 v0.3.0 wheel：
+需要 Python 3.11+ 和 Git。推荐直接安装当前安全版本 v0.3.2 wheel（**不要**再安装
+已知存在阻断问题的 v0.3.0）：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v0.3.0/git_deploy-0.3.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v0.3.2/git_deploy-0.3.2-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -581,7 +582,7 @@ uvx ty check src
 uv build --clear
 ```
 
-当前 v0.3.0 GA 基线为 347 个自动测试，包含 Host、真实 OpenSSH/SFTP 容器和 fake FTP/FTPS contract 门禁。
+当前 v0.3.2 基线为 365+ 个自动测试，包含 Host、真实 OpenSSH/SFTP 容器和 fake FTP/FTPS contract 门禁，以及 application exact-plan / exact-deployment 竞态回归。
 
 ### 2. 更新版本
 
@@ -591,7 +592,7 @@ uv build --clear
 uv lock
 ```
 
-禁止手工编辑 `uv.lock`。
+禁止手工编辑 `uv.lock`。**禁止**用新内容覆盖重发同一版本号（例如不要再发布不同内容的 `0.3.1`）。
 
 ### 3. 构建、校验与隔离安装
 
@@ -601,15 +602,15 @@ uv build --clear
 (
   cd dist
   sha256sum \
-    git_deploy-0.3.0-py3-none-any.whl \
-    git_deploy-0.3.0.tar.gz \
+    git_deploy-0.3.2-py3-none-any.whl \
+    git_deploy-0.3.2.tar.gz \
     > SHA256SUMS
 )
 
 uv venv --clear tmp/release-smoke
 uv pip install \
   --python tmp/release-smoke/bin/python \
-  dist/git_deploy-0.3.0-py3-none-any.whl
+  dist/git_deploy-0.3.2-py3-none-any.whl
 
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
@@ -621,19 +622,19 @@ tmp/release-smoke/bin/git-deploy --help
 
 ```bash
 git add README.md pyproject.toml uv.lock src tests docs git-deploy.example.toml
-git commit -m "release v0.3.0"
+git commit -m "release v0.3.2"
 git push
 
-git tag -a v0.3.0 -m "git-deploy v0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.2 -m "git-deploy v0.3.2"
+git push origin v0.3.2
 
-gh release create v0.3.0 \
-  dist/git_deploy-0.3.0-py3-none-any.whl \
-  dist/git_deploy-0.3.0.tar.gz \
+gh release create v0.3.2 \
+  dist/git_deploy-0.3.2-py3-none-any.whl \
+  dist/git_deploy-0.3.2.tar.gz \
   dist/SHA256SUMS \
   --verify-tag \
-  --title "git-deploy v0.3.0" \
-  --notes-file docs/release-notes-v0.3.0.md
+  --title "git-deploy v0.3.2" \
+  --notes-file docs/release-notes-v0.3.2.md
 ```
 
 仓库当前通过 GitHub Release 分发 wheel/sdist，尚未配置 PyPI 自动发布。未来接入 PyPI 时应使用 trusted publishing 或受保护的 registry credential，不能把 token 写入仓库、命令历史或文档。

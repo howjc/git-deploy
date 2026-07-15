@@ -25,12 +25,14 @@ class RollbackResult:
         generation: New generation after rollback.
         after_state_id: New current state id.
         restored_paths: Paths restored from backups.
+        deployment_id: Exact deployment that was rolled back (``rollback_of``).
     """
 
     status: str
     generation: int | None
     after_state_id: str | None
     restored_paths: tuple[str, ...]
+    deployment_id: str | None = None
 
 
 class StateRollbackService:
@@ -230,6 +232,8 @@ class StateRollbackService:
         *,
         force: bool = False,
         fail_after_writes: int | None = None,
+        expected_deployment_id: str | None = None,
+        expected_generation: int | None = None,
     ) -> RollbackResult:
         """Restore remote before bytes and CAS a new generation reflecting before lineage.
 
@@ -241,12 +245,19 @@ class StateRollbackService:
         refuses third-party content with zero mutations; ``force=True`` continues
         and persists the real pre-rollback remote bytes as recovery backup.
 
+        When ``expected_deployment_id`` is set (application exact-plan path), the
+        lock-held path loads that exact deployment, verifies it is still the
+        latest successful and matches ``expected_generation``/current, and never
+        silently re-selects a newer latest.
+
         Args:
             force: Allow remote after-state drift (third-party content).
             fail_after_writes: Test-only injection for partial rollback crash.
+            expected_deployment_id: Exact preview-bound deployment to roll back.
+            expected_generation: Preview-bound current generation at plan time.
 
         Returns:
-            Rollback result.
+            Rollback result including the exact ``deployment_id`` rolled back.
         """
 
         with TargetLock(self.target_root):
@@ -256,8 +267,33 @@ class StateRollbackService:
             if loaded is None:
                 raise PolicyError("no current state; use legacy rollback without state lineage")
             pointer, current_state = loaded
-            # Same gates as CLI pre-connect path (after_state match + before readable).
-            manifest = self.assert_rollback_eligible()
+            if expected_generation is not None and pointer.generation != expected_generation:
+                raise PolicyError(
+                    "stale_plan: current generation changed before rollback "
+                    f"(expected {expected_generation}, actual {pointer.generation}); "
+                    "re-preview required"
+                )
+            if expected_deployment_id is not None:
+                # Exact reviewed deployment — never re-select latest under lock.
+                try:
+                    manifest = self.deploy_store.load(expected_deployment_id)
+                except Exception as exc:
+                    raise PolicyError(
+                        "stale_plan: expected deployment is no longer loadable; "
+                        f"re-preview required: {exc}"
+                    ) from exc
+                latest = self.deploy_store.latest_successful()
+                if latest.deployment_id != manifest.deployment_id:
+                    raise PolicyError(
+                        "stale_plan: reviewed deployment is no longer latest successful "
+                        f"(expected {manifest.deployment_id}, latest {latest.deployment_id}); "
+                        "re-preview required"
+                    )
+                # Eligibility against the exact reviewed manifest (not a re-pick).
+                manifest = self.assert_rollback_eligible(manifest)
+            else:
+                # Same gates as CLI pre-connect path (after_state match + before readable).
+                manifest = self.assert_rollback_eligible()
             # Lock-held after-state check before any durable write or mutation.
             self._require_remote_after_state(manifest, force=force)
             # v1 / lineage: before immutable state already validated; load for after build.
@@ -386,6 +422,7 @@ class StateRollbackService:
                 generation=after.generation,
                 after_state_id=after.state_id(),
                 restored_paths=tuple(restored),
+                deployment_id=manifest.deployment_id,
             )
 
     def _require_remote_after_state(

@@ -521,6 +521,10 @@ def _run_application_plan(
 def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     """Gate CLI deployment through the shared plan, policy, and worker services.
 
+    The reviewed ``RevisionPlanResult`` is the exact domain boundary executed
+    under target lock. Execution never calls ``_run_plan_or_deploy`` (no
+    post-confirm re-plan against a later current generation).
+
     Args:
         config: Loaded application configuration.
         args: Parsed non-dry-run deploy arguments.
@@ -533,14 +537,11 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
 
     from .application import (
         ApplicationConfigService,
-        ApplicationResult,
         ApplicationWorker,
         ConfirmationGrant,
         DeployRequest,
         DeployService,
         PlanTokenSigner,
-        ResultField,
-        ResultStatus,
         RevisionPlanService,
         SideEffectLevel,
         StateInspectService,
@@ -625,54 +626,40 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
                     supplied_phrase=getattr(args, "confirm_phrase", None),
                     prompt=f"Deploy project {project_name} to remote {remote_name}?",
                 )
-            nested_args = argparse.Namespace(**vars(args))
-            nested_args.targets = [project_name]
-            nested_args.revisions = plan.resolved_revisions
-            nested_args.yes = True
-            nested_args._application_gated = True
 
-            def execute_domain(_request, _plan, _emit, *, _args=nested_args):
-                """Run the existing transaction adapter behind the application facade."""
+            def execute_domain(
+                _request,
+                _plan,
+                _emit,
+                *,
+                _force=bool(args.force),
+                _config=config,
+            ):
+                """Execute the exact reviewed plan; never re-plan via CLI deploy."""
 
+                # Unlocked fast-path precheck (authoritative check is lock-held).
                 current_selection, current_generation = StateInspectService(
                     config_service
-                ).current_generation(request.remote, request.project)
+                ).current_generation(_request.remote, _request.project)
                 if (
-                    current_selection.target_id != request.expected_target_id
+                    current_selection.target_id != _request.expected_target_id
                     or current_selection.physical_fingerprint
-                    != request.expected_physical_fingerprint
-                    or current_generation != request.expected_generation
+                    != _request.expected_physical_fingerprint
+                    or current_generation != _request.expected_generation
                 ):
-                    # PolicyError maps to the shipped CLI exit path (not bare ValueError).
                     raise PolicyError(
                         "stale_plan: target identity or generation changed before "
                         "deployment; re-plan required"
                     )
-                code = _run_plan_or_deploy(config, _args)
-                if code:
-                    raise PolicyError(f"deployment failed with exit code {code}")
-                summary = "deployment command completed"
-                status = ResultStatus.SUCCEEDED
-                if (
-                    _plan.static_noop
-                    and not _plan.build.enabled
-                    and not _plan.source_changes
-                    and not _plan.introduced_transition_ids
-                ):
-                    summary = (
-                        "No changes: target generation already matches "
-                        f"{_plan.after_tree_id}"
-                    )
-                    status = ResultStatus.NOOP
-                    print(summary)
-                return ApplicationResult(
-                    operation=request.operation,
-                    remote=request.remote,
-                    project=request.project,
-                    side_effect=request.side_effect,
-                    status=status,
-                    summary=summary,
-                    fields=(ResultField("exit_code", code),),
+                # Test/injection hook: concurrent advance after precheck, before domain.
+                race_hook = getattr(args, "_post_precheck_race_hook", None)
+                if callable(race_hook):
+                    race_hook()
+                return _execute_reviewed_domain_deploy(
+                    _config,
+                    _request,
+                    _plan,
+                    force=_force,
                 )
 
             service = DeployService(signer, execute_domain)
@@ -701,6 +688,407 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     finally:
         worker.shutdown()
     return exit_code
+
+
+def _execute_reviewed_domain_deploy(
+    config: AppConfig,
+    request: object,
+    plan: object,
+    *,
+    force: bool = False,
+) -> object:
+    """Deploy the exact reviewed application plan under domain target lock.
+
+    Rebuilds domain ``SourceDiffPlan`` from the signed freeze fields only.
+    Never re-reads live current as the plan before-boundary and never calls
+    ``_run_plan_or_deploy`` / ``plan_selectors`` against a later generation.
+
+    Args:
+        config: Loaded application configuration.
+        request: Confirmed ``DeployRequest``.
+        plan: Reviewed ``RevisionPlanResult`` (token-bound).
+        force: Allow confirmed remote content drift.
+
+    Returns:
+        Structured ``ApplicationResult``.
+
+    Raises:
+        PolicyError: Stale plan, domain refusal, or deploy failure.
+    """
+
+    from .application import (
+        ApplicationConfigService,
+        ApplicationResult,
+        DeployRequest,
+        ResultField,
+        ResultStatus,
+        RevisionPlanResult,
+        to_frozen_source_diff_plan,
+    )
+    from .config import resolve_project_target
+    from .expected_state import ExpectedStateStore
+    from .git_store import PersistentGitStore
+    from .gitrepo import GitRepository
+    from .remote_verify import open_cli_transport
+    from .state_executor import InMemoryTransport, StateDeploymentExecutor
+    from .state_planner import StatePlanner
+    from .target_identity import default_state_base
+
+    if not isinstance(request, DeployRequest):
+        raise TypeError("request must be a DeployRequest")
+    if not isinstance(plan, RevisionPlanResult):
+        raise TypeError("plan must be a RevisionPlanResult")
+
+    config_service = ApplicationConfigService(config)
+    _alias, server, project, identity = config_service._resolve_domain_project(
+        request.remote,
+        request.project,
+    )
+    # Prefer config-resolved identity (same as other CLI paths).
+    identity = resolve_project_target(server, project, config=config)
+    target_root = identity.state_root(
+        default_state_base(project.name, project.local_state_dir)
+    )
+    frozen = to_frozen_source_diff_plan(plan)
+    is_static_noop = bool(
+        plan.static_noop
+        and not plan.build.enabled
+        and not plan.source_changes
+        and not plan.introduced_transition_ids
+    )
+
+    if is_static_noop:
+        executor = StateDeploymentExecutor(
+            project,
+            identity,
+            target_root,
+            transport=InMemoryTransport(),
+        )
+        result = executor.deploy(frozen, list(frozen.files), force=False)
+        summary = (
+            "No changes: target generation already matches "
+            f"{plan.after_tree_id}"
+        )
+        print(summary)
+        return ApplicationResult(
+            operation=request.operation,
+            remote=request.remote,
+            project=request.project,
+            side_effect=request.side_effect,
+            status=ResultStatus.NOOP,
+            summary=summary,
+            fields=(
+                ResultField("exit_code", 0),
+                ResultField("generation", result.get("generation")),
+                ResultField("status", result.get("status", "already deployed")),
+            ),
+        )
+
+    # Materialize durable trees from the *reviewed* before-boundary + selectors
+    # (not live current). Lock-held expected_* stay on the reviewed freeze.
+    git_store: PersistentGitStore | None = None
+    object_env: dict[str, str] | None = None
+    source_plan = frozen
+    if plan.before_state_id is not None or plan.generation is not None:
+        git_store = PersistentGitStore(target_root, project.repository)
+        git_store.ensure_layout()
+        planner = StatePlanner(
+            project.repository,
+            include=project.include,
+            exclude=project.exclude,
+            protected=project.protected,
+            remote_root=project.remote_root,
+            git_store=git_store,
+        )
+        recomposed = planner.plan_selectors(
+            plan.resolved_revisions,
+            current_tree_id=plan.before_tree_id,
+            applied_transition_ids=plan.before_applied_transition_ids,
+            static_only=False,
+        )
+        object_env = planner.object_env()
+        _assert_recomposed_matches_reviewed(recomposed, plan)
+        source_plan = replace(
+            recomposed,
+            expected_before_state_id=plan.before_state_id,
+            expected_generation=plan.generation,
+            expected_before_tree_id=plan.before_tree_id,
+            expected_before_applied_transition_ids=plan.before_applied_transition_ids,
+        )
+
+    transport = None
+    try:
+        if project.build is None:
+            repo = GitRepository(project.repository)
+
+            def _content(
+                path: str,
+                *,
+                _repo: GitRepository = repo,
+                _tree: str = source_plan.after_tree_id,
+                _env: dict[str, str] | None = object_env,
+            ) -> bytes:
+                blob = _repo.blob(_tree, path, env=_env)
+                if blob is None:
+                    return b""
+                return blob.data
+
+            transport = open_cli_transport(dict(server.values))
+            executor = StateDeploymentExecutor(
+                project,
+                identity,
+                target_root,
+                transport=transport,
+                content_provider=_content,
+            )
+            result = executor.deploy(
+                source_plan,
+                list(source_plan.files),
+                force=force,
+            )
+        else:
+            from .artifact_planner import ArtifactPlanner
+            from .build_service import BuildService
+            from .combined_planner import CombinedPlanner
+            from .streaming import FileContentRef, StreamingContentProvider
+            from .worktree import WorktreeManager
+
+            state_store = ExpectedStateStore(target_root, identity)
+            loaded = state_store.load_current_state()
+            if loaded is None:
+                raise PolicyError("artifact deploy requires current state")
+            # Live current is only used for artifact baseline bookkeeping; source
+            # plan before-boundary remains the reviewed freeze (checked under lock).
+            _pointer, current_state = loaded
+            if git_store is None:
+                git_store = PersistentGitStore(target_root, project.repository)
+                git_store.ensure_layout()
+            if object_env is None:
+                object_env = git_store.object_environment()
+            build_service = BuildService(project, target_root)
+            target_build = build_service.execute(
+                source_plan.after_tree_id,
+                object_env=object_env,
+            )
+            artifact_planner = ArtifactPlanner()
+            artifact_plan = artifact_planner.plan(
+                project, current_state, target_build.entry
+            )
+            if artifact_plan.status == "baseline_required":
+                transport = open_cli_transport(dict(server.values))
+                baseline_build = (
+                    target_build
+                    if current_state.source_tree_id == source_plan.after_tree_id
+                    else build_service.execute(
+                        current_state.source_tree_id,
+                        object_env=object_env,
+                    )
+                )
+                baseline = artifact_planner.verify_known_source_baseline(
+                    project,
+                    baseline_build.entry,
+                    transport,
+                )
+                writes_before = getattr(transport, "write_calls", 0)
+                baseline_executor = StateDeploymentExecutor(
+                    project,
+                    identity,
+                    target_root,
+                    transport=transport,
+                )
+                current_state = baseline_executor.commit_artifact_baseline(
+                    baseline.files,
+                    baseline.provenance,
+                )
+                if getattr(transport, "write_calls", 0) != writes_before:
+                    raise ConfigurationError(
+                        "artifact baseline state transition wrote remote"
+                    )
+                # Baseline advances generation: reviewed freeze is now stale.
+                # Re-bind expected_* so lock guard rejects unless baseline was a
+                # no-op relative to the reviewed generation (it is not).
+                source_plan = replace(
+                    source_plan,
+                    expected_before_state_id=current_state.state_id(),
+                    expected_generation=current_state.generation,
+                    expected_before_tree_id=current_state.source_tree_id,
+                    expected_before_applied_transition_ids=tuple(
+                        current_state.applied_transition_ids
+                    ),
+                )
+                artifact_plan = artifact_planner.plan(
+                    project, current_state, target_build.entry
+                )
+            combined = CombinedPlanner().combine(
+                current_state.files,
+                source_plan,
+                artifact_plan,
+            )
+            artifact_hashes = dict(combined.artifact_content_refs)
+            provenance = (
+                {
+                    "mode": "build",
+                    "build_fingerprint": target_build.fingerprint,
+                    "source_tree_id": source_plan.after_tree_id,
+                    "runner": project.build.runner,
+                    "artifacts": [
+                        {
+                            "path": item.destination,
+                            "content_sha256": item.content_sha256,
+                            "size": item.size,
+                            "executable": item.executable,
+                        }
+                        for item in target_build.entry.artifacts
+                    ],
+                },
+            )
+            if transport is None:
+                transport = open_cli_transport(dict(server.values))
+            worktrees = WorktreeManager(
+                project.repository,
+                target_root / "build" / "deploy-worktrees",
+            )
+            with worktrees.materialize(
+                source_plan.after_tree_id,
+                object_env=object_env,
+            ) as worktree:
+                refs: dict[str, FileContentRef] = {}
+                cache = build_service.cache
+                for operation in combined.files:
+                    if operation.action == "delete" or operation.target_sha256 is None:
+                        continue
+                    if operation.path in artifact_hashes:
+                        local = cache.cas.path_for(artifact_hashes[operation.path])
+                    else:
+                        local = worktree.path / operation.path
+                    refs[operation.path] = FileContentRef(
+                        local,
+                        operation.target_sha256,
+                        operation.target_size,
+                    )
+                provider = StreamingContentProvider(
+                    refs,
+                    target_root / "build" / "spool",
+                )
+                executor = StateDeploymentExecutor(
+                    project,
+                    identity,
+                    target_root,
+                    transport=transport,
+                    content_provider=provider,
+                )
+                result = executor.deploy(
+                    source_plan,
+                    list(combined.files),
+                    force=force,
+                    target_entries=combined.target_entries,
+                    artifact_provenance=provenance,
+                )
+            print(
+                f"[{project.name}] build "
+                f"{'cache hit' if target_build.cache_hit else 'completed'} "
+                f"fingerprint={target_build.fingerprint[:12]}"
+            )
+    finally:
+        close = getattr(transport, "close", None) if transport is not None else None
+        if callable(close):
+            close()
+
+    status = result.get("status", "unknown")
+    deployment_id = result.get("deployment_id", "")
+    generation = result.get("generation")
+    print(
+        f"[{project.name}] {status}"
+        + (f": {deployment_id}" if deployment_id else "")
+        + (f" generation={generation}" if generation is not None else "")
+    )
+    if result.get("restored") or result.get("ok") is False or status == "restored":
+        error = result.get("error") or "deploy restored after failure"
+        raise PolicyError(f"deployment failed: {error}")
+    if status not in {"succeeded", "already deployed", "reconciled"}:
+        raise PolicyError(f"deployment failed with status {status!r}")
+    app_status = (
+        ResultStatus.NOOP
+        if status == "already deployed"
+        else ResultStatus.SUCCEEDED
+    )
+    return ApplicationResult(
+        operation=request.operation,
+        remote=request.remote,
+        project=request.project,
+        side_effect=request.side_effect,
+        status=app_status,
+        summary=f"deployment {status}",
+        fields=(
+            ResultField("exit_code", 0),
+            ResultField("deployment_id", deployment_id or None),
+            ResultField("generation", generation),
+            ResultField("status", status),
+        ),
+    )
+
+
+def _assert_recomposed_matches_reviewed(recomposed: object, plan: object) -> None:
+    """Refuse when durable recompose diverges from the signed reviewed plan.
+
+    Args:
+        recomposed: Domain ``SourceDiffPlan`` rebuilt from frozen before + selectors.
+        plan: Reviewed ``RevisionPlanResult``.
+
+    Returns:
+        None.
+
+    Raises:
+        PolicyError: When transitions or exact file set differ from the review.
+    """
+
+    from .application import RevisionPlanResult
+    from .state_planner import SourceDiffPlan
+
+    if not isinstance(recomposed, SourceDiffPlan) or not isinstance(
+        plan, RevisionPlanResult
+    ):
+        raise TypeError("recomposed/plan types invalid")
+    if tuple(recomposed.introduced_transition_ids) != plan.introduced_transition_ids:
+        raise PolicyError(
+            "stale_plan: recomposed introduced transitions differ from reviewed plan; "
+            "re-plan required"
+        )
+    if plan.after_applied_transition_ids and tuple(
+        recomposed.applied_transition_ids
+    ) != plan.after_applied_transition_ids:
+        raise PolicyError(
+            "stale_plan: recomposed applied transitions differ from reviewed plan; "
+            "re-plan required"
+        )
+    reviewed = {
+        (
+            item.action,
+            item.path,
+            item.remote_path,
+            item.target_sha256,
+            item.expected_before_sha256,
+            item.target_size,
+            item.executable,
+        )
+        for item in plan.domain_files
+    }
+    actual = {
+        (
+            item.action,
+            item.path,
+            item.remote_path,
+            item.target_sha256,
+            item.expected_before_sha256,
+            item.target_size,
+            item.executable,
+        )
+        for item in recomposed.files
+    }
+    if reviewed != actual:
+        raise PolicyError(
+            "stale_plan: recomposed file set differs from reviewed plan; re-plan required"
+        )
 
 
 def _application_project_names(
@@ -1526,7 +1914,17 @@ def _run_rollback(config: AppConfig, args: argparse.Namespace) -> int:
         transport = open_cli_transport(dict(server.values))
         try:
             service.transport = transport  # type: ignore[assignment]
-            result = service.rollback_latest(force=bool(args.force))
+            # Bind the pre-selected manifest so concurrent newer latests cannot
+            # substitute under lock (legacy CLI path without application token).
+            result = service.rollback_latest(
+                force=bool(args.force),
+                expected_deployment_id=manifest.deployment_id,
+                expected_generation=(
+                    manifest.after_generation
+                    if manifest.after_generation is not None
+                    else None
+                ),
+            )
         finally:
             close = getattr(transport, "close", None)
             if callable(close):
@@ -1548,6 +1946,9 @@ def _run_application_latest_rollback(
 ) -> int:
     """Gate latest rollback through preview, policy, and worker services.
 
+    Execution forces the preview-bound ``deployment_id`` / generation under
+    target lock. It never re-selects a newer latest via ``_run_rollback``.
+
     Args:
         config: Loaded application configuration.
         args: Parsed non-dry-run latest rollback arguments.
@@ -1560,12 +1961,9 @@ def _run_application_latest_rollback(
 
     from .application import (
         ApplicationConfigService,
-        ApplicationResult,
         ApplicationWorker,
         LatestRollbackService,
         PlanTokenSigner,
-        ResultField,
-        ResultStatus,
         RollbackRequest,
         SideEffectLevel,
         StateInspectService,
@@ -1599,41 +1997,22 @@ def _run_application_latest_rollback(
                 force=bool(args.force),
             )
             signer = PlanTokenSigner(secrets.token_bytes(32))
-            nested_args = argparse.Namespace(**vars(args))
-            nested_args.target = project_name
-            nested_args.yes = True
-            nested_args._application_gated = True
 
             def execute_domain(
                 _request,
                 rollback_plan,
                 _emit,
                 *,
-                _args=nested_args,
-                _request_context=request,
-                _state=state_service,
+                _force=bool(args.force),
+                _config=config,
             ):
-                """Run the existing latest rollback transaction adapter."""
+                """Roll back the exact preview-bound deployment only."""
 
-                code = _run_rollback(config, _args)
-                if code:
-                    raise PolicyError(f"rollback failed with exit code {code}")
-                _selection, after_generation = _state.current_generation(
-                    _request_context.remote,
-                    _request_context.project,
-                )
-                return ApplicationResult(
-                    operation=_request_context.operation,
-                    remote=_request_context.remote,
-                    project=_request_context.project,
-                    side_effect=_request_context.side_effect,
-                    status=ResultStatus.SUCCEEDED,
-                    summary="latest rollback command completed",
-                    fields=(
-                        ResultField("deployment_id", rollback_plan.deployment_id),
-                        ResultField("generation", after_generation),
-                        ResultField("exit_code", code),
-                    ),
+                return _execute_reviewed_latest_rollback(
+                    _config,
+                    _request,
+                    rollback_plan,
+                    force=_force,
                 )
 
             service = LatestRollbackService(config_service, signer, execute_domain)
@@ -1677,6 +2056,117 @@ def _run_application_latest_rollback(
     finally:
         worker.shutdown()
     return 0
+
+
+def _execute_reviewed_latest_rollback(
+    config: AppConfig,
+    request: object,
+    plan: object,
+    *,
+    force: bool = False,
+) -> object:
+    """Execute the exact preview-bound latest rollback under target lock.
+
+    Passes ``expected_deployment_id`` and ``expected_generation`` into the
+    domain service so a concurrent newer successful deployment cannot be
+    substituted for the reviewed one.
+
+    Args:
+        config: Loaded application configuration.
+        request: Confirmed ``RollbackRequest``.
+        plan: Reviewed ``LatestRollbackPlan``.
+        force: Allow remote after-state drift.
+
+    Returns:
+        Structured ``ApplicationResult`` whose ``deployment_id`` equals the
+        actual ``rollback_of``.
+
+    Raises:
+        PolicyError: Stale plan or domain refusal.
+    """
+
+    from .application import (
+        ApplicationConfigService,
+        ApplicationResult,
+        LatestRollbackPlan,
+        ResultField,
+        ResultStatus,
+        RollbackRequest,
+    )
+    from .config import resolve_project_target
+    from .remote_verify import open_cli_transport
+    from .state_rollback import StateRollbackService
+    from .target_identity import default_state_base
+
+    if not isinstance(request, RollbackRequest):
+        raise TypeError("request must be a RollbackRequest")
+    if not isinstance(plan, LatestRollbackPlan):
+        raise TypeError("plan must be a LatestRollbackPlan")
+
+    config_service = ApplicationConfigService(config)
+    _alias, server, project, identity = config_service._resolve_domain_project(
+        request.remote,
+        request.project,
+    )
+    identity = resolve_project_target(server, project, config=config)
+    target_root = identity.state_root(
+        default_state_base(project.name, project.local_state_dir)
+    )
+    service = StateRollbackService(project, identity, target_root)
+    # Pre-connect: exact reviewed deployment must still be latest (zero transport).
+    try:
+        manifest = service.deploy_store.load(plan.deployment_id)
+    except Exception as exc:
+        raise PolicyError(
+            "stale_plan: reviewed deployment is no longer loadable; "
+            f"re-preview required: {exc}"
+        ) from exc
+    latest = service.deploy_store.latest_successful()
+    if latest.deployment_id != manifest.deployment_id:
+        raise PolicyError(
+            "stale_plan: reviewed deployment is no longer latest successful "
+            f"(expected {manifest.deployment_id}, latest {latest.deployment_id}); "
+            "re-preview required"
+        )
+    service.assert_rollback_eligible(manifest)
+
+    transport = open_cli_transport(dict(server.values))
+    try:
+        service.transport = transport  # type: ignore[assignment]
+        result = service.rollback_latest(
+            force=force,
+            expected_deployment_id=plan.deployment_id,
+            expected_generation=plan.generation,
+        )
+    finally:
+        close = getattr(transport, "close", None)
+        if callable(close):
+            close()
+
+    # Domain result is authoritative; never report a different deployment_id.
+    actual_id = result.deployment_id or plan.deployment_id
+    if actual_id != plan.deployment_id:
+        raise PolicyError(
+            "stale_plan: domain rolled back a different deployment than reviewed "
+            f"(expected {plan.deployment_id}, actual {actual_id})"
+        )
+    print(
+        f"[{project.name}] rolled back (stateful): generation={result.generation} "
+        f"paths={len(result.restored_paths)} deployment={actual_id}"
+    )
+    return ApplicationResult(
+        operation=request.operation,
+        remote=request.remote,
+        project=request.project,
+        side_effect=request.side_effect,
+        status=ResultStatus.SUCCEEDED,
+        summary="latest rollback command completed",
+        fields=(
+            ResultField("deployment_id", actual_id),
+            ResultField("generation", result.generation),
+            ResultField("exit_code", 0),
+        ),
+    )
 
 
 def _run_state(config: AppConfig, args: argparse.Namespace) -> int:
