@@ -14,7 +14,7 @@ from git_deploy.gitrepo import GitDeploymentPlanner, GitRepository
 from git_deploy.models import PlannedFile, ProjectConfig
 from git_deploy.state_composer import StateComposer, TransitionId
 from git_deploy.state_guards import StateGuards
-from git_deploy.state_planner import StatePlanner
+from git_deploy.state_planner import SourceDiffPlan, StatePlanner
 from git_deploy.target_identity import default_state_base
 
 from .config_service import ApplicationConfigService, ProjectSelection
@@ -63,8 +63,29 @@ class RevisionSelectionOrigin(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenDomainFile:
+    """Exact domain PlannedFile fields bound into the reviewed plan digest."""
+
+    action: str
+    path: str
+    remote_path: str
+    source_path: str | None
+    expected_before_sha256: str | None
+    target_sha256: str | None
+    target_size: int
+    executable: bool
+    expected_before_executable: bool | None
+
+
+@dataclass(frozen=True, slots=True)
 class RevisionPlanResult:
-    """Structured local plan shared by CLI and future TUI adapters."""
+    """Structured local plan shared by CLI and future TUI adapters.
+
+    Domain freeze fields (``before_state_id``, before applied transitions,
+    exact ``domain_files``, after applied set) are part of the signed plan.
+    Execution must reconstitute the same domain boundary and must not re-plan
+    against a later current generation.
+    """
 
     selection: ProjectSelection
     selection_origin: RevisionSelectionOrigin
@@ -82,6 +103,10 @@ class RevisionPlanResult:
     remote_verified: bool
     plan_digest: str
     plan_token: OperationPlanToken
+    before_state_id: str | None = None
+    before_applied_transition_ids: tuple[str, ...] = ()
+    after_applied_transition_ids: tuple[str, ...] = ()
+    domain_files: tuple[FrozenDomainFile, ...] = ()
 
 
 class RevisionPlanService:
@@ -149,6 +174,9 @@ class RevisionPlanService:
                 f"expected {request.expected_generation}, actual {actual_generation}"
             )
 
+        before_state_id: str | None = None
+        before_applied: tuple[str, ...] = ()
+        after_applied: tuple[str, ...] = ()
         if loaded is None:
             if not request.revisions:
                 revision_command = (
@@ -185,8 +213,11 @@ class RevisionPlanService:
             excluded_paths = tuple(item.path for item in source.excluded)
             introduced: tuple[str, ...] = ()
             static_noop = not files
+            domain_files = tuple(_freeze_domain_file(item) for item in files)
         else:
             _pointer, state = loaded
+            before_state_id = state.state_id()
+            before_applied = tuple(state.applied_transition_ids)
             StateGuards(
                 target_root,
                 identity,
@@ -228,6 +259,8 @@ class RevisionPlanService:
             excluded_paths = tuple(item.path for item in source.excluded)
             introduced = source.introduced_transition_ids
             static_noop = source.static_noop
+            after_applied = tuple(source.applied_transition_ids)
+            domain_files = tuple(_freeze_domain_file(item) for item in files)
 
         changes = tuple(_planned_change(item) for item in files)
         artifacts = tuple(
@@ -247,6 +280,10 @@ class RevisionPlanService:
             introduced,
             selection_origin,
             resolved_revisions,
+            before_state_id=before_state_id,
+            before_applied_transition_ids=before_applied,
+            after_applied_transition_ids=after_applied,
+            domain_files=domain_files,
         )
         token = self._signer.issue(
             request,
@@ -270,7 +307,59 @@ class RevisionPlanService:
             remote_verified=False,
             plan_digest=digest,
             plan_token=token,
+            before_state_id=before_state_id,
+            before_applied_transition_ids=before_applied,
+            after_applied_transition_ids=after_applied,
+            domain_files=domain_files,
         )
+
+
+def to_frozen_source_diff_plan(plan: RevisionPlanResult) -> SourceDiffPlan:
+    """Rebuild the exact domain SourceDiffPlan bound by a reviewed application plan.
+
+    Does not re-read live current or re-resolve revision selectors. Execution
+    paths must use this (or an equivalent freeze) so TargetLock freshness
+    compares against the operator-reviewed boundary.
+
+    Args:
+        plan: Signed application revision plan.
+
+    Returns:
+        Domain source plan with lock-held expected_* fields from the review.
+    """
+
+    files = tuple(
+        PlannedFile(
+            action=item.action,
+            path=item.path,
+            remote_path=item.remote_path,
+            source_path=item.source_path,
+            expected_before_sha256=item.expected_before_sha256,
+            target_sha256=item.target_sha256,
+            target_size=item.target_size,
+            executable=item.executable,
+            expected_before_executable=item.expected_before_executable,
+        )
+        for item in plan.domain_files
+    )
+    return SourceDiffPlan(
+        before_tree_id=plan.before_tree_id,
+        after_tree_id=plan.after_tree_id,
+        files=files,
+        excluded=(),
+        introduced_transition_ids=plan.introduced_transition_ids,
+        applied_transition_ids=plan.after_applied_transition_ids
+        or plan.before_applied_transition_ids,
+        remote_unverified=False,
+        static_noop=plan.static_noop,
+        revision_specs=plan.resolved_revisions,
+        expected_before_state_id=plan.before_state_id,
+        expected_generation=plan.generation,
+        expected_before_tree_id=plan.before_tree_id,
+        expected_before_applied_transition_ids=plan.before_applied_transition_ids
+        if plan.before_state_id is not None or plan.generation is not None
+        else None,
+    )
 
 
 def _effective_revisions(
@@ -366,6 +455,22 @@ def _planned_change(item: PlannedFile) -> PlannedChange:
     )
 
 
+def _freeze_domain_file(item: PlannedFile) -> FrozenDomainFile:
+    """Capture exact domain file mutation fields for digest and execution."""
+
+    return FrozenDomainFile(
+        action=item.action,
+        path=item.path,
+        remote_path=item.remote_path,
+        source_path=item.source_path,
+        expected_before_sha256=item.expected_before_sha256,
+        target_sha256=item.target_sha256,
+        target_size=item.target_size,
+        executable=item.executable,
+        expected_before_executable=item.expected_before_executable,
+    )
+
+
 def _build_summary(
     project: ProjectConfig,
 ) -> tuple[BuildPlanSummary, tuple[str, ...]]:
@@ -420,6 +525,11 @@ def _plan_digest(
     introduced: tuple[str, ...],
     selection_origin: RevisionSelectionOrigin,
     resolved_revisions: tuple[str, ...],
+    *,
+    before_state_id: str | None = None,
+    before_applied_transition_ids: tuple[str, ...] = (),
+    after_applied_transition_ids: tuple[str, ...] = (),
+    domain_files: tuple[FrozenDomainFile, ...] = (),
 ) -> str:
     """Hash the exact renderer-neutral plan reviewed by an operator."""
 
@@ -428,6 +538,9 @@ def _plan_digest(
         "physical_fingerprint": selection.physical_fingerprint,
         "policy_fingerprint": selection.policy_fingerprint,
         "generation": generation,
+        "before_state_id": before_state_id,
+        "before_applied_transition_ids": list(before_applied_transition_ids),
+        "after_applied_transition_ids": list(after_applied_transition_ids),
         "selection_origin": selection_origin.value,
         "resolved_revisions": list(resolved_revisions),
         "before_tree": before_tree,
@@ -440,6 +553,20 @@ def _plan_digest(
                 "executable": item.executable,
             }
             for item in changes
+        ],
+        "domain_files": [
+            {
+                "action": item.action,
+                "path": item.path,
+                "remote_path": item.remote_path,
+                "source_path": item.source_path,
+                "expected_before_sha256": item.expected_before_sha256,
+                "target_sha256": item.target_sha256,
+                "target_size": item.target_size,
+                "executable": item.executable,
+                "expected_before_executable": item.expected_before_executable,
+            }
+            for item in domain_files
         ],
         "artifacts": [
             {

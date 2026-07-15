@@ -195,6 +195,7 @@ def test_latest_rollback_restores_bytes_and_generation(tmp_path: Path) -> None:
     assert result.status == "succeeded"
     assert transport.files["/srv/a.txt"].data == b"before"
     assert result.generation == 3
+    assert result.deployment_id == latest.deployment_id
     current = store.read_current()
     assert current is not None
     state = store.read_state(current.state_id)
@@ -202,6 +203,87 @@ def test_latest_rollback_restores_bytes_and_generation(tmp_path: Path) -> None:
         state.applied_transition_ids
     )
     assert "t0" in state.applied_transition_ids
+
+
+def test_rollback_latest_expected_deployment_stale_when_newer_exists(
+    tmp_path: Path,
+) -> None:
+    """§8.2 domain: expected_deployment_id that is no longer latest → stale_plan."""
+
+    service, transport, store, _identity, _older, latest = _setup(tmp_path)
+    writes_before = transport.write_calls
+    # Insert a newer successful deployment so latest is no longer `latest`.
+    current = store.load_current_state()
+    assert current is not None
+    pointer, cur_state = current
+    newer_state = build_expected_state(
+        generation=pointer.generation + 1,
+        parent_state_id=pointer.state_id,
+        source_tree_id=cur_state.source_tree_id,
+        applied_transition_ids=cur_state.applied_transition_ids + ("t2",),
+        physical_fingerprint=cur_state.physical_fingerprint,
+        policy_fingerprint=cur_state.policy_fingerprint,
+        files=cur_state.files,
+        deployment_id="20200101T000002Z-newer",
+    )
+    store.cas_advance(expected_generation=pointer.generation, state=newer_state)
+    service.deploy_store.write_manifest(
+        DeploymentManifest(
+            deployment_id="20200101T000002Z-newer",
+            project="demo",
+            repository=str(service.project.repository),
+            remote_root="/srv",
+            from_commit="c",
+            to_commit="d",
+            created_at="t3",
+            status="succeeded",
+            snapshots=[
+                FileSnapshot(
+                    path="a.txt",
+                    remote_path="/srv/a.txt",
+                    before_exists=True,
+                    before_sha256=hashlib.sha256(b"after").hexdigest(),
+                    backup_file=service.deploy_store.write_backup(
+                        "20200101T000002Z-newer", 0, b"after"
+                    ),
+                    after_exists=True,
+                    after_sha256=hashlib.sha256(b"after2").hexdigest(),
+                )
+            ],
+            state="v1",
+            before_state_id=pointer.state_id,
+            after_state_id=newer_state.state_id(),
+            before_generation=pointer.generation,
+            after_generation=newer_state.generation,
+            introduced_transition_ids=["t2"],
+        )
+    )
+    transport.files["/srv/a.txt"] = FakeRemotePath(b"after2")
+
+    with pytest.raises(PolicyError, match="stale_plan"):
+        service.rollback_latest(
+            expected_deployment_id=latest.deployment_id,
+            expected_generation=2,
+        )
+    assert transport.write_calls == writes_before
+    assert transport.files["/srv/a.txt"].data == b"after2"
+    assert store.read_current().generation == 3  # type: ignore[union-attr]
+
+
+def test_rollback_latest_expected_id_success_reports_same_deployment(
+    tmp_path: Path,
+) -> None:
+    """§8.2 domain success: result.deployment_id equals actual rollback_of."""
+
+    service, transport, store, _identity, _older, latest = _setup(tmp_path)
+    result = service.rollback_latest(
+        expected_deployment_id=latest.deployment_id,
+        expected_generation=2,
+    )
+    assert result.status == "succeeded"
+    assert result.deployment_id == latest.deployment_id
+    assert transport.files["/srv/a.txt"].data == b"before"
+    assert result.generation == 3
 
 
 def test_rollback_after_match_allows_default(tmp_path: Path) -> None:
