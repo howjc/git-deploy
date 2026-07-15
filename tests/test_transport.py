@@ -97,6 +97,7 @@ def _fake_sftp_transport(
     transport._sftp = client
     transport._permissions = policy
     transport._directories = set()
+    transport._posix_rename_supported = None
 
     def execute(command: str) -> tuple[int, str, str]:
         """Capture a successful ownership command."""
@@ -274,6 +275,107 @@ def test_sftp_ownership_failure_cleans_temp_without_publishing() -> None:
     assert any(action[0] == "remove" for action in client.actions)
 
 
+class _NoPosixRenameSftpClient(_FakeSftpClient):
+    """Fake client whose ``posix_rename`` always reports the extension itself
+    as unsupported, and whose plain ``rename``/``stat`` model live targets."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.targets: set[str] = set()
+
+    def stat(self, path: str) -> object:
+        self.actions.append(("stat", path))
+        if path in self.directories or path in self.targets:
+            return object()
+        raise FileNotFoundError(path)
+
+    def posix_rename(self, source: str, target: str) -> None:
+        self.actions.append(("posix_rename", source, target))
+        raise OSError("SSH_FX_OP_UNSUPPORTED: server does not support this extension")
+
+    def rename(self, source: str, target: str) -> None:
+        self.actions.append(("rename", source, target))
+        self.targets.discard(source)
+        self.targets.add(target)
+
+    def remove(self, path: str) -> None:
+        super().remove(path)
+        self.targets.discard(path)
+
+
+class _GenericFailureSftpClient(_NoPosixRenameSftpClient):
+    """Fake client whose ``posix_rename`` fails with an ambiguous, generic
+    error (no "unsupported"-style wording) — the same shape a real server
+    returns for a plain SSH_FX_FAILURE, which paramiko cannot distinguish
+    from a genuinely-missing extension by errno alone."""
+
+    def posix_rename(self, source: str, target: str) -> None:
+        self.actions.append(("posix_rename", source, target))
+        raise OSError("Failure")
+
+
+def test_sftp_posix_rename_unsupported_falls_back_to_safe_backup_swap() -> None:
+    """P1-06: server-reported unsupported extension uses a non-destructive fallback."""
+
+    transport = SftpTransport.__new__(SftpTransport)
+    client = _NoPosixRenameSftpClient()
+    client.directories.add("/srv/app")
+    client.targets.add("/srv/app/config.php")
+    transport._sftp = client
+    transport._permissions = SftpPermissionPolicy()
+    transport._directories = {"/srv/app"}
+    transport._posix_rename_supported = None
+    transport.execute = lambda command: (0, "", "")  # type: ignore[method-assign]
+
+    transport.replace_file("/srv/app/config.php", b"payload")
+
+    assert transport._posix_rename_supported is False
+    rename_targets = [action[2] for action in client.actions if action[0] == "rename"]
+    # remote_path -> backup, then temporary -> remote_path (never a blind delete).
+    assert rename_targets[0].startswith("/srv/app/config.php.git-deploy-")
+    assert rename_targets[1] == "/srv/app/config.php"
+    assert not any(
+        action[0] == "remove" and action[1] == "/srv/app/config.php"
+        for action in client.actions
+    )
+    assert client.targets == {"/srv/app/config.php"}
+
+    # A second publish on the same connection must skip posix_rename entirely.
+    client.actions.clear()
+    transport.replace_file("/srv/app/config.php", b"payload-2")
+    assert not any(action[0] == "posix_rename" for action in client.actions)
+
+
+def test_sftp_posix_rename_generic_failure_still_falls_back_safely() -> None:
+    """P1-06: an ambiguous/generic posix_rename failure (no "unsupported"
+    wording) must not be treated differently from an explicit one — it still
+    uses the non-destructive backup-swap instead of permanently hard-failing
+    every future write on this connection."""
+
+    transport = SftpTransport.__new__(SftpTransport)
+    client = _GenericFailureSftpClient()
+    client.directories.add("/srv/app")
+    client.targets.add("/srv/app/config.php")
+    transport._sftp = client
+    transport._permissions = SftpPermissionPolicy()
+    transport._directories = {"/srv/app"}
+    transport._posix_rename_supported = None
+    transport.execute = lambda command: (0, "", "")  # type: ignore[method-assign]
+
+    transport.replace_file("/srv/app/config.php", b"payload")
+
+    assert transport._posix_rename_supported is False
+    rename_targets = [action[2] for action in client.actions if action[0] == "rename"]
+    assert rename_targets[0].startswith("/srv/app/config.php.git-deploy-")
+    assert rename_targets[1] == "/srv/app/config.php"
+    assert client.targets == {"/srv/app/config.php"}
+
+    # A second write must not hard-fail forever after one ambiguous failure.
+    client.actions.clear()
+    transport.replace_file("/srv/app/config.php", b"payload-2")
+    assert not any(action[0] == "posix_rename" for action in client.actions)
+
+
 def test_public_identity_selects_only_matching_agent_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -421,6 +523,34 @@ def test_build_ftps_ssl_context_custom_ca(tmp_path: Path) -> None:
     assert context.check_hostname is True
 
 
+def test_build_ftps_ssl_context_corrupt_ca_pem_raises_configuration_error(
+    tmp_path: Path,
+) -> None:
+    """P1-08: a corrupt CA PEM must surface as ConfigurationError, not a raw ssl.SSLError."""
+
+    from git_deploy.transport import build_ftps_ssl_context
+
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_bytes(b"not a real certificate")
+
+    with pytest.raises(ConfigurationError, match="invalid FTPS TLS configuration"):
+        build_ftps_ssl_context({"tls_ca_file": str(ca_path), "tls_verify": True})
+
+
+def test_build_ftps_ssl_context_missing_ca_file_raises_configuration_error(
+    tmp_path: Path,
+) -> None:
+    """P1-08: a CA file that vanished between config load and connect is still
+    reported as a structured configuration error."""
+
+    from git_deploy.transport import build_ftps_ssl_context
+
+    missing = tmp_path / "does-not-exist.pem"
+
+    with pytest.raises(ConfigurationError, match="invalid FTPS TLS configuration"):
+        build_ftps_ssl_context({"tls_ca_file": str(missing), "tls_verify": True})
+
+
 def test_ftps_connect_rejects_untrusted_certificate(tmp_path: Path) -> None:
     """FtpTransport with verified context fails against an untrusted self-signed server."""
 
@@ -532,6 +662,259 @@ def test_ftps_hostname_mismatch_fails_with_verified_context(tmp_path: Path) -> N
     context = build_ftps_ssl_context({"tls_verify": True})
     assert context.check_hostname is True
     assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+def _generate_test_certificate(
+    tmp_path: Path,
+    name: str,
+    *,
+    common_name: str = "127.0.0.1",
+    san_ip: str | None = "127.0.0.1",
+    not_before_days: int = -1,
+    not_after_days: int = 30,
+):
+    """Write a self-signed cert/key pair and return (cert_path, key_path).
+
+    Args:
+        tmp_path: Directory to write the PEM files into.
+        name: File name stem (``{name}.pem`` / ``{name}-key.pem``).
+        common_name: Certificate subject/issuer common name.
+        san_ip: Optional SAN IP address entry (``None`` omits the extension).
+        not_before_days: Validity start, in days relative to now.
+        not_after_days: Validity end, in days relative to now.
+
+    Returns:
+        Tuple of written certificate and private key paths.
+    """
+
+    import ipaddress
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        pytest.skip("cryptography package required for TLS fixture")
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) + timedelta(days=not_before_days))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=not_after_days))
+    )
+    if san_ip is not None:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.IPv4Address(san_ip))]),
+            critical=False,
+        )
+    cert = builder.sign(key, hashes.SHA256())
+    cert_path = tmp_path / f"{name}.pem"
+    key_path = tmp_path / f"{name}-key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path
+
+
+class _RealFtpsServer:
+    """A real explicit-FTPS server (pyftpdlib) for protocol-level tests.
+
+    Requires TLS on both control and data channels, exactly like a hardened
+    production FTPS host — this is what proves git-deploy's client actually
+    completes AUTH TLS / PBSZ / PROT P and a TLS-wrapped data channel, not
+    just that an ``ssl.SSLContext`` was built with the right flags.
+    """
+
+    def __init__(self, tmp_path: Path, cert_path: Path, key_path: Path):
+        """Start serving ``tmp_path/ftproot`` over explicit FTPS on 127.0.0.1.
+
+        Args:
+            tmp_path: Test temp directory (home dir lives under it).
+            cert_path: Server certificate PEM.
+            key_path: Server private key PEM.
+        """
+
+        try:
+            from pyftpdlib.authorizers import DummyAuthorizer
+            from pyftpdlib.handlers.ftps.control import TLS_FTPHandler
+            from pyftpdlib.servers import FTPServer
+        except ImportError:
+            pytest.skip("pyftpdlib/pyOpenSSL required for real FTPS protocol tests")
+
+        import threading
+
+        self.home_dir = tmp_path / "ftproot"
+        self.home_dir.mkdir(exist_ok=True)
+        authorizer = DummyAuthorizer()
+        authorizer.add_user("u", "p", str(self.home_dir), perm="elradfmwMT")
+
+        handler = type("_TestTLSHandler", (TLS_FTPHandler,), {})
+        handler.certfile = str(cert_path)
+        handler.keyfile = str(key_path)
+        handler.tls_control_required = True
+        handler.tls_data_required = True
+        handler.authorizer = authorizer
+        handler.passive_ports = range(60100, 60200)
+        handler.banner = "test-ftps-server ready"
+
+        self._server = FTPServer(("127.0.0.1", 0), handler)
+        self.port = self._server.address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        """Stop the background server thread."""
+
+        self._server.close_all()
+        self._thread.join(timeout=3)
+
+    def __enter__(self) -> "_RealFtpsServer":
+        """Return self for ``with`` usage."""
+
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        """Stop the server on context exit."""
+
+        del args
+        self.close()
+
+
+def test_ftps_full_roundtrip_over_real_tls_server(tmp_path: Path) -> None:
+    """P1-07: trusted CA + matching SAN completes a real AUTH TLS handshake,
+    PROT P data channel, and full STOR/RETR/DELE roundtrip."""
+
+    from git_deploy.transport import FtpTransport
+
+    cert_path, key_path = _generate_test_certificate(tmp_path, "server")
+    with _RealFtpsServer(tmp_path, cert_path, key_path) as server:
+        transport = FtpTransport(
+            {
+                "host": "127.0.0.1",
+                "port": server.port,
+                "username": "u",
+                "password": "p",
+                "timeout": 5,
+                "tls_ca_file": str(cert_path),
+                "tls_verify": True,
+                "passive": True,
+            },
+            use_tls=True,
+        )
+        try:
+            payload = b"real ftps roundtrip payload" * 100
+            transport.replace_file("/upload.txt", payload)
+            assert (server.home_dir / "upload.txt").read_bytes() == payload
+            assert transport.read_file("/upload.txt") == payload
+            # P1-06: overwrite an existing file through the real server —
+            # exercises the non-destructive backup-swap branch, not just the
+            # fresh-path STOR/rename above.
+            replacement = b"replaced content over an existing live file"
+            transport.replace_file("/upload.txt", replacement)
+            assert (server.home_dir / "upload.txt").read_bytes() == replacement
+            assert transport.read_file("/upload.txt") == replacement
+            leftover = [p.name for p in server.home_dir.iterdir() if p.name != "upload.txt"]
+            assert leftover == [], f"backup/temp files leaked: {leftover}"
+            transport.delete_file("/upload.txt")
+            assert transport.read_file("/upload.txt") is None
+        finally:
+            transport.close()
+
+
+def test_ftps_expired_certificate_rejected_by_real_server(tmp_path: Path) -> None:
+    """P1-07: a verified context refuses an actually-expired server certificate."""
+
+    from git_deploy.errors import GitDeployError
+    from git_deploy.transport import FtpTransport
+
+    cert_path, key_path = _generate_test_certificate(
+        tmp_path, "expired", not_before_days=-30, not_after_days=-1
+    )
+    with _RealFtpsServer(tmp_path, cert_path, key_path) as server:
+        with pytest.raises(GitDeployError, match="FTP connection failed|certificate|SSL|ssl"):
+            FtpTransport(
+                {
+                    "host": "127.0.0.1",
+                    "port": server.port,
+                    "username": "u",
+                    "password": "p",
+                    "timeout": 5,
+                    "tls_ca_file": str(cert_path),
+                    "tls_verify": True,
+                },
+                use_tls=True,
+            )
+
+
+def test_ftps_real_hostname_mismatch_rejected(tmp_path: Path) -> None:
+    """P1-07: a verified context refuses a certificate issued for a different host,
+    proving the handshake actually enforces hostname checking end to end."""
+
+    from git_deploy.errors import GitDeployError
+    from git_deploy.transport import FtpTransport
+
+    cert_path, key_path = _generate_test_certificate(
+        tmp_path,
+        "wrong-host",
+        common_name="not-the-server.invalid",
+        san_ip="10.255.255.254",
+    )
+    with _RealFtpsServer(tmp_path, cert_path, key_path) as server:
+        with pytest.raises(GitDeployError, match="FTP connection failed|certificate|SSL|ssl"):
+            FtpTransport(
+                {
+                    "host": "127.0.0.1",
+                    "port": server.port,
+                    "username": "u",
+                    "password": "p",
+                    "timeout": 5,
+                    "tls_ca_file": str(cert_path),
+                    "tls_verify": True,
+                },
+                use_tls=True,
+            )
+
+
+def test_ftps_tls_verify_false_connects_despite_untrusted_certificate(
+    tmp_path: Path,
+) -> None:
+    """P1-07: the documented tls_verify=false escape hatch really does connect
+    through a certificate that would otherwise fail verification."""
+
+    from git_deploy.transport import FtpTransport
+
+    cert_path, key_path = _generate_test_certificate(tmp_path, "self-signed")
+    with _RealFtpsServer(tmp_path, cert_path, key_path) as server:
+        # No tls_ca_file configured: default verification would reject this
+        # self-signed certificate outright.
+        transport = FtpTransport(
+            {
+                "host": "127.0.0.1",
+                "port": server.port,
+                "username": "u",
+                "password": "p",
+                "timeout": 5,
+                "tls_verify": False,
+            },
+            use_tls=True,
+        )
+        try:
+            transport.replace_file("/insecure.txt", b"data")
+            assert transport.read_file("/insecure.txt") == b"data"
+        finally:
+            transport.close()
 
 
 @pytest.mark.parametrize("protocol", ["sftp", "ftp", "ftps"])

@@ -237,11 +237,19 @@ class ProjectDoctorChecks:
 
         failures: list[str] = []
         counts: list[tuple[str, int]] = []
+        rollback_event_counts: list[tuple[str, int]] = []
         for name, project, _identity, target_root in self._targets(request):
             deployment_root = target_root / "deployments"
             count = 0
+            rollback_events = 0
             for directory in sorted(deployment_root.glob("*")):
                 if not directory.is_dir():
+                    continue
+                if directory.name.startswith("rb-"):
+                    # P1-04: rollback recovery evidence (pre-rollback backup
+                    # bytes captured by StateRollbackService), not a deployment
+                    # record — it has no manifest.json by design.
+                    rollback_events += 1
                     continue
                 count += 1
                 manifest_path = directory / "manifest.json"
@@ -278,6 +286,7 @@ class ProjectDoctorChecks:
                 except Exception as exc:
                     failures.append(f"{name}/{directory.name}: {exc}")
             counts.append((name, count))
+            rollback_event_counts.append((name, rollback_events))
         return DoctorCheckResult.create(
             check_id="state.manifests",
             category=DoctorCheckCategory.STATE,
@@ -288,7 +297,11 @@ class ProjectDoctorChecks:
                 else "all deployment manifests and referenced backups are readable"
             ),
             side_effect=SideEffectLevel.LOCAL_READ,
-            context={"deployment_counts": counts, "corrupt_count": len(failures)},
+            context={
+                "deployment_counts": counts,
+                "corrupt_count": len(failures),
+                "rollback_event_counts": rollback_event_counts,
+            },
             suggested_action=(
                 "inspect the listed manifest paths and restore them from a trusted backup"
                 if failures

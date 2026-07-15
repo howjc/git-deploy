@@ -13,6 +13,16 @@ class PolicyError(GitDeployError):
     exit_code = 2
 
 
+class StalePlanError(PolicyError):
+    """Report that a reviewed/signed plan no longer matches execution facts.
+
+    Single stable type for every stale-plan rejection (application token
+    mismatch, lock-held domain freshness gate, rollback exact-binding
+    drift) so CLI/application error mapping does not depend on matching
+    the ``stale_plan`` message substring.
+    """
+
+
 class RemoteDriftError(GitDeployError):
     """Report remote bytes that do not match the declared source commit."""
 

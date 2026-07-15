@@ -10,11 +10,10 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any
 
+from ..errors import StalePlanError
 from .models import OperationRequest
 
-
-class StalePlanError(ValueError):
-    """Raised when an operation plan token no longer matches execution facts."""
+__all__ = ["OperationPlanToken", "PlanTokenSigner", "StalePlanError", "confirmation_policy_fingerprint"]
 
 
 @dataclass(frozen=True, slots=True)

@@ -1476,6 +1476,11 @@ local_state_dir = ".state/demo"
         ),
     )
     store.cas_advance(expected_generation=None, state=gen1)
+    # P1-01: a stale reviewed plan must leave zero durable Git object footprint.
+    objects_dir = root / "git" / "objects"
+    objects_before = sorted(
+        p.relative_to(objects_dir) for p in objects_dir.rglob("*") if p.is_file()
+    )
 
     transport = InMemoryTransport()
     transport.files["/srv/demo/file.txt"] = FakeRemotePath(body)
@@ -1561,6 +1566,13 @@ local_state_dir = ".state/demo"
         )
         # Remote content must remain the concurrent actor's world (base bytes).
         assert transport.files["/srv/demo/file.txt"].data == body
+        objects_after = sorted(
+            p.relative_to(objects_dir) for p in objects_dir.rglob("*") if p.is_file()
+        )
+        assert objects_after == objects_before, (
+            "P1-01: stale plan rejection must not durably materialize the "
+            f"reviewed tree's Git objects (before={objects_before} after={objects_after})"
+        )
     finally:
         set_cli_transport_factory(None)
 
@@ -4680,3 +4692,141 @@ kind = "tree"
     after_rollback = store.load_current_state()
     assert after_rollback is not None and after_rollback[1].generation == 4
     assert after_rollback[1].artifacts[0]["mode"] == "known_source"
+
+
+def test_first_artifact_baseline_deploy_failure_does_not_report_self_stale_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P0 audit regression: a first-time artifact baseline is a durable, separate CAS
+    transition (generation N -> N+1). If the *same* deploy command's own remote
+    mutation then fails, the failure must be reported as an ordinary deploy
+    failure (not `stale_plan`, which would wrongly suggest the reviewed plan
+    itself was invalidated by a race), current must stay pinned at the
+    already-committed baseline generation, and re-running the identical
+    command immediately afterward must succeed without any re-plan step.
+    """
+
+    import hashlib
+    import sys
+    from dataclasses import dataclass
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.target_identity import default_state_base, policy_fingerprint_for_project
+
+    @dataclass
+    class _FailFirstWriteTransport(InMemoryTransport):
+        """Fail the first real remote write only (baseline verify never writes)."""
+
+        fail_remaining: int = 0
+
+        def write_file(self, remote_path: str, data: bytes, executable: bool = False) -> None:
+            if self.fail_remaining > 0:
+                self.fail_remaining -= 1
+                raise RuntimeError(f"injected write failure for {remote_path}")
+            super().write_file(remote_path, data, executable=executable)
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.email", "t@e")
+    _git(repository, "config", "user.name", "T")
+    (repository / "build.py").write_text(
+        "from pathlib import Path\n"
+        "Path('dist').mkdir(exist_ok=True)\n"
+        "Path('dist/app.txt').write_text('artifact-' + Path('app.txt').read_text())\n",
+        encoding="utf-8",
+    )
+    (repository / "app.txt").write_text("old", encoding="utf-8")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-qm", "old")
+    old_commit = _git(repository, "rev-parse", "HEAD")
+    old_tree = _git(repository, "rev-parse", "HEAD^{tree}")
+    (repository / "app.txt").write_text("new", encoding="utf-8")
+    _git(repository, "add", "app.txt")
+    _git(repository, "commit", "-qm", "new")
+    new_commit = _git(repository, "rev-parse", "HEAD")
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "deploy.example"
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv"
+local_state_dir = ".state/demo"
+[projects.demo.build]
+commands = [["{sys.executable}", "build.py"]]
+[[projects.demo.artifacts]]
+source = "dist"
+destination = "public"
+kind = "tree"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote_name, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    git_store = PersistentGitStore(root, repository)
+    git_store.ensure_layout()
+    git_store._publish_repository_identity()
+    old_source = b"old"
+    old_artifact = b"artifact-old"
+    cas = ContentAddressedStore(root)
+    cas.put(old_source)
+    cas.put(old_artifact)
+    applied = (StateComposer(repository).transition_id_for_commit(old_commit).as_str(),)
+    current = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=old_tree,
+        applied_transition_ids=applied,
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(FileEntry("app.txt", "source", hashlib.sha256(old_source).hexdigest()),),
+        artifacts=(),
+    )
+    store = ExpectedStateStore(root, identity)
+    store.cas_advance(expected_generation=None, state=current)
+    remote = _FailFirstWriteTransport(fail_remaining=1)
+    remote.files["/srv/app.txt"] = FakeRemotePath(old_source)
+    remote.files["/srv/public/app.txt"] = FakeRemotePath(old_artifact)
+
+    set_cli_transport_factory(lambda _server: remote)
+    try:
+        exit_code = run(["deploy", "demo", "--revisions", new_commit, "--yes"])
+    finally:
+        set_cli_transport_factory(None)
+    err = capsys.readouterr().err
+    assert exit_code != 0
+    assert "stale_plan" not in err, f"first-baseline deploy failure must not self-report stale_plan: {err}"
+
+    after_failure = store.load_current_state()
+    assert after_failure is not None and after_failure[1].generation == 2, (
+        "baseline is a durable transition and must survive the failed deploy attempt"
+    )
+    assert after_failure[1].artifacts[0]["mode"] == "known_source"
+
+    # Re-run the identical command with no manual recovery step; baseline is
+    # already established so this becomes a plain retry of the failed upload.
+    set_cli_transport_factory(lambda _server: remote)
+    try:
+        assert run(["deploy", "demo", "--revisions", new_commit, "--yes"]) == 0
+    finally:
+        set_cli_transport_factory(None)
+    assert remote.files["/srv/app.txt"].data == b"new"
+    assert remote.files["/srv/public/app.txt"].data == b"artifact-new"
+    after_retry = store.load_current_state()
+    assert after_retry is not None and after_retry[1].generation == 3

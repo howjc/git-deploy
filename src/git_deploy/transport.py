@@ -239,6 +239,9 @@ class SftpTransport:
             self._ssh.close()
             raise GitDeployError(f"SFTP connection failed for {username}@{host}: {exc}") from exc
         self._directories: set[str] = set()
+        # Learned once per connection: None = unknown, True/False = confirmed
+        # by a prior posix_rename call on this session.
+        self._posix_rename_supported: bool | None = None
 
     def read_file(
         self,
@@ -336,20 +339,72 @@ class SftpTransport:
             )
             self._sftp.chmod(temporary, mode)
             self._set_ownership(temporary)
-            try:
-                self._sftp.posix_rename(temporary, remote_path)
-            except (OSError, IOError):
-                try:
-                    self._sftp.remove(remote_path)
-                except FileNotFoundError:
-                    pass
-                self._sftp.rename(temporary, remote_path)
+            self._publish_temporary(temporary, remote_path)
         except Exception as exc:
             try:
                 self._sftp.remove(temporary)
             except Exception:
                 pass
             raise GitDeployError(f"cannot replace remote file {remote_path}: {exc}") from exc
+
+    def _publish_temporary(self, temporary: str, remote_path: str) -> None:
+        """Atomically publish a staged temporary file over ``remote_path``.
+
+        Prefers the ``posix-rename@openssh.com`` extension. Any failure —
+        extension genuinely unsupported, permission denied, a transient
+        network/session error, or a generic server-side failure — falls back
+        to a non-destructive two-step rename instead of guessing whether the
+        specific error text means "unsupported". P1-06's safety property does
+        not depend on classifying *why* posix_rename failed: the fallback
+        itself never blindly deletes the live target. It swaps the current
+        target to a sibling backup name (itself an atomic rename), publishes
+        the new content, and restores the backup if the final rename fails —
+        so it is safe to attempt even when the original failure was
+        transient, and a server that lacks the extension but reports it with
+        unpredictable wording still gets a working, crash-safe deploy instead
+        of a permanent hard failure on every future write.
+
+        Args:
+            temporary: Already-written, chmod'd, owned temporary sibling path.
+            remote_path: Final destination path.
+
+        Returns:
+            None.
+        """
+
+        if self._posix_rename_supported is not False:
+            try:
+                self._sftp.posix_rename(temporary, remote_path)
+                self._posix_rename_supported = True
+                return
+            except (OSError, IOError):
+                # Remember only that posix_rename itself doesn't work on this
+                # connection (skip the redundant attempt next call); do not
+                # try to classify *why* — see docstring above.
+                self._posix_rename_supported = False
+
+        backup = remote_path + f".git-deploy-{os.getpid()}.bak"
+        try:
+            self._sftp.stat(remote_path)
+            target_existed = True
+        except FileNotFoundError:
+            target_existed = False
+        if target_existed:
+            self._sftp.rename(remote_path, backup)
+        try:
+            self._sftp.rename(temporary, remote_path)
+        except Exception:
+            if target_existed:
+                try:
+                    self._sftp.rename(backup, remote_path)
+                except Exception:
+                    pass
+            raise
+        if target_existed:
+            try:
+                self._sftp.remove(backup)
+            except Exception:
+                pass
 
     def list_files(self, remote_prefix: str) -> tuple[str, ...]:
         """Recursively list non-directory SFTP paths without following symlinks."""
@@ -531,6 +586,11 @@ def build_ftps_ssl_context(server: dict[str, Any]) -> Any:
 
     Returns:
         Configured ``ssl.SSLContext`` for ``ftplib.FTP_TLS``.
+
+    Raises:
+        ConfigurationError: P1-08: a missing CA/cert/key file, a corrupt PEM,
+            or a cert/key mismatch is reported as a structured configuration
+            error instead of a raw ``ssl.SSLError``/``OSError``.
     """
 
     import ssl
@@ -541,26 +601,32 @@ def build_ftps_ssl_context(server: dict[str, Any]) -> Any:
     cert_file = str(server.get("tls_cert_file") or server.get("cert_file") or "").strip() or None
     key_file = str(server.get("tls_key_file") or server.get("key_file") or "").strip() or None
 
-    if not verify:
-        warnings.warn(
-            "FTPS tls_verify=false disables server certificate and hostname "
-            "verification; credentials and payloads are exposed to MITM",
-            UserWarning,
-            stacklevel=2,
-        )
-        context = ssl._create_unverified_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+    try:
+        if not verify:
+            warnings.warn(
+                "FTPS tls_verify=false disables server certificate and hostname "
+                "verification; credentials and payloads are exposed to MITM",
+                UserWarning,
+                stacklevel=2,
+            )
+            context = ssl._create_unverified_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            if cert_file:
+                context.load_cert_chain(cert_file, key_file)
+            return context
+
+        context = ssl.create_default_context(cafile=ca_file)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
         if cert_file:
             context.load_cert_chain(cert_file, key_file)
         return context
-
-    context = ssl.create_default_context(cafile=ca_file)
-    context.verify_mode = ssl.CERT_REQUIRED
-    context.check_hostname = True
-    if cert_file:
-        context.load_cert_chain(cert_file, key_file)
-    return context
+    except (ssl.SSLError, OSError, ValueError) as exc:
+        raise ConfigurationError(
+            f"invalid FTPS TLS configuration (ca_file={ca_file!r} "
+            f"cert_file={cert_file!r} key_file={key_file!r}): {exc}"
+        ) from exc
 
 
 class FtpTransport:
@@ -691,7 +757,7 @@ class FtpTransport:
         executable: bool = False,
         progress: ByteProgress | None = None,
     ) -> None:
-        """Stream iterable chunks through FTP STOR and rename the temporary file."""
+        """Stream iterable chunks through FTP STOR, then publish via a safe rename swap."""
 
         del executable
         self._ensure_dir(posixpath.dirname(remote_path))
@@ -704,18 +770,53 @@ class FtpTransport:
                 blocksize=TRANSFER_BLOCK_SIZE,
                 callback=callback,
             )
-            try:
-                self._ftp.delete(remote_path)
-            except ftplib.error_perm as exc:
-                if not str(exc).startswith("550"):
-                    raise
-            self._ftp.rename(temporary, remote_path)
+            self._publish_temporary(temporary, remote_path)
         except Exception as exc:
             try:
                 self._ftp.delete(temporary)
             except Exception:
                 pass
             raise GitDeployError(f"cannot replace remote file {remote_path}: {exc}") from exc
+
+    def _publish_temporary(self, temporary: str, remote_path: str) -> None:
+        """Publish a staged temporary file over ``remote_path`` without ever
+        blindly deleting the live target first.
+
+        P1-06 also applies to plain FTP/FTPS: standard FTP has no atomic
+        rename-over-existing-file guarantee, so this swaps the current target
+        to a sibling backup name first (rather than deleting it outright),
+        publishes the new content, and restores the backup if the final
+        rename fails — the same non-destructive protocol used for SFTP.
+
+        Args:
+            temporary: Already-uploaded temporary sibling path.
+            remote_path: Final destination path.
+
+        Returns:
+            None.
+        """
+
+        backup = remote_path + f".git-deploy-{os.getpid()}.bak"
+        try:
+            target_existed = self._ftp.size(remote_path) is not None
+        except ftplib.all_errors:
+            target_existed = False
+        if target_existed:
+            self._ftp.rename(remote_path, backup)
+        try:
+            self._ftp.rename(temporary, remote_path)
+        except Exception:
+            if target_existed:
+                try:
+                    self._ftp.rename(backup, remote_path)
+                except Exception:
+                    pass
+            raise
+        if target_existed:
+            try:
+                self._ftp.delete(backup)
+            except Exception:
+                pass
 
     def list_files(self, remote_prefix: str) -> tuple[str, ...]:
         """Recursively list FTP paths using MLSD, treating a direct file as present."""

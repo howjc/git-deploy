@@ -12,7 +12,7 @@ from pathlib import Path
 from . import __version__
 from .application.errors import ApplicationError, ErrorCategory
 from .config import discover_config, load_config, select_remote
-from .errors import ConfigurationError, GitDeployError, PolicyError
+from .errors import ConfigurationError, GitDeployError, PolicyError, StalePlanError
 from .executor import DeploymentExecutor, RemoteCheck
 from .gitrepo import GitDeploymentPlanner
 from .models import AppConfig, DeploymentManifest, DeploymentPlan, ProjectConfig, ServerConfig
@@ -647,7 +647,7 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
                     != _request.expected_physical_fingerprint
                     or current_generation != _request.expected_generation
                 ):
-                    raise PolicyError(
+                    raise StalePlanError(
                         "stale_plan: target identity or generation changed before "
                         "deployment; re-plan required"
                     )
@@ -700,6 +700,14 @@ def _require_reviewed_plan_fresh_under_lock(
     This is the AC1 pre-connect gate: concurrent generation advance after the
     unlocked application precheck must fail here with zero transport factory
     calls. ``StateDeploymentExecutor.deploy`` still re-checks under its own lock.
+
+    P1-02: this function acquires and releases its own ``TargetLock`` instance
+    before the caller opens a transport. A concurrent generation advance in the
+    short unlocked window between this release and the domain executor's own
+    lock acquisition is still rejected — as ``stale_plan`` with zero remote
+    mutation — but is not guaranteed to happen before a transport connects.
+    Do not claim zero-connect for every possible race; only zero-mutation is
+    guaranteed end to end.
 
     Args:
         target_root: Target state root.
@@ -885,14 +893,17 @@ def _execute_reviewed_domain_deploy(
             ),
         )
 
+    # AC1 / P1-01: lock-held freshness BEFORE any transport factory / connect
+    # AND before any durable Git object materialization. A stale plan must
+    # leave zero footprint under target_root, including no durable objects
+    # written by this tool's own (otherwise legitimate) compose step.
+    _require_reviewed_plan_fresh_under_lock(target_root, identity, source_plan)
     # Local object materialization only (no plan_selectors, no live current).
     git_store, object_env, content_tree = _materialize_reviewed_object_env(
         project,
         target_root,
         plan,
     )
-    # AC1: lock-held freshness BEFORE any transport factory / connect.
-    _require_reviewed_plan_fresh_under_lock(target_root, identity, source_plan)
 
     transport = None
     try:
@@ -2141,13 +2152,13 @@ def _execute_reviewed_latest_rollback(
     try:
         manifest = service.deploy_store.load(plan.deployment_id)
     except Exception as exc:
-        raise PolicyError(
+        raise StalePlanError(
             "stale_plan: reviewed deployment is no longer loadable; "
             f"re-preview required: {exc}"
         ) from exc
     latest = service.deploy_store.latest_successful()
     if latest.deployment_id != manifest.deployment_id:
-        raise PolicyError(
+        raise StalePlanError(
             "stale_plan: reviewed deployment is no longer latest successful "
             f"(expected {manifest.deployment_id}, latest {latest.deployment_id}); "
             "re-preview required"
@@ -2170,7 +2181,7 @@ def _execute_reviewed_latest_rollback(
     # Domain result is authoritative; never report a different deployment_id.
     actual_id = result.deployment_id or plan.deployment_id
     if actual_id != plan.deployment_id:
-        raise PolicyError(
+        raise StalePlanError(
             "stale_plan: domain rolled back a different deployment than reviewed "
             f"(expected {plan.deployment_id}, actual {actual_id})"
         )

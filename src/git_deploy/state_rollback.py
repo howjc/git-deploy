@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import ConfigurationError, PolicyError
+from .errors import ConfigurationError, PolicyError, StalePlanError
 from .expected_state import ExpectedStateStore, FileEntry, build_expected_state
 from .models import DeploymentManifest, ProjectConfig
 from .state import DeploymentStore
-from .state_executor import InMemoryTransport
+from .state_executor import InMemoryTransport, restore_backup_entries, run_post_write_lifecycle
 from .target_identity import TargetIdentity, policy_fingerprint_for_project
 from .target_lock import TargetLock
 from .transaction import TransactionStore
@@ -234,6 +234,7 @@ class StateRollbackService:
         fail_after_writes: int | None = None,
         expected_deployment_id: str | None = None,
         expected_generation: int | None = None,
+        fail_at: str | None = None,
     ) -> RollbackResult:
         """Restore remote before bytes and CAS a new generation reflecting before lineage.
 
@@ -250,11 +251,19 @@ class StateRollbackService:
         latest successful and matches ``expected_generation``/current, and never
         silently re-selects a newer latest.
 
+        P1-05: once every snapshot is restored and read-back verified, the same
+        ``post_commands``/``health_urls`` lifecycle a deploy runs is applied here
+        too (caches/reload/health), before advancing to ``remote_verified`` and
+        CAS-ing current. If the lifecycle fails, the rollback-before remote bytes
+        (captured just before this rollback's own mutation) are restored and
+        generation is left unadvanced, matching the deploy failure contract.
+
         Args:
             force: Allow remote after-state drift (third-party content).
             fail_after_writes: Test-only injection for partial rollback crash.
             expected_deployment_id: Exact preview-bound deployment to roll back.
             expected_generation: Preview-bound current generation at plan time.
+            fail_at: Test-only lifecycle injection point ``hook`` or ``health``.
 
         Returns:
             Rollback result including the exact ``deployment_id`` rolled back.
@@ -268,7 +277,7 @@ class StateRollbackService:
                 raise PolicyError("no current state; use legacy rollback without state lineage")
             pointer, current_state = loaded
             if expected_generation is not None and pointer.generation != expected_generation:
-                raise PolicyError(
+                raise StalePlanError(
                     "stale_plan: current generation changed before rollback "
                     f"(expected {expected_generation}, actual {pointer.generation}); "
                     "re-preview required"
@@ -278,13 +287,13 @@ class StateRollbackService:
                 try:
                     manifest = self.deploy_store.load(expected_deployment_id)
                 except Exception as exc:
-                    raise PolicyError(
+                    raise StalePlanError(
                         "stale_plan: expected deployment is no longer loadable; "
                         f"re-preview required: {exc}"
                     ) from exc
                 latest = self.deploy_store.latest_successful()
                 if latest.deployment_id != manifest.deployment_id:
-                    raise PolicyError(
+                    raise StalePlanError(
                         "stale_plan: reviewed deployment is no longer latest successful "
                         f"(expected {manifest.deployment_id}, latest {latest.deployment_id}); "
                         "re-preview required"
@@ -294,8 +303,13 @@ class StateRollbackService:
             else:
                 # Same gates as CLI pre-connect path (after_state match + before readable).
                 manifest = self.assert_rollback_eligible()
-            # Lock-held after-state check before any durable write or mutation.
-            self._require_remote_after_state(manifest, force=force)
+            # P1-03: lock-held after-state check before any durable write or
+            # mutation, reading each remote path exactly once — the same
+            # observation is reused below for backup capture instead of a
+            # second independent read (eliminating that TOCTOU window).
+            observed_before_mutation = self._observe_remote_before_mutation(
+                manifest, force=force
+            )
             # v1 / lineage: before immutable state already validated; load for after build.
             # Snapshot-only fallback is limited to true legacy/no-lineage manifests.
             after = None
@@ -349,9 +363,11 @@ class StateRollbackService:
                     "before_exists": True,
                     "executable": bool(snapshot.after_executable),
                 }
-                # Capture real remote bytes (possibly third-party when force)
-                # so crash recovery restores pre-rollback remote, not manifest after.
-                data = self.transport.read_file(snapshot.remote_path)
+                # P1-03: reuse the single pre-mutation observation (possibly
+                # third-party content when force) instead of reading again, so
+                # crash recovery restores exactly the bytes that were live
+                # immediately before this rollback mutated anything.
+                data = observed_before_mutation.get(snapshot.remote_path)
                 if data is not None:
                     rel = self.deploy_store.write_backup(
                         f"rb-{manifest.deployment_id}",
@@ -407,12 +423,55 @@ class StateRollbackService:
                         raise RuntimeError(
                             f"injected partial rollback failure after {writes_done} write(s)"
                         )
+            except Exception as exc:
+                # Leave journal open at remote_mutating for recover; do not CAS.
+                raise PolicyError(
+                    f"rollback partial failure; run state recover: {exc}"
+                ) from exc
+
+            try:
+                # P1-05: same post-write lifecycle contract as deploy, run only
+                # after every snapshot write is durable and read-back verified.
+                run_post_write_lifecycle(self.transport, self.project, fail_at=fail_at)
+            except Exception as exc:
+                try:
+                    if not journal.deployment_id:
+                        raise ConfigurationError(
+                            "cannot restore rollback-before bytes: journal has no deployment_id"
+                        )
+                    restore_backup_entries(
+                        self.deploy_store,
+                        self.transport,
+                        journal.deployment_id,
+                        backup_entries,
+                    )
+                    journal = self.tx_store.advance(journal, "recovered")
+                except Exception as restore_exc:
+                    journal = self.tx_store.advance(
+                        journal,
+                        "manual_recovery_required",
+                        error=f"{exc}; restore failed: {restore_exc}",
+                    )
+                    raise PolicyError(
+                        "manual_recovery_required: automatic restore failed; "
+                        "rollback blocked"
+                    ) from restore_exc
+                raise PolicyError(
+                    "rollback lifecycle (post_commands/health_urls) failed; "
+                    f"rollback-before remote bytes restored, generation unchanged: {exc}"
+                ) from exc
+
+            try:
                 journal = self.tx_store.advance(journal, "remote_verified")
                 self.state_store.cas_advance(expected_generation=pointer.generation, state=after)
                 journal = self.tx_store.advance(journal, "state_committed")
                 journal = self.tx_store.advance(journal, "recovered")
             except Exception as exc:
-                # Leave journal open at remote_mutating for recover; do not CAS.
+                # Remote already reflects the rollback and lifecycle already
+                # ran; only the local journal/CAS bookkeeping failed. Leave a
+                # structured error and stable recovery guidance instead of an
+                # uncaught traceback — do not attempt a further remote
+                # mutation here (state recover owns finishing this journal).
                 raise PolicyError(
                     f"rollback partial failure; run state recover: {exc}"
                 ) from exc
@@ -425,33 +484,41 @@ class StateRollbackService:
                 deployment_id=manifest.deployment_id,
             )
 
-    def _require_remote_after_state(
+    def _observe_remote_before_mutation(
         self,
         manifest: DeploymentManifest,
         *,
         force: bool = False,
-    ) -> None:
-        """Verify remote matches each snapshot after-state before mutation.
+    ) -> dict[str, bytes | None]:
+        """Read each snapshot's remote bytes exactly once and verify after-state.
+
+        P1-03: this single read is the shared ``RemoteObservation`` reused by
+        the caller for backup capture immediately afterward — previously the
+        after-state drift check and the pre-rollback backup capture were two
+        independent reads with a live TOCTOU window between them.
 
         Args:
             manifest: Eligible latest deployment being rolled back.
             force: When true, allow third-party content and continue.
 
         Returns:
-            None.
+            Mapping of ``remote_path`` to observed bytes (``None`` when absent),
+            for reuse as backup content.
 
         Raises:
-            PolicyError: When remote drifts from after-state and force is false.
-            RemoteDriftError: Alias-style drift when force is false (stable code path).
+            RemoteDriftError: When remote drifts from after-state and force is false.
         """
 
         import hashlib
 
         from .errors import RemoteDriftError
 
+        observed: dict[str, bytes | None] = {}
         drifts: list[str] = []
+        checker = getattr(self.transport, "is_executable", None)
         for snapshot in manifest.snapshots:
             actual = self.transport.read_file(snapshot.remote_path)
+            observed[snapshot.remote_path] = actual
             if snapshot.after_exists:
                 if actual is None:
                     drifts.append(f"{snapshot.path}: missing (expected after content)")
@@ -463,7 +530,6 @@ class StateRollbackService:
                             f"{snapshot.path}: hash drift "
                             f"expected={snapshot.after_sha256[:12]} actual={actual_hash[:12]}"
                         )
-                checker = getattr(self.transport, "is_executable", None)
                 if (
                     callable(checker)
                     and snapshot.after_executable is not None
@@ -481,7 +547,7 @@ class StateRollbackService:
                 "rollback refused: remote after-state drift "
                 f"(use --force to overwrite third-party content): {detail}"
             )
-
+        return observed
 
     def _verify_rollback_snapshot(self, snapshot: Any) -> None:
         """Read-back verify one restored path against manifest before state.

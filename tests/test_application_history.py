@@ -112,3 +112,22 @@ def test_application_history_pages_selects_and_distinguishes_lineage(
     assert second.entries[0].lineage is HistoryLineage.LEGACY
     assert selected.entries[0].deployment_id == "20260713-legacy"
     assert first.corrupt_records == (str(corrupt),)
+
+
+def test_application_history_ignores_rollback_recovery_directories(
+    tmp_path: Path,
+) -> None:
+    """P1-04: an ``rb-<id>`` rollback recovery directory has no manifest.json
+    by design and must not be reported as a corrupt/missing deployment record."""
+
+    from git_deploy.application.history_service import _corrupt_manifest_paths
+
+    config, project, identity = _fixture(tmp_path)
+    target_root = identity.state_root(
+        default_state_base(project.name, project.local_state_dir)
+    )
+    DeploymentStore(project, root=target_root).write_backup(
+        "rb-20260714-stateful", 0, b"pre-rollback-bytes"
+    )
+
+    assert _corrupt_manifest_paths(target_root) == ()

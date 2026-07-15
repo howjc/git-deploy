@@ -170,6 +170,12 @@ def _corrupt_manifest_paths(root: Path) -> tuple[str, ...]:
     for directory in sorted(deployment_root.glob("*")):
         if not directory.is_dir():
             continue
+        if directory.name.startswith("rb-"):
+            # P1-04: rollback recovery evidence (StateRollbackService backups
+            # for the pre-rollback remote bytes), not a deployment record —
+            # it intentionally has no manifest.json and must not be reported
+            # as a corrupt/missing manifest.
+            continue
         path = directory / "manifest.json"
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))

@@ -105,9 +105,13 @@ def application_error_from_exception(
         GitDeployError,
         PolicyError,
         RemoteDriftError,
+        StalePlanError,
     )
 
-    if isinstance(error, ConfigurationError):
+    if isinstance(error, StalePlanError):
+        code = "operation.stale-plan"
+        category = ErrorCategory.POLICY
+    elif isinstance(error, ConfigurationError):
         code = "configuration.invalid"
         category = ErrorCategory.CONFIGURATION
     elif isinstance(error, PolicyError):

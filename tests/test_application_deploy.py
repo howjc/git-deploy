@@ -19,6 +19,7 @@ from git_deploy.application import (
     ResultStatus,
     RevisionPlanService,
     SideEffectLevel,
+    StalePlanError,
     TerminalResultEvent,
     TransactionStage,
     TransactionStageEvent,
@@ -210,7 +211,7 @@ def test_application_deploy_rejects_token_for_changed_request(tmp_path: Path) ->
         revisions=("HEAD~1",),
     )
 
-    with pytest.raises(ValueError, match="stale|reviewed"):
+    with pytest.raises(StalePlanError, match="stale|reviewed"):
         DeployService(signer, lambda *_args: None).execute(  # type: ignore[arg-type]
             changed,
             plan,

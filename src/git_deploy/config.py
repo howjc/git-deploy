@@ -86,18 +86,22 @@ def load_config(path: Path) -> AppConfig:
         if not isinstance(server, dict):
             raise ConfigurationError("server must be a table")
         load_sftp_permission_policy(server, location="server")
-        remotes = {"default": ServerConfig(dict(server))}
+        values = dict(server)
+        _resolve_ftps_tls_paths(values, base=path.parent, location="server")
+        remotes = {"default": ServerConfig(values)}
         default_remote: str | None = "default"
     else:
         if not isinstance(raw_remotes, dict) or not raw_remotes:
             raise ConfigurationError("configuration requires [server] or at least one [remotes.NAME]")
         remotes = {}
-        for name, values in raw_remotes.items():
+        for name, raw_values in raw_remotes.items():
             _validate_remote_name(name)
-            if not isinstance(values, dict):
+            if not isinstance(raw_values, dict):
                 raise ConfigurationError(f"remotes.{name} must be a table")
-            load_sftp_permission_policy(values, location=f"remotes.{name}")
-            remotes[name] = ServerConfig(dict(values))
+            load_sftp_permission_policy(raw_values, location=f"remotes.{name}")
+            values = dict(raw_values)
+            _resolve_ftps_tls_paths(values, base=path.parent, location=f"remotes.{name}")
+            remotes[name] = ServerConfig(values)
         configured_default = raw.get("default_remote")
         default_remote = str(configured_default).strip() if configured_default is not None else None
         if default_remote is not None and default_remote not in remotes:
@@ -762,6 +766,69 @@ def _env_name_tuple(value: Any, field: str) -> tuple[str, ...]:
         if not _ENV_NAME.fullmatch(name):
             raise ConfigurationError(f"{field} contains invalid name {name!r}")
     return names
+
+
+_FTPS_TLS_PATH_FIELDS = ("tls_ca_file", "tls_cert_file", "tls_key_file")
+# transport.py's build_ftps_ssl_context/ftps_tls_trust_digest also accept these
+# legacy, undocumented aliases (`server.get("tls_ca_file") or server.get("ca_file")`);
+# resolve/validate whichever key is actually present so neither name silently
+# skips the config-relative rule or the load-time existence check.
+_FTPS_TLS_PATH_ALIASES = {
+    "tls_ca_file": "ca_file",
+    "tls_cert_file": "cert_file",
+    "tls_key_file": "key_file",
+}
+
+
+def _resolve_ftps_tls_paths(values: dict[str, Any], *, base: Path, location: str) -> None:
+    """Resolve FTPS certificate paths config-relative and reject unreadable files.
+
+    P1-08: ``tls_ca_file``/``tls_cert_file``/``tls_key_file`` (and their
+    ``ca_file``/``cert_file``/``key_file`` aliases, scoped to ``protocol =
+    "ftps"`` entries only so they never touch SFTP's unrelated ``key_file``)
+    must follow the same "relative to deploy.toml's directory" rule as every
+    other configured path (README ``配置文件发现顺序``), instead of being
+    interpreted against the process's current working directory only at
+    connect time. Resolved values are written back into ``values`` in place
+    so downstream transport code needs no change. Existence/readability is
+    only enforced for entries actually configured as ``protocol = "ftps"``:
+    these fields are meaningless for other protocols and must not block an
+    otherwise-valid config.
+
+    Args:
+        values: Mutable parsed ``[server]``/``[remotes.NAME]`` table.
+        base: Directory containing the TOML file.
+        location: Human-readable table path used in error messages.
+
+    Returns:
+        None.
+
+    Raises:
+        ConfigurationError: When an ftps entry names a missing or unreadable file.
+    """
+
+    is_ftps = str(values.get("protocol", "sftp")).lower() == "ftps"
+    fields = list(_FTPS_TLS_PATH_FIELDS)
+    if is_ftps:
+        fields += list(_FTPS_TLS_PATH_ALIASES.values())
+    for field in fields:
+        raw_value = values.get(field)
+        if raw_value is None or not str(raw_value).strip():
+            continue
+        resolved = _resolve_optional_path(raw_value, base)
+        assert resolved is not None
+        if is_ftps:
+            if not resolved.is_file():
+                raise ConfigurationError(
+                    f"{location}.{field} does not exist: {resolved}"
+                )
+            try:
+                resolved.open("rb").close()
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"{location}.{field} is not readable: {resolved}: {exc}"
+                ) from exc
+        values[field] = str(resolved)
 
 
 def _resolve_optional_path(value: Any, base: Path) -> Path | None:

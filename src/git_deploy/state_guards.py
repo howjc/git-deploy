@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .errors import ConfigurationError, PolicyError
+from .errors import ConfigurationError, PolicyError, StalePlanError
 from .expected_state import ExpectedState, ExpectedStateStore
 from .object_store import ContentAddressedStore
 from .target_identity import TargetIdentity
@@ -223,7 +223,7 @@ def require_plan_matches_current(
 
     if current is None:
         if has_hard_boundary:
-            raise PolicyError(
+            raise StalePlanError(
                 "stale_plan: no current state; re-plan required before deploy"
             )
         return
@@ -243,7 +243,7 @@ def require_plan_matches_current(
             mismatches.append("applied_transition_ids")
 
     if mismatches:
-        raise PolicyError(
+        raise StalePlanError(
             "stale_plan: plan before-boundary no longer matches current "
             f"({', '.join(mismatches)}); re-plan required"
         )

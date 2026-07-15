@@ -205,6 +205,106 @@ def test_latest_rollback_restores_bytes_and_generation(tmp_path: Path) -> None:
     assert "t0" in state.applied_transition_ids
 
 
+def test_rollback_latest_reads_each_remote_path_once_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """P1-03: after-state drift check and pre-rollback backup capture share a
+    single remote read per path instead of two independent reads."""
+
+    service, transport, _store, _identity, _older, _latest = _setup(tmp_path)
+    read_paths: list[str] = []
+    real_read = transport.read_file
+
+    def counting_read(remote_path: str):
+        read_paths.append(remote_path)
+        return real_read(remote_path)
+
+    transport.read_file = counting_read  # type: ignore[method-assign]
+
+    result = service.rollback_latest()
+
+    assert result.status == "succeeded"
+    # Exactly one read before mutation (the shared observation) plus one
+    # post-write readback verify after the restore write — never two
+    # independent reads for the same path before anything is mutated.
+    assert read_paths == ["/srv/a.txt", "/srv/a.txt"], read_paths
+
+
+def test_rollback_latest_runs_post_commands_and_health_after_restore(
+    tmp_path: Path,
+) -> None:
+    """P1-05: rollback runs the same post_commands/health lifecycle as deploy."""
+
+    import dataclasses
+
+    service, transport, store, _identity, _older, latest = _setup(tmp_path)
+    executed: list[str] = []
+    transport.execute = lambda command: (executed.append(command) or (0, "", ""))  # type: ignore[method-assign]
+    service.project = dataclasses.replace(
+        service.project,
+        post_commands=("php-fpm reload",),
+        health_urls=("http://localhost/health",),
+    )
+
+    from unittest.mock import patch
+
+    with patch("git_deploy.executor._check_health_url") as health_check:
+        result = service.rollback_latest()
+
+    assert result.status == "succeeded"
+    assert executed == ["php-fpm reload"]
+    health_check.assert_called_once_with("http://localhost/health")
+    assert result.generation == 3
+    current = store.read_current()
+    assert current is not None and current.generation == 3
+
+
+def test_rollback_latest_lifecycle_failure_restores_rollback_before_bytes(
+    tmp_path: Path,
+) -> None:
+    """P1-05: a hook failure after restore rolls the remote back to the bytes
+    that were live before *this* rollback attempt, and current stays unchanged."""
+
+    import dataclasses
+
+    service, transport, store, _identity, _older, latest = _setup(tmp_path)
+    service.project = dataclasses.replace(service.project, post_commands=("noop",))
+    before_generation = store.read_current()
+    assert before_generation is not None
+    starting_generation = before_generation.generation
+
+    with pytest.raises(PolicyError, match="rollback-before remote bytes restored"):
+        service.rollback_latest(fail_at="hook")
+
+    # The remote must be back to what it was before this rollback ran (the
+    # deployment's "after" bytes), not left holding the restored "before" bytes.
+    assert transport.files["/srv/a.txt"].data == b"after"
+    current = store.read_current()
+    assert current is not None and current.generation == starting_generation
+
+
+def test_rollback_latest_cas_failure_after_successful_lifecycle_raises_policy_error(
+    tmp_path: Path,
+) -> None:
+    """A journal/CAS bookkeeping failure *after* every write and the lifecycle
+    already succeeded must still surface as a structured PolicyError with
+    recovery guidance, not an uncaught exception (remote is already mutated
+    by this point, so this cannot retry the mutation itself)."""
+
+    service, transport, _store, _identity, _older, _latest = _setup(tmp_path)
+
+    def broken_cas_advance(*_args, **_kwargs):
+        raise ConfigurationError("injected disk-full during CAS advance")
+
+    service.state_store.cas_advance = broken_cas_advance  # type: ignore[method-assign]
+
+    with pytest.raises(PolicyError, match="rollback partial failure; run state recover"):
+        service.rollback_latest()
+
+    # The write already happened; only local bookkeeping failed.
+    assert transport.files["/srv/a.txt"].data == b"before"
+
+
 def test_rollback_latest_expected_deployment_stale_when_newer_exists(
     tmp_path: Path,
 ) -> None:
@@ -1087,9 +1187,9 @@ def test_rollback_read_error_fails_closed(tmp_path: Path) -> None:
 
     def flaky_read(remote_path: str):
         calls["n"] += 1
-        # Allow after-state check + pre-rollback recovery backup reads;
-        # fail during post-write verify (third read of the same path).
-        if calls["n"] > 2:
+        # P1-03: after-state check and pre-rollback recovery backup now share
+        # one read; fail during post-write verify (second read of the path).
+        if calls["n"] > 1:
             raise OSError("injected readback failure")
         return real_read(remote_path)
 

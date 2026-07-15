@@ -6,17 +6,17 @@ current state 自动计算到当前 `HEAD` 的变化，通过 SFTP、FTP 或 FTP
 冗长确认短语。
 
 它适合仍通过 SSH/FTP 发布普通目录、希望保留清晰 Git 来源和最新版本回滚能力
-的项目。它不是 CI 平台、服务器面板或数据库 migration 系统；v0.3.2 也不提供
+的项目。它不是 CI 平台、服务器面板或数据库 migration 系统；v0.3.3 也不提供
 TUI、历史版本派生回滚或自动 GC。
 
 ## 安装
 
-需要 Python 3.11+ 和 Git。推荐直接安装当前安全版本 v0.3.2 wheel（**不要**再安装
+需要 Python 3.11+ 和 Git。推荐直接安装当前安全版本 v0.3.3 wheel（**不要**再安装
 已知存在阻断问题的 v0.3.0）：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v0.3.2/git_deploy-0.3.2-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v0.3.3/git_deploy-0.3.3-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -582,7 +582,7 @@ uvx ty check src
 uv build --clear
 ```
 
-当前 v0.3.2 基线为 365+ 个自动测试，包含 Host、真实 OpenSSH/SFTP 容器和 fake FTP/FTPS contract 门禁，以及 application exact-plan / exact-deployment 竞态回归。
+当前 v0.3.3 基线为 384 个自动测试，包含 Host、真实 OpenSSH/SFTP 容器和 fake FTP/FTPS contract 门禁，以及 application exact-plan / exact-deployment 竞态回归。
 
 ### 2. 更新版本
 
@@ -602,15 +602,15 @@ uv build --clear
 (
   cd dist
   sha256sum \
-    git_deploy-0.3.2-py3-none-any.whl \
-    git_deploy-0.3.2.tar.gz \
+    git_deploy-0.3.3-py3-none-any.whl \
+    git_deploy-0.3.3.tar.gz \
     > SHA256SUMS
 )
 
 uv venv --clear tmp/release-smoke
 uv pip install \
   --python tmp/release-smoke/bin/python \
-  dist/git_deploy-0.3.2-py3-none-any.whl
+  dist/git_deploy-0.3.3-py3-none-any.whl
 
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
@@ -622,19 +622,19 @@ tmp/release-smoke/bin/git-deploy --help
 
 ```bash
 git add README.md pyproject.toml uv.lock src tests docs git-deploy.example.toml
-git commit -m "release v0.3.2"
+git commit -m "release v0.3.3"
 git push
 
-git tag -a v0.3.2 -m "git-deploy v0.3.2"
-git push origin v0.3.2
+git tag -a v0.3.3 -m "git-deploy v0.3.3"
+git push origin v0.3.3
 
-gh release create v0.3.2 \
-  dist/git_deploy-0.3.2-py3-none-any.whl \
-  dist/git_deploy-0.3.2.tar.gz \
+gh release create v0.3.3 \
+  dist/git_deploy-0.3.3-py3-none-any.whl \
+  dist/git_deploy-0.3.3.tar.gz \
   dist/SHA256SUMS \
   --verify-tag \
-  --title "git-deploy v0.3.2" \
-  --notes-file docs/release-notes-v0.3.2.md
+  --title "git-deploy v0.3.3" \
+  --notes-file docs/release-notes-v0.3.3.md
 ```
 
 仓库当前通过 GitHub Release 分发 wheel/sdist，尚未配置 PyPI 自动发布。未来接入 PyPI 时应使用 trusted publishing 或受保护的 registry credential，不能把 token 写入仓库、命令历史或文档。
@@ -652,6 +652,7 @@ gh release create v0.3.2 \
 - 上传使用临时文件再 rename，删除最后执行；事务阶段写入 durable journal。
 - source/artifact 任一步失败时恢复 before bytes 和 before state。
 - `--force` 只处理明确漂移，不能绕过 identity、policy、integrity 或 transaction 门禁。
+- reviewed plan 在锁内先做 pre-connect freshness 校验，再打开远端连接：多数已知的并发 generation/身份变化会在连接前以 `stale_plan` 拒绝，且零远端 mutation。pre-connect 校验释放锁到打开连接之间仍有极短未加锁窗口，**不保证所有竞态都零 connect**——该窗口内发生的竞态仍会在领域执行器二次加锁校验时以零 mutation（可能已连接但未写入）的方式安全拒绝，不会造成数据破坏。
 - Host runner 具有当前用户权限；Docker daemon 管理员可读取存活容器环境变量。
 - 1Password reference、认证 token 和解析值不会写入 fingerprint、manifest、state 或日志。
 - 回滚不处理数据库、消息、支付或其他外部系统副作用。

@@ -791,3 +791,112 @@ def test_remote_root_normalizes_duplicate_slashes_and_allows_unicode() -> None:
     from git_deploy.config import _validate_remote_root
 
     assert _validate_remote_root("/srv//应用///", "root") == "/srv/应用"
+
+
+def test_ftps_tls_paths_resolve_relative_to_toml_directory(tmp_path: Path) -> None:
+    """P1-08: tls_ca_file/tls_cert_file/tls_key_file follow the same
+    config-relative rule as every other path in deploy.toml."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    certs = tmp_path / "certs"
+    certs.mkdir()
+    (certs / "ca.pem").write_bytes(b"placeholder-ca")
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "ftps"
+host = "ftp.example.com"
+tls_ca_file = "certs/ca.pem"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    _remote_name, server, _projects = select_remote(config, None)
+    assert server.values["tls_ca_file"] == str((tmp_path / "certs" / "ca.pem").resolve())
+
+
+def test_ftps_tls_ca_file_missing_is_rejected_at_config_load(tmp_path: Path) -> None:
+    """P1-08: a missing FTPS CA file must fail as a structured config error,
+    before any connection is attempted."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "ftps"
+host = "ftp.example.com"
+tls_ca_file = "certs/missing-ca.pem"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="tls_ca_file does not exist"):
+        load_config(config_path)
+
+
+def test_ftps_legacy_cert_file_alias_also_resolves_and_validates(tmp_path: Path) -> None:
+    """P1-08 follow-up: the undocumented cert_file/ca_file/key_file aliases
+    accepted by build_ftps_ssl_context must get the same config-relative
+    resolution and load-time existence check as tls_ca_file, not silently
+    stay unresolved against the process CWD."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "ftps"
+host = "ftp.example.com"
+ca_file = "certs/missing-ca.pem"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="ca_file does not exist"):
+        load_config(config_path)
+
+
+def test_ftps_tls_paths_ignored_for_non_ftps_protocol(tmp_path: Path) -> None:
+    """A stray tls_ca_file on a non-FTPS remote must not block config load."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "sftp.example.com"
+tls_ca_file = "certs/missing-ca.pem"
+
+[projects.demo]
+repository = "{repository}"
+remote_root = "/srv/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    _remote_name, server, _projects = select_remote(config, None)
+    # Still normalized to an absolute path even though existence is not enforced.
+    assert server.values["tls_ca_file"] == str(
+        (tmp_path / "certs" / "missing-ca.pem").resolve()
+    )

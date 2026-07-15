@@ -563,25 +563,9 @@ class StateDeploymentExecutor:
             raise ConfigurationError(
                 "journal lacks backup_entries mapping; cannot restore from backup_refs alone"
             )
-        touched: list[str] = []
-        for entry in entries:
-            remote_path = str(entry["remote_path"])
-            backup_file = entry.get("backup_file")
-            if backup_file:
-                data = self.deploy_store.read_backup(journal.deployment_id, str(backup_file))
-                writer = getattr(self.transport, "write_file", None)
-                if not callable(writer):
-                    writer = getattr(self.transport, "replace_file")
-                writer(
-                    remote_path,
-                    data,
-                    executable=bool(entry.get("executable")),
-                )
-            else:
-                # Path was absent before mutation: remove partial upload residue.
-                self.transport.delete_file(remote_path)
-            touched.append(remote_path)
-        return touched
+        return restore_backup_entries(
+            self.deploy_store, self.transport, journal.deployment_id, entries
+        )
 
     def auto_restore(
         self,
@@ -1045,9 +1029,6 @@ class StateDeploymentExecutor:
     def _run_post_hooks_and_health(self, *, fail_at: str | None = None) -> None:
         """Execute configured post commands and health checks after remote mutation.
 
-        Uses the same product transport surface as legacy deploy: ``execute``
-        (SftpTransport / FtpTransport), not a test-only ``run_command`` alias.
-
         Args:
             fail_at: Test-only injection point ``hook`` or ``health``.
 
@@ -1055,37 +1036,109 @@ class StateDeploymentExecutor:
             None.
         """
 
-        from .errors import GitDeployError
+        run_post_write_lifecycle(self.transport, self.project, fail_at=fail_at)
 
-        if fail_at == "hook":
-            raise RuntimeError("hook failed")
-        if self.project.post_commands:
-            supports = getattr(self.transport, "supports_commands", True)
-            if supports is False:
-                raise PolicyError("post_commands require SFTP/SSH and cannot run over FTP/FTPS")
-            executor = getattr(self.transport, "execute", None)
-            if not callable(executor):
-                # Fallback for minimal fakes that only implement run_command.
-                runner = getattr(self.transport, "run_command", None)
-                if not callable(runner):
-                    raise PolicyError(
-                        "post_commands require a transport that supports execute()"
-                    )
-                for command in self.project.post_commands:
-                    runner(command)
-            else:
-                for command in self.project.post_commands:
-                    code, stdout, stderr = executor(command)
-                    if int(code) != 0:
-                        detail = (stderr or stdout or f"exit code {code}").strip()
-                        raise GitDeployError(f"post command failed: {command}: {detail}")
-        if fail_at == "health":
-            raise RuntimeError("health failed")
-        if self.project.health_urls:
-            from .executor import _check_health_url
 
-            for url in self.project.health_urls:
-                _check_health_url(url)
+def run_post_write_lifecycle(
+    transport: Any,
+    project: ProjectConfig,
+    *,
+    fail_at: str | None = None,
+) -> None:
+    """Execute configured post commands and health checks after remote mutation.
+
+    P1-05: single lifecycle runner shared by ``StateDeploymentExecutor.deploy``
+    and ``StateRollbackService.rollback_latest`` so a rollback restoring live
+    files gets the identical cache-clear/reload/health contract a deploy gets,
+    instead of stopping at "bytes restored" while stale caches or a
+    not-yet-reloaded worker keep serving the old process.
+
+    Uses the same product transport surface as legacy deploy: ``execute``
+    (SftpTransport / FtpTransport), not a test-only ``run_command`` alias.
+
+    Args:
+        transport: Connected remote transport.
+        project: Project configuration supplying ``post_commands``/``health_urls``.
+        fail_at: Test-only injection point ``hook`` or ``health``.
+
+    Returns:
+        None.
+    """
+
+    from .errors import GitDeployError
+
+    if fail_at == "hook":
+        raise RuntimeError("hook failed")
+    if project.post_commands:
+        supports = getattr(transport, "supports_commands", True)
+        if supports is False:
+            raise PolicyError("post_commands require SFTP/SSH and cannot run over FTP/FTPS")
+        executor = getattr(transport, "execute", None)
+        if not callable(executor):
+            # Fallback for minimal fakes that only implement run_command.
+            runner = getattr(transport, "run_command", None)
+            if not callable(runner):
+                raise PolicyError(
+                    "post_commands require a transport that supports execute()"
+                )
+            for command in project.post_commands:
+                runner(command)
+        else:
+            for command in project.post_commands:
+                code, stdout, stderr = executor(command)
+                if int(code) != 0:
+                    detail = (stderr or stdout or f"exit code {code}").strip()
+                    raise GitDeployError(f"post command failed: {command}: {detail}")
+    if fail_at == "health":
+        raise RuntimeError("health failed")
+    if project.health_urls:
+        from .executor import _check_health_url
+
+        for url in project.health_urls:
+            _check_health_url(url)
+
+
+def restore_backup_entries(
+    deploy_store: DeploymentStore,
+    transport: Any,
+    deployment_id: str,
+    backup_entries: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Restore remote bytes from durable backup entries.
+
+    Shared recovery primitive for both a failed deploy
+    (``StateDeploymentExecutor.restore_from_backups``) and a rollback whose
+    post-write lifecycle (hooks/health) failed after all snapshot writes
+    already succeeded (``StateRollbackService.rollback_latest``, P1-05).
+
+    Args:
+        deploy_store: Backup/manifest store scoped to the physical target.
+        transport: Connected remote transport.
+        deployment_id: Owning deployment or rollback-event id (backup namespace).
+        backup_entries: Structured entries with remote_path/backup_file/executable.
+
+    Returns:
+        Remote paths restored or deleted, in entry order.
+    """
+
+    touched: list[str] = []
+    for entry in backup_entries:
+        remote_path = str(entry["remote_path"])
+        backup_file = entry.get("backup_file")
+        if backup_file:
+            data = deploy_store.read_backup(deployment_id, str(backup_file))
+            writer = getattr(transport, "write_file", None)
+            if not callable(writer):
+                writer = getattr(transport, "replace_file")
+            writer(
+                remote_path,
+                data,
+                executable=bool(entry.get("executable")),
+            )
+        else:
+            transport.delete_file(remote_path)
+        touched.append(remote_path)
+    return touched
 
 
 def _new_deployment_id() -> str:

@@ -258,6 +258,13 @@ local_state_dir = "{tmp_path / 'state'}"
     broken_journal = root / "transactions" / "broken.json"
     broken_journal.parent.mkdir(parents=True)
     broken_journal.write_text("{not-json", encoding="utf-8")
+    # P1-04: a rollback recovery directory has no manifest.json by design and
+    # must not be misreported as a corrupt deployment record.
+    from git_deploy.state import DeploymentStore
+
+    DeploymentStore(project, root=root).write_backup(
+        "rb-some-deployment", 0, b"pre-rollback-bytes"
+    )
     before = {
         item.relative_to(root).as_posix(): item.read_bytes()
         for item in root.rglob("*")
@@ -283,6 +290,9 @@ local_state_dir = "{tmp_path / 'state'}"
     assert by_id["state.current"].status is DoctorCheckStatus.PASS
     assert by_id["state.manifests"].status is DoctorCheckStatus.FAIL
     assert "broken-record" in by_id["state.manifests"].summary
+    assert "rb-some-deployment" not in by_id["state.manifests"].summary
+    manifests_context = by_id["state.manifests"].to_dict()["context"]
+    assert manifests_context["rollback_event_counts"] == (("application", 1),)
     assert by_id["state.transactions"].status is DoctorCheckStatus.FAIL
     assert "broken.json" in by_id["state.transactions"].summary
     assert by_id["remote.access"].status is DoctorCheckStatus.PASS

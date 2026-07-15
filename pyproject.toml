@@ -1,6 +1,6 @@
 [project]
 name = "git-deploy"
-version = "0.3.2"
+version = "0.3.3"
 description = "Git revision based deployment and rollback for Git projects"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,4 +18,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "cryptography>=42.0.0",
+    "pyftpdlib>=2.0.0",
+    "pyopenssl>=24.0.0",
 ]
