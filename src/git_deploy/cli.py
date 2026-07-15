@@ -690,6 +690,106 @@ def _run_application_deploy(config: AppConfig, args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _require_reviewed_plan_fresh_under_lock(
+    target_root: Path,
+    identity: object,
+    source_plan: object,
+) -> None:
+    """Reject a stale reviewed plan under TargetLock before any remote connect.
+
+    This is the AC1 pre-connect gate: concurrent generation advance after the
+    unlocked application precheck must fail here with zero transport factory
+    calls. ``StateDeploymentExecutor.deploy`` still re-checks under its own lock.
+
+    Args:
+        target_root: Target state root.
+        identity: Physical ``TargetIdentity``.
+        source_plan: Frozen domain ``SourceDiffPlan`` from the reviewed token.
+
+    Returns:
+        None.
+
+    Raises:
+        PolicyError: When the reviewed before-boundary no longer matches current.
+    """
+
+    from .expected_state import ExpectedStateStore
+    from .state_guards import require_plan_matches_current
+    from .state_planner import SourceDiffPlan
+    from .target_identity import TargetIdentity
+    from .target_lock import TargetLock
+
+    if not isinstance(identity, TargetIdentity):
+        raise TypeError("identity must be a TargetIdentity")
+    if not isinstance(source_plan, SourceDiffPlan):
+        raise TypeError("source_plan must be a SourceDiffPlan")
+    with TargetLock(target_root):
+        loaded = ExpectedStateStore(target_root, identity).load_current_state()
+        before = loaded[1] if loaded else None
+        require_plan_matches_current(before, source_plan)
+
+
+def _materialize_reviewed_object_env(
+    project: ProjectConfig,
+    target_root: Path,
+    plan: object,
+) -> tuple[object | None, dict[str, str] | None, str]:
+    """Publish durable Git objects for the reviewed freeze without re-planning.
+
+    Uses ``StateComposer.compose`` against the *frozen* before tree and
+    resolved revision selectors only. Does **not** call ``plan_selectors`` and
+    does **not** produce a new ``SourceDiffPlan`` — deploy always uses the
+    token-bound freeze. Returns an object env and a content tree id suitable
+    for blob reads (frozen after_tree when readable, else composed target).
+
+    Args:
+        project: Domain project configuration.
+        target_root: Target state root.
+        plan: Reviewed ``RevisionPlanResult``.
+
+    Returns:
+        ``(git_store_or_None, object_env_or_None, content_tree_id)``.
+    """
+
+    from .application import RevisionPlanResult
+    from .git_store import PersistentGitStore
+    from .gitrepo import GitRepository
+    from .state_composer import StateComposer
+
+    if not isinstance(plan, RevisionPlanResult):
+        raise TypeError("plan must be a RevisionPlanResult")
+    content_tree = plan.after_tree_id
+    if plan.before_state_id is None and plan.generation is None:
+        return None, None, content_tree
+    store = PersistentGitStore(target_root, project.repository)
+    store.ensure_layout()
+    composer = StateComposer(project.repository, git_store=store)
+    compose = composer.compose(
+        selectors=plan.resolved_revisions,
+        current_tree_id=plan.before_tree_id,
+        applied_transition_ids=plan.before_applied_transition_ids,
+    )
+    try:
+        object_env = compose.object_env
+        if object_env is None:
+            object_env = store.object_environment()
+        # Prefer frozen after_tree for content when it is still readable.
+        repo = GitRepository(project.repository)
+        try:
+            repo._run_text_env(
+                "rev-parse",
+                "--verify",
+                f"{content_tree}^{{tree}}",
+                env=object_env,
+            )
+        except Exception:
+            content_tree = compose.target_tree_id
+        return store, object_env, content_tree
+    finally:
+        if compose._ephemeral_dir is not None:
+            compose.close()
+
+
 def _execute_reviewed_domain_deploy(
     config: AppConfig,
     request: object,
@@ -699,9 +799,9 @@ def _execute_reviewed_domain_deploy(
 ) -> object:
     """Deploy the exact reviewed application plan under domain target lock.
 
-    Rebuilds domain ``SourceDiffPlan`` from the signed freeze fields only.
-    Never re-reads live current as the plan before-boundary and never calls
-    ``_run_plan_or_deploy`` / ``plan_selectors`` against a later generation.
+    Uses only the signed freeze (``to_frozen_source_diff_plan``). Never calls
+    ``_run_plan_or_deploy`` or ``plan_selectors`` after confirm. Lock-held
+    freshness runs **before** any transport factory / remote connect.
 
     Args:
         config: Loaded application configuration.
@@ -731,7 +831,6 @@ def _execute_reviewed_domain_deploy(
     from .gitrepo import GitRepository
     from .remote_verify import open_cli_transport
     from .state_executor import InMemoryTransport, StateDeploymentExecutor
-    from .state_planner import StatePlanner
     from .target_identity import default_state_base
 
     if not isinstance(request, DeployRequest):
@@ -749,7 +848,8 @@ def _execute_reviewed_domain_deploy(
     target_root = identity.state_root(
         default_state_base(project.name, project.local_state_dir)
     )
-    frozen = to_frozen_source_diff_plan(plan)
+    # Exact reviewed domain plan — never re-plan selectors after confirm.
+    source_plan = to_frozen_source_diff_plan(plan)
     is_static_noop = bool(
         plan.static_noop
         and not plan.build.enabled
@@ -758,13 +858,14 @@ def _execute_reviewed_domain_deploy(
     )
 
     if is_static_noop:
+        # InMemoryTransport: no remote connect; deploy still lock-checks freeze.
         executor = StateDeploymentExecutor(
             project,
             identity,
             target_root,
             transport=InMemoryTransport(),
         )
-        result = executor.deploy(frozen, list(frozen.files), force=False)
+        result = executor.deploy(source_plan, list(source_plan.files), force=False)
         summary = (
             "No changes: target generation already matches "
             f"{plan.after_tree_id}"
@@ -784,37 +885,14 @@ def _execute_reviewed_domain_deploy(
             ),
         )
 
-    # Materialize durable trees from the *reviewed* before-boundary + selectors
-    # (not live current). Lock-held expected_* stay on the reviewed freeze.
-    git_store: PersistentGitStore | None = None
-    object_env: dict[str, str] | None = None
-    source_plan = frozen
-    if plan.before_state_id is not None or plan.generation is not None:
-        git_store = PersistentGitStore(target_root, project.repository)
-        git_store.ensure_layout()
-        planner = StatePlanner(
-            project.repository,
-            include=project.include,
-            exclude=project.exclude,
-            protected=project.protected,
-            remote_root=project.remote_root,
-            git_store=git_store,
-        )
-        recomposed = planner.plan_selectors(
-            plan.resolved_revisions,
-            current_tree_id=plan.before_tree_id,
-            applied_transition_ids=plan.before_applied_transition_ids,
-            static_only=False,
-        )
-        object_env = planner.object_env()
-        _assert_recomposed_matches_reviewed(recomposed, plan)
-        source_plan = replace(
-            recomposed,
-            expected_before_state_id=plan.before_state_id,
-            expected_generation=plan.generation,
-            expected_before_tree_id=plan.before_tree_id,
-            expected_before_applied_transition_ids=plan.before_applied_transition_ids,
-        )
+    # Local object materialization only (no plan_selectors, no live current).
+    git_store, object_env, content_tree = _materialize_reviewed_object_env(
+        project,
+        target_root,
+        plan,
+    )
+    # AC1: lock-held freshness BEFORE any transport factory / connect.
+    _require_reviewed_plan_fresh_under_lock(target_root, identity, source_plan)
 
     transport = None
     try:
@@ -825,7 +903,7 @@ def _execute_reviewed_domain_deploy(
                 path: str,
                 *,
                 _repo: GitRepository = repo,
-                _tree: str = source_plan.after_tree_id,
+                _tree: str = content_tree,
                 _env: dict[str, str] | None = object_env,
             ) -> bytes:
                 blob = _repo.blob(_tree, path, env=_env)
@@ -860,14 +938,22 @@ def _execute_reviewed_domain_deploy(
             # Live current is only used for artifact baseline bookkeeping; source
             # plan before-boundary remains the reviewed freeze (checked under lock).
             _pointer, current_state = loaded
-            if git_store is None:
-                git_store = PersistentGitStore(target_root, project.repository)
-                git_store.ensure_layout()
-            if object_env is None:
-                object_env = git_store.object_environment()
+            durable_store = git_store
+            if durable_store is None:
+                durable_store = PersistentGitStore(target_root, project.repository)
+                durable_store.ensure_layout()
+                git_store = durable_store
+            resolved_env = object_env
+            if resolved_env is None:
+                # durable_store is always PersistentGitStore here.
+                from .git_store import PersistentGitStore as _PGS
+
+                assert isinstance(durable_store, _PGS)
+                resolved_env = durable_store.object_environment()
+            object_env = resolved_env
             build_service = BuildService(project, target_root)
             target_build = build_service.execute(
-                source_plan.after_tree_id,
+                content_tree,
                 object_env=object_env,
             )
             artifact_planner = ArtifactPlanner()
@@ -875,10 +961,11 @@ def _execute_reviewed_domain_deploy(
                 project, current_state, target_build.entry
             )
             if artifact_plan.status == "baseline_required":
+                # Freshness already held above; baseline still opens transport.
                 transport = open_cli_transport(dict(server.values))
                 baseline_build = (
                     target_build
-                    if current_state.source_tree_id == source_plan.after_tree_id
+                    if current_state.source_tree_id == content_tree
                     else build_service.execute(
                         current_state.source_tree_id,
                         object_env=object_env,
@@ -929,7 +1016,7 @@ def _execute_reviewed_domain_deploy(
                 {
                     "mode": "build",
                     "build_fingerprint": target_build.fingerprint,
-                    "source_tree_id": source_plan.after_tree_id,
+                    "source_tree_id": content_tree,
                     "runner": project.build.runner,
                     "artifacts": [
                         {
@@ -949,7 +1036,7 @@ def _execute_reviewed_domain_deploy(
                 target_root / "build" / "deploy-worktrees",
             )
             with worktrees.materialize(
-                source_plan.after_tree_id,
+                content_tree,
                 object_env=object_env,
             ) as worktree:
                 refs: dict[str, FileContentRef] = {}
@@ -1026,69 +1113,6 @@ def _execute_reviewed_domain_deploy(
             ResultField("status", status),
         ),
     )
-
-
-def _assert_recomposed_matches_reviewed(recomposed: object, plan: object) -> None:
-    """Refuse when durable recompose diverges from the signed reviewed plan.
-
-    Args:
-        recomposed: Domain ``SourceDiffPlan`` rebuilt from frozen before + selectors.
-        plan: Reviewed ``RevisionPlanResult``.
-
-    Returns:
-        None.
-
-    Raises:
-        PolicyError: When transitions or exact file set differ from the review.
-    """
-
-    from .application import RevisionPlanResult
-    from .state_planner import SourceDiffPlan
-
-    if not isinstance(recomposed, SourceDiffPlan) or not isinstance(
-        plan, RevisionPlanResult
-    ):
-        raise TypeError("recomposed/plan types invalid")
-    if tuple(recomposed.introduced_transition_ids) != plan.introduced_transition_ids:
-        raise PolicyError(
-            "stale_plan: recomposed introduced transitions differ from reviewed plan; "
-            "re-plan required"
-        )
-    if plan.after_applied_transition_ids and tuple(
-        recomposed.applied_transition_ids
-    ) != plan.after_applied_transition_ids:
-        raise PolicyError(
-            "stale_plan: recomposed applied transitions differ from reviewed plan; "
-            "re-plan required"
-        )
-    reviewed = {
-        (
-            item.action,
-            item.path,
-            item.remote_path,
-            item.target_sha256,
-            item.expected_before_sha256,
-            item.target_size,
-            item.executable,
-        )
-        for item in plan.domain_files
-    }
-    actual = {
-        (
-            item.action,
-            item.path,
-            item.remote_path,
-            item.target_sha256,
-            item.expected_before_sha256,
-            item.target_size,
-            item.executable,
-        )
-        for item in recomposed.files
-    }
-    if reviewed != actual:
-        raise PolicyError(
-            "stale_plan: recomposed file set differs from reviewed plan; re-plan required"
-        )
 
 
 def _application_project_names(

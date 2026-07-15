@@ -1370,6 +1370,201 @@ local_state_dir = ".state/demo"
         set_cli_transport_factory(None)
 
 
+def test_application_deploy_non_noop_stale_after_precheck_zero_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """§8.1 non-noop: post-precheck race must stale before transport factory.
+
+    Unlike static no-op (InMemoryTransport), a real mutation plan would open
+    SFTP/FTP via the CLI factory if freshness ran after connect. Advance
+    generation after unlocked precheck; expect stale_plan, factory_calls==0,
+    zero remote writes, current kept at concurrent N+1.
+    """
+
+    import hashlib
+    import subprocess
+
+    from git_deploy.cli import run
+    from git_deploy.config import load_config, resolve_project_target, select_remote
+    from git_deploy.expected_state import ExpectedStateStore, FileEntry, build_expected_state
+    from git_deploy.git_store import PersistentGitStore
+    from git_deploy.object_store import ContentAddressedStore
+    from git_deploy.remote_verify import set_cli_transport_factory
+    from git_deploy.state import DeploymentStore
+    from git_deploy.state_composer import StateComposer
+    from git_deploy.state_executor import FakeRemotePath, InMemoryTransport
+    from git_deploy.state_planner import StatePlanner
+    from git_deploy.target_identity import (
+        default_state_base,
+        policy_fingerprint_for_project,
+    )
+    from git_deploy.transaction import TransactionStore
+    import git_deploy.cli as cli_mod
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    base_tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "file.txt").write_text("newer\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "newer"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    config_path = tmp_path / "deploy.toml"
+    config_path.write_text(
+        f"""
+[server]
+protocol = "sftp"
+host = "deploy.example"
+[projects.demo]
+repository = "{repo}"
+remote_root = "/srv/demo"
+local_state_dir = ".state/demo"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+    _remote, server, projects = select_remote(config, None)
+    project = projects["demo"]
+    identity = resolve_project_target(server, project, config=config)
+    root = identity.state_root(default_state_base(project.name, project.local_state_dir))
+    PersistentGitStore(root, repo).ensure_layout()
+    PersistentGitStore(root, repo)._publish_repository_identity()
+    body = b"base\n"
+    ContentAddressedStore(root).put(body)
+    ContentAddressedStore(root).put(b"newer\n")
+    store = ExpectedStateStore(root, identity)
+    base_tid = StateComposer(repo).transition_id_for_commit(base).as_str()
+    gen1 = build_expected_state(
+        generation=1,
+        parent_state_id=None,
+        source_tree_id=base_tree,
+        applied_transition_ids=(base_tid,),
+        physical_fingerprint=identity.physical_fingerprint,
+        policy_fingerprint=policy_fingerprint_for_project(project),
+        files=(
+            FileEntry(
+                path="file.txt",
+                owner="source",
+                content_sha256=hashlib.sha256(body).hexdigest(),
+                exists=True,
+            ),
+        ),
+    )
+    store.cas_advance(expected_generation=None, state=gen1)
+
+    transport = InMemoryTransport()
+    transport.files["/srv/demo/file.txt"] = FakeRemotePath(body)
+    writes_before = transport.write_calls
+    factory_calls = {"count": 0}
+
+    def factory(_server: dict[str, object]) -> InMemoryTransport:
+        factory_calls["count"] += 1
+        return transport
+
+    set_cli_transport_factory(factory)
+
+    def race_after_precheck() -> None:
+        """Advance current after unlocked precheck, before domain lock/connect."""
+
+        current = store.load_current_state()
+        assert current is not None
+        pointer, state = current
+        advanced = build_expected_state(
+            generation=pointer.generation + 1,
+            parent_state_id=pointer.state_id,
+            source_tree_id=state.source_tree_id,
+            applied_transition_ids=tuple(state.applied_transition_ids),
+            physical_fingerprint=identity.physical_fingerprint,
+            policy_fingerprint=policy_fingerprint_for_project(project),
+            files=state.files,
+            artifacts=({"mode": "probe", "note": "non-noop-post-precheck-race"},),
+        )
+        store.cas_advance(expected_generation=pointer.generation, state=advanced)
+
+    real_app_deploy = cli_mod._run_application_deploy
+
+    def deploy_with_race(cfg, args):  # type: ignore[no-untyped-def]
+        args._post_precheck_race_hook = race_after_precheck
+        return real_app_deploy(cfg, args)
+
+    monkeypatch.setattr(cli_mod, "_run_application_deploy", deploy_with_race)
+
+    # Application execute must not re-plan via plan_selectors after confirm.
+    real_plan_selectors = StatePlanner.plan_selectors
+    selector_calls = {"count": 0}
+
+    def track_selectors(self, *a, **k):  # type: ignore[no-untyped-def]
+        selector_calls["count"] += 1
+        # Plan phase may call plan_selectors; execute must not. Count after
+        # race hook arming is insufficient; forbid after deploy_with_race starts
+        # by checking a flag set when execute domain runs.
+        if getattr(track_selectors, "forbid", False):
+            raise AssertionError(
+                "post-confirm plan_selectors is forbidden on exact-plan path"
+            )
+        return real_plan_selectors(self, *a, **k)
+
+    monkeypatch.setattr(StatePlanner, "plan_selectors", track_selectors)
+
+    real_fresh = cli_mod._require_reviewed_plan_fresh_under_lock
+
+    def fresh_then_forbid(*a, **k):  # type: ignore[no-untyped-def]
+        # Once domain pre-connect freshness runs, any later plan_selectors is a bug.
+        track_selectors.forbid = True  # type: ignore[attr-defined]
+        return real_fresh(*a, **k)
+
+    monkeypatch.setattr(cli_mod, "_require_reviewed_plan_fresh_under_lock", fresh_then_forbid)
+
+    try:
+        code = run(["deploy", "demo", "--revisions", head, "--yes"])
+        captured = capsys.readouterr()
+        err = captured.err
+        out = captured.out
+        assert code != 0, f"expected stale rejection, got 0\nout={out}\nerr={err}"
+        assert "stale_plan" in err, f"expected stale_plan in stderr, got:\n{err}\nstdout:\n{out}"
+        assert factory_calls["count"] == 0, (
+            f"stale non-noop must not open transport (factory_calls={factory_calls['count']})"
+        )
+        assert transport.write_calls == writes_before
+        assert TransactionStore(root).list_open() == []
+        assert DeploymentStore(project, root=root).list_manifests() == []
+        current = store.read_current()
+        assert current is not None and current.generation == 2
+        state = store.read_state(current.state_id)
+        assert state.artifacts and state.artifacts[0].get("note") == (
+            "non-noop-post-precheck-race"
+        )
+        # Remote content must remain the concurrent actor's world (base bytes).
+        assert transport.files["/srv/demo/file.txt"].data == body
+    finally:
+        set_cli_transport_factory(None)
+
+
 def test_application_deploy_never_replans_via_run_plan_or_deploy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
