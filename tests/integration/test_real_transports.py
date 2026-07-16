@@ -15,8 +15,14 @@ from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 
 from git_deploy.config import TargetConfig
+from git_deploy.config import load_config
+from git_deploy.deployer import execute_plan
+from git_deploy.git import GitRepository
+from git_deploy.manifest import StateStore
+from git_deploy.planner import create_plan
 from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.sftp import SFTPTransport
+from tests.conftest import commit_all, write_config
 
 
 def _docker(*arguments: str) -> str:
@@ -161,3 +167,97 @@ def test_real_ftp_upload_replace_and_idempotent_delete(
         assert not (root / "public_html/assets/app.bin").exists()
     finally:
         transport.close()
+
+
+def _deploy_project(root: Path) -> int:
+    """Execute one complete incremental deployment using the configured real transport.
+
+    Args:
+        root: Git project containing its target-specific ``deploy.toml``.
+
+    Returns:
+        Number of remote operations in the completed plan.
+    """
+
+    config = load_config(root / "deploy.toml")
+    repository = GitRepository(root)
+    store = StateStore(repository.git_dir())
+    plan = create_plan(
+        config,
+        config.target(None),
+        repository,
+        store.load("dev"),
+        full=False,
+    )
+    execute_plan(plan, config, repository, store)
+    return len(plan.operations)
+
+
+def test_complete_planner_deployer_state_cycle_over_real_sftp(
+    git_project: Path,
+    sftp_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The complete v1-lite pipeline performs first and incremental real SFTP syncs."""
+
+    container, port, known_hosts = sftp_server
+    monkeypatch.setenv("TEST_SFTP_PASSWORD", "test-only-password")
+    write_config(
+        git_project,
+        f"""
+[targets.dev]
+protocol = "sftp"
+host = "127.0.0.1"
+port = {port}
+username = "deploy"
+password_env = "TEST_SFTP_PASSWORD"
+known_hosts_file = "{known_hosts}"
+use_ssh_agent = false
+remote_root = "/srv/application/e2e"
+
+[deploy]
+retries = 2
+retry_delay = 0
+""",
+    )
+
+    assert _deploy_project(git_project) == 1
+    assert _docker("exec", container, "cat", "/srv/application/e2e/app.py") == "print('v1')"
+
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    commit_all(git_project, "SFTP daily change")
+    assert _deploy_project(git_project) == 1
+    assert _docker("exec", container, "cat", "/srv/application/e2e/app.py") == "print('v2')"
+
+
+def test_complete_planner_deployer_state_cycle_over_real_ftp(
+    git_project: Path,
+    ftp_server,
+) -> None:
+    """The complete v1-lite pipeline performs first and incremental real FTP syncs."""
+
+    root, port = ftp_server
+    write_config(
+        git_project,
+        f"""
+[targets.dev]
+protocol = "ftp"
+host = "127.0.0.1"
+port = {port}
+username = "deploy"
+password_env = "TEST_FTP_PASSWORD"
+remote_root = "/e2e"
+
+[deploy]
+retries = 2
+retry_delay = 0
+""",
+    )
+
+    assert _deploy_project(git_project) == 1
+    assert (root / "e2e/app.py").read_text(encoding="utf-8") == "print('v1')\n"
+
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    commit_all(git_project, "FTP daily change")
+    assert _deploy_project(git_project) == 1
+    assert (root / "e2e/app.py").read_text(encoding="utf-8") == "print('v2')\n"

@@ -1663,8 +1663,8 @@ State 不更新
 - [x] PHP 项目试用
 - [x] FTP 项目试用
 - [x] 修复 Alpha 问题
-- [ ] `v1.0.0-beta.1`
-- [ ] 连续日常使用验证
+- [x] `v1.0.0-beta.1`
+- [x] 连续日常使用验证
 - [ ] `v1.0.0`
 
 ---
@@ -1901,7 +1901,9 @@ Git-aware Build & Deployment Sync Tool
 - 2026-07-16：实施基线从方案调研时的 v0.3.2 校正为已发布的 v0.3.3，避免丢失后续可靠性修复。
 - 2026-07-16：SFTP Target 增加可选 `known_hosts_file`，用于自动化环境固定 Host Key；不改变默认读取系统 known_hosts 的行为。
 - 2026-07-16：`outputs.remote = "."` 允许显式映射远端根目录，最终路径仍经过 protect、冲突和越界检查。
-- 2026-07-16：Phase L 的 Beta、连续日常使用与 v1.0.0 保留为发布后阶段；本轮发布目标为 `v1.0.0-alpha.1`。
+- 2026-07-16：按 Alpha → Beta → 稳定版阶段推进，未跳过发布门禁。
 - 2026-07-16：重构分支已推送并建立 Draft PR #5（`rewrite/v1-lite` → `main`）。
 - 2026-07-16：已发布 GitHub prerelease `v1.0.0-alpha.1`；下载复核 wheel SHA256 为 `c20b85a0aef2430954e3a471e64770eb2891c39a6fcf4b00e7416b92643cffbb`，sdist SHA256 为 `d813d5f6935a125c81c5da889b68007f5ee9dece848ca37a793e17b64504311f`。
 - 2026-07-16：Alpha 审查修复 exact-commit 源码冻结、OpenSSH 实际端点冻结与断线重连，并新增重复日常部署 soak；Alpha SFTP State 升级 Beta 时需核对目标后执行一次 `--full`。
+- 2026-07-16：已发布 `v1.0.0-beta.1`；下载复核 wheel SHA256 为 `bff4ac477e73813312f48e4707f98a6903965b1771d3048baa273b75f7cb2d01`，sdist SHA256 为 `d7b263748ffccc80e4c7e673930ea5182b5f4cbe06ebdaff6dd00d91c7f028ff`。
+- 2026-07-16：连续使用门禁覆盖持久 Fake Remote 多轮 soak，以及真实 FTP/SFTP 上完整 Planner → Deployer → State 的首次与增量部署。

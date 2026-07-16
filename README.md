@@ -12,11 +12,11 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ## 安装
 
-需要 Python 3.11+ 和 Git。Beta 版本通过 GitHub Release 分发 wheel：
+需要 Python 3.11+ 和 Git。稳定版通过 GitHub Release 分发 wheel：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.0.0-beta.1/git_deploy-1.0.0b1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.0.0/git_deploy-1.0.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -89,6 +89,8 @@ SFTP 默认验证 Host Key 并支持：
 - `key_file`；
 - 可选 `password_env`；
 - 可选项目专用 `known_hosts_file`。
+
+v1.0 的 Paramiko 传输层暂不支持 OpenSSH `ProxyJump`/`ProxyCommand`；`ssh -G` 解析到这些字段时会在连接前明确拒绝。
 
 FTP 必须通过 `password_env` 读取密码，不接受 TOML 明文密码。v1-lite 不支持 FTPS、远端命令、owner/group 或远端健康检查。
 
@@ -191,7 +193,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.0.0b1-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.0.0-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```
