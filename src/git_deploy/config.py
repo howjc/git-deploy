@@ -1,866 +1,516 @@
-"""Configuration discovery and TOML parsing."""
+"""Load and validate the intentionally small v1-lite TOML configuration."""
 
 from __future__ import annotations
 
 import os
-import re
 import tomllib
-from dataclasses import replace
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal, cast
 
-from .errors import ConfigurationError
-from .models import (
-    AppConfig,
-    ArtifactConfig,
-    BuildConfig,
-    DockerBuildConfig,
-    OnePasswordConfig,
-    ProjectConfig,
-    ProjectRemoteConfig,
-    ServerConfig,
+from git_deploy.errors import ConfigError
+
+Protocol = Literal["sftp", "ftp"]
+
+DEFAULT_EXCLUDE = (
+    ".git/**",
+    ".env",
+    ".env.*",
+    "node_modules/**",
+    "runtime/**",
+    "uploads/**",
+    "storage/logs/**",
 )
-from .remote_permissions import load_sftp_permission_policy
+DEFAULT_PROTECT = (
+    ".env",
+    ".env.*",
+    "uploads/**",
+    "runtime/**",
+    "storage/cert/**",
+    "**/*.key",
+    "**/*.pem",
+)
 
 
-_REMOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+@dataclass(frozen=True, slots=True)
+class SourceConfig:
+    """Describe committed source paths managed by Git."""
+
+    include: tuple[str, ...] = ("**",)
+    exclude: tuple[str, ...] = DEFAULT_EXCLUDE
+    protect: tuple[str, ...] = DEFAULT_PROTECT
+    require_clean_worktree: bool = False
 
 
-def discover_config(explicit: str | None = None) -> Path:
-    """Resolve the deployment configuration without searching parent folders.
+@dataclass(frozen=True, slots=True)
+class BuildConfig:
+    """Describe trusted shell commands run serially in the project root."""
+
+    steps: tuple[str, ...] = ()
+    timeout: float | None = 900.0
+
+
+@dataclass(frozen=True, slots=True)
+class OutputConfig:
+    """Map one local build-output path to a remote relative directory."""
+
+    local: Path
+    remote: PurePosixPath
+    delete_removed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TargetConfig:
+    """Contain the connection settings for one independent environment."""
+
+    name: str
+    protocol: Protocol
+    host: str | None
+    username: str | None
+    remote_root: PurePosixPath
+    port: int
+    port_explicit: bool = False
+    password_env: str | None = None
+    ssh_host_alias: str | None = None
+    ssh_config_file: Path = Path("~/.ssh/config")
+    known_hosts_file: Path | None = None
+    key_file: Path | None = None
+    use_ssh_agent: bool = True
+    strict_host_key_checking: bool = True
+    passive: bool = True
+    timeout: float = 15.0
+
+    @property
+    def fingerprint(self) -> str:
+        """Return a stable non-secret identity for state-target binding."""
+
+        host = self.ssh_host_alias or self.host or ""
+        user = self.username or ""
+        return f"{self.protocol}:{user}@{host}:{self.port}:{self.remote_root}"
+
+
+@dataclass(frozen=True, slots=True)
+class DeployConfig:
+    """Configure per-file retry behavior."""
+
+    retries: int = 3
+    retry_delay: float = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    """Represent a fully resolved v1-lite project configuration."""
+
+    path: Path
+    project_root: Path
+    default_target: str | None
+    source: SourceConfig
+    build: BuildConfig
+    outputs: tuple[OutputConfig, ...]
+    targets: dict[str, TargetConfig]
+    deploy: DeployConfig = field(default_factory=DeployConfig)
+
+    def target(self, requested: str | None) -> TargetConfig:
+        """Resolve a requested or default target and return its settings.
+
+        Args:
+            requested: Explicit target name, or ``None`` to use ``default_target``.
+
+        Returns:
+            The selected validated target configuration.
+        """
+
+        name = requested or self.default_target
+        if name is None:
+            if len(self.targets) == 1:
+                return next(iter(self.targets.values()))
+            raise ConfigError("target is required because default_target is not set")
+        try:
+            return self.targets[name]
+        except KeyError as exc:
+            choices = ", ".join(sorted(self.targets)) or "<none>"
+            raise ConfigError(f"unknown target {name!r}; configured targets: {choices}") from exc
+
+
+def discover_config(explicit: Path | None = None) -> Path:
+    """Find the v1-lite config without walking into parent directories.
 
     Args:
-        explicit: Optional path supplied by ``--config``.
+        explicit: Optional path supplied through ``--config``.
 
     Returns:
-        Absolute path to an existing TOML configuration file.
-
-    Raises:
-        ConfigurationError: When no candidate exists.
+        An absolute path to the selected configuration file.
     """
 
-    candidates: list[tuple[str, Path]] = []
-    if explicit:
-        candidates.append(("--config", Path(explicit).expanduser()))
-    else:
-        candidates.append(("current directory", Path.cwd() / "deploy.toml"))
-        env_path = os.environ.get("GIT_DEPLOY_CONFIG")
-        if env_path:
-            candidates.append(("GIT_DEPLOY_CONFIG", Path(env_path).expanduser()))
-        candidates.append(("user config", Path("~/.config/git-deploy/deploy.toml").expanduser()))
-
-    for source, candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.is_file():
-            return resolved
-        if explicit:
-            raise ConfigurationError(f"configuration from {source} does not exist: {resolved}")
-
-    raise ConfigurationError(
-        "deploy.toml not found in the current directory; use --config or GIT_DEPLOY_CONFIG"
-    )
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    local = Path.cwd() / "deploy.toml"
+    if local.is_file():
+        return local.resolve()
+    configured = os.environ.get("GIT_DEPLOY_CONFIG")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".config/git-deploy/deploy.toml").resolve()
 
 
-def load_config(path: Path) -> AppConfig:
-    """Parse and resolve one deployment TOML file.
+def load_config(path: Path) -> Config:
+    """Parse and validate one v1-lite TOML file.
 
     Args:
-        path: Existing TOML file selected by configuration discovery.
+        path: Configuration path selected by discovery or ``--config``.
 
     Returns:
-        Validated application configuration.
+        A fully validated immutable configuration model.
     """
 
+    path = path.expanduser().resolve()
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
+    except FileNotFoundError as exc:
+        raise ConfigError(f"configuration file not found: {path}") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ConfigurationError(f"cannot read configuration {path}: {exc}") from exc
+        raise ConfigError(f"cannot read configuration {path}: {exc}") from exc
 
-    server = raw.get("server")
-    raw_remotes = raw.get("remotes")
-    if server is not None and raw_remotes is not None:
-        raise ConfigurationError("configure either [server] or [remotes.NAME], not both")
-    if server is not None:
-        if not isinstance(server, dict):
-            raise ConfigurationError("server must be a table")
-        load_sftp_permission_policy(server, location="server")
-        values = dict(server)
-        _resolve_ftps_tls_paths(values, base=path.parent, location="server")
-        remotes = {"default": ServerConfig(values)}
-        default_remote: str | None = "default"
+    _reject_legacy_config(raw)
+    _reject_unknown(raw, {"default_target", "source", "build", "outputs", "targets", "deploy"}, "top level")
+    root = path.parent.resolve()
+    source = _parse_source(raw.get("source", {}))
+    build = _parse_build(raw.get("build", {}))
+    outputs = _parse_outputs(raw.get("outputs", []), root)
+    targets = _parse_targets(raw.get("targets", {}), root)
+    deploy = _parse_deploy(raw.get("deploy", {}))
+    default_target = _optional_string(raw.get("default_target"), "default_target")
+    if default_target is not None and default_target not in targets:
+        raise ConfigError(f"default_target {default_target!r} is not present in [targets]")
+    return Config(path, root, default_target, source, build, outputs, targets, deploy)
+
+
+def path_matches(path: str, patterns: tuple[str, ...]) -> bool:
+    """Return whether a normalized relative POSIX path matches any glob.
+
+    Args:
+        path: Relative POSIX path to test.
+        patterns: Git-deploy glob patterns.
+
+    Returns:
+        ``True`` when at least one pattern owns the path.
+    """
+
+    from fnmatch import fnmatchcase
+
+    normalized = path.strip("/")
+    for pattern in patterns:
+        pattern = pattern.strip("/")
+        if pattern == "**" or fnmatchcase(normalized, pattern):
+            return True
+        # A recursive prefix owns both top-level and nested matches.
+        if pattern.startswith("**/") and fnmatchcase(normalized, pattern[3:]):
+            return True
+        if pattern.endswith("/**"):
+            prefix = pattern[:-3].rstrip("/")
+            if normalized == prefix or normalized.startswith(prefix + "/"):
+                return True
+    return False
+
+
+def is_protected(path: str, config: SourceConfig) -> bool:
+    """Return whether a local or remote relative path is protected.
+
+    Args:
+        path: Relative POSIX path to check.
+        config: Source safety policy containing configured and mandatory patterns.
+
+    Returns:
+        ``True`` when deployment must not touch the path.
+    """
+
+    candidate = PurePosixPath(path.strip("/"))
+    return any(
+        path_matches(ancestor.as_posix(), config.protect)
+        for ancestor in (candidate, *candidate.parents)
+        if ancestor.as_posix() != "."
+    )
+
+
+def is_source_managed(path: str, config: SourceConfig) -> bool:
+    """Return whether a committed source path belongs to the managed set.
+
+    Args:
+        path: Relative POSIX Git path.
+        config: Source include, exclude, and protect policy.
+
+    Returns:
+        ``True`` only for included, non-excluded, non-protected paths.
+    """
+
+    return (
+        path_matches(path, config.include)
+        and not path_matches(path, config.exclude)
+        and not is_protected(path, config)
+    )
+
+
+def _reject_legacy_config(raw: dict[str, Any]) -> None:
+    """Reject v0.x tables explicitly instead of guessing migration semantics."""
+
+    legacy = sorted({"server", "remotes", "projects"}.intersection(raw))
+    if legacy:
+        raise ConfigError(
+            "v0.x configuration is not compatible with v1-lite; found legacy tables: "
+            + ", ".join(legacy)
+        )
+
+
+def _parse_source(raw: Any) -> SourceConfig:
+    """Validate the source table and merge mandatory safety defaults."""
+
+    table = _table(raw, "source")
+    _reject_unknown(table, {"include", "exclude", "protect", "require_clean_worktree"}, "source")
+    include = _string_tuple(table.get("include", ["**"]), "source.include", allow_empty=False)
+    configured_exclude = _string_tuple(table.get("exclude", []), "source.exclude")
+    configured_protect = _string_tuple(table.get("protect", []), "source.protect")
+    exclude = tuple(dict.fromkeys((*DEFAULT_EXCLUDE, *configured_exclude)))
+    protect = tuple(dict.fromkeys((*DEFAULT_PROTECT, *configured_protect)))
+    clean = table.get("require_clean_worktree", False)
+    if not isinstance(clean, bool):
+        raise ConfigError("source.require_clean_worktree must be a boolean")
+    _validate_patterns((*include, *exclude, *protect))
+    return SourceConfig(include, exclude, protect, clean)
+
+
+def _parse_build(raw: Any) -> BuildConfig:
+    """Validate build steps and their optional aggregate timeout."""
+
+    table = _table(raw, "build")
+    _reject_unknown(table, {"steps", "timeout"}, "build")
+    steps = _string_tuple(table.get("steps", []), "build.steps")
+    timeout_raw = table.get("timeout", 900)
+    if timeout_raw is None:
+        timeout = None
+    elif isinstance(timeout_raw, (int, float)) and not isinstance(timeout_raw, bool) and timeout_raw > 0:
+        timeout = float(timeout_raw)
     else:
-        if not isinstance(raw_remotes, dict) or not raw_remotes:
-            raise ConfigurationError("configuration requires [server] or at least one [remotes.NAME]")
-        remotes = {}
-        for name, raw_values in raw_remotes.items():
-            _validate_remote_name(name)
-            if not isinstance(raw_values, dict):
-                raise ConfigurationError(f"remotes.{name} must be a table")
-            load_sftp_permission_policy(raw_values, location=f"remotes.{name}")
-            values = dict(raw_values)
-            _resolve_ftps_tls_paths(values, base=path.parent, location=f"remotes.{name}")
-            remotes[name] = ServerConfig(values)
-        configured_default = raw.get("default_remote")
-        default_remote = str(configured_default).strip() if configured_default is not None else None
-        if default_remote is not None and default_remote not in remotes:
-            raise ConfigurationError(f"unknown default_remote {default_remote!r}")
-
-    raw_projects = raw.get("projects")
-    if not isinstance(raw_projects, dict) or not raw_projects:
-        raise ConfigurationError("configuration requires at least one [projects.NAME] table")
-
-    projects: dict[str, ProjectConfig] = {}
-    for name, values in raw_projects.items():
-        if not isinstance(values, dict):
-            raise ConfigurationError(f"projects.{name} must be a table")
-        projects[name] = _load_project(name, values, path.parent, set(remotes))
-
-    # Reject explicit target_id reuse across distinct physical payloads before
-    # any CLI remote connect or state-dir access.
-    _validate_explicit_target_id_bindings(remotes, projects)
-
-    return AppConfig(
-        path=path,
-        remotes=remotes,
-        projects=projects,
-        default_remote=default_remote,
-    )
+        raise ConfigError("build.timeout must be a positive number or null")
+    return BuildConfig(steps, timeout)
 
 
-def _validate_explicit_target_id_bindings(
-    remotes: dict[str, ServerConfig],
-    projects: dict[str, ProjectConfig],
-) -> None:
-    """Ensure each explicit ``target_id`` binds to one canonical physical payload.
+def _parse_outputs(raw: Any, root: Path) -> tuple[OutputConfig, ...]:
+    """Validate output mappings and keep every local path inside the project."""
 
-    Args:
-        remotes: Configured remotes.
-        projects: Configured projects (including per-remote root overrides).
-
-    Returns:
-        None.
-
-    Raises:
-        ConfigurationError: When the same explicit id names different payloads.
-    """
-
-    from .target_identity import PhysicalTargetPayload, build_physical_payload
-
-    bound: dict[str, PhysicalTargetPayload] = {}
-    for remote_name, server in remotes.items():
-        for project in projects.values():
-            if not project.target_id:
-                continue
-            override = project.remotes.get(remote_name)
-            root = (
-                override.remote_root
-                if override is not None and override.remote_root is not None
-                else project.remote_root
-            )
-            if not root:
-                continue
-            payload = build_physical_payload(
-                protocol=str(server.values.get("protocol", "sftp")),
-                host=str(server.values.get("host", "")),
-                port=server.values.get("port"),
-                project=project.name,
-                remote_root=root,
-            )
-            existing = bound.get(project.target_id)
-            if existing is not None and existing.canonical_dict() != payload.canonical_dict():
-                raise ConfigurationError(
-                    f"explicit target_id {project.target_id!r} cannot merge distinct "
-                    f"physical payloads (conflict across remote {remote_name!r} / "
-                    f"project {project.name!r})"
-                )
-            bound[project.target_id] = payload
+    if not isinstance(raw, list):
+        raise ConfigError("outputs must be an array of tables")
+    outputs: list[OutputConfig] = []
+    for index, value in enumerate(raw):
+        table = _table(value, f"outputs[{index}]")
+        _reject_unknown(table, {"local", "remote", "delete_removed"}, f"outputs[{index}]")
+        local_text = _required_string(table.get("local"), f"outputs[{index}].local")
+        local_rel = Path(local_text)
+        if local_rel.is_absolute() or ".." in local_rel.parts:
+            raise ConfigError(f"outputs[{index}].local must stay inside the project root")
+        local = (root / local_rel).resolve()
+        if not local.is_relative_to(root):
+            raise ConfigError(f"outputs[{index}].local resolves outside the project root")
+        remote = _relative_remote(table.get("remote"), f"outputs[{index}].remote")
+        delete_removed = table.get("delete_removed", True)
+        if not isinstance(delete_removed, bool):
+            raise ConfigError(f"outputs[{index}].delete_removed must be a boolean")
+        outputs.append(OutputConfig(local, remote, delete_removed))
+    return tuple(outputs)
 
 
-def _load_project(
-    name: str,
-    values: dict[str, Any],
-    base: Path,
-    remote_names: set[str],
-) -> ProjectConfig:
-    """Resolve one project table relative to the configuration directory.
+def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
+    """Validate named SFTP/FTP targets and protocol-specific settings."""
 
-    Args:
-        name: Project key used by the CLI.
-        values: Raw TOML project mapping.
-        base: Directory containing the TOML file.
-        remote_names: Configured remote names available to the project.
-
-    Returns:
-        Validated project configuration.
-    """
-
-    raw_repository = values.get("repository", values.get("source"))
-    remote_root = str(values.get("remote_root", "")).strip()
-    if not raw_repository:
-        raise ConfigurationError(f"projects.{name}.repository is required")
-    if remote_root:
-        remote_root = _validate_remote_root(remote_root, f"projects.{name}.remote_root")
-
-    raw_project_remotes = values.get("remotes", {})
-    if not isinstance(raw_project_remotes, dict):
-        raise ConfigurationError(f"projects.{name}.remotes must be a table")
-    project_remotes: dict[str, ProjectRemoteConfig] = {}
-    for remote_name, overrides in raw_project_remotes.items():
-        _validate_remote_name(remote_name)
-        if remote_name not in remote_names:
-            raise ConfigurationError(
-                f"projects.{name}.remotes.{remote_name} has no matching [remotes.{remote_name}]"
-            )
-        if not isinstance(overrides, dict):
-            raise ConfigurationError(f"projects.{name}.remotes.{remote_name} must be a table")
-        remote_prefix = f"projects.{name}.remotes.{remote_name}"
-        override_root = str(overrides.get("remote_root", "")).strip() or None
-        if override_root is not None:
-            override_root = _validate_remote_root(
-                override_root,
-                f"projects.{name}.remotes.{remote_name}.remote_root",
-            )
-        project_remotes[remote_name] = ProjectRemoteConfig(
-            remote_root=override_root,
-            post_commands=(
-                _string_tuple(overrides.get("post_commands"), ())
-                if "post_commands" in overrides
-                else None
-            ),
-            health_urls=(
-                _string_tuple(overrides.get("health_urls"), ())
-                if "health_urls" in overrides
-                else None
-            ),
-            build=(
-                _load_build(overrides["build"], f"{remote_prefix}.build")
-                if "build" in overrides
-                else None
-            ),
-            build_configured="build" in overrides,
-            artifacts=(
-                _load_artifacts(overrides["artifacts"], f"{remote_prefix}.artifacts")
-                if "artifacts" in overrides
-                else None
-            ),
+    table = _table(raw, "targets")
+    if not table:
+        raise ConfigError("at least one [targets.NAME] table is required")
+    targets: dict[str, TargetConfig] = {}
+    for name, value in table.items():
+        if not isinstance(name, str) or not name or "/" in name or "\\" in name or name in {".", ".."}:
+            raise ConfigError(f"invalid target name: {name!r}")
+        item = _table(value, f"targets.{name}")
+        _reject_unknown(
+            item,
+            {
+                "protocol",
+                "host",
+                "username",
+                "remote_root",
+                "port",
+                "password_env",
+                "ssh_host_alias",
+                "ssh_config_file",
+                "known_hosts_file",
+                "key_file",
+                "use_ssh_agent",
+                "strict_host_key_checking",
+                "passive",
+                "timeout",
+            },
+            f"targets.{name}",
         )
-
-    missing_roots = sorted(
-        remote_name
-        for remote_name in remote_names
-        if not remote_root
-        and (
-            remote_name not in project_remotes
-            or project_remotes[remote_name].remote_root is None
+        protocol_value = _required_string(item.get("protocol"), f"targets.{name}.protocol").lower()
+        if protocol_value not in {"sftp", "ftp"}:
+            raise ConfigError(f"targets.{name}.protocol must be 'sftp' or 'ftp'")
+        protocol = cast(Protocol, protocol_value)
+        alias = _optional_string(item.get("ssh_host_alias"), f"targets.{name}.ssh_host_alias")
+        host = _optional_string(item.get("host"), f"targets.{name}.host")
+        if not host and not (protocol == "sftp" and alias):
+            raise ConfigError(f"targets.{name} requires host or an SFTP ssh_host_alias")
+        username = _optional_string(item.get("username"), f"targets.{name}.username")
+        if protocol == "ftp" and not username:
+            raise ConfigError(f"targets.{name}.username is required for FTP")
+        remote_root = _absolute_remote(item.get("remote_root"), f"targets.{name}.remote_root")
+        port_default = 22 if protocol == "sftp" else 21
+        port = item.get("port", port_default)
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ConfigError(f"targets.{name}.port must be between 1 and 65535")
+        timeout = item.get("timeout", 15)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+            raise ConfigError(f"targets.{name}.timeout must be positive")
+        password_env = _optional_string(item.get("password_env"), f"targets.{name}.password_env")
+        if protocol == "ftp" and not password_env:
+            raise ConfigError(f"targets.{name}.password_env is required for FTP")
+        key_raw = _optional_string(item.get("key_file"), f"targets.{name}.key_file")
+        key_file = _resolve_user_path(key_raw, root) if key_raw else None
+        config_raw = _optional_string(item.get("ssh_config_file"), f"targets.{name}.ssh_config_file")
+        ssh_config = _resolve_user_path(config_raw or "~/.ssh/config", root)
+        known_hosts_raw = _optional_string(
+            item.get("known_hosts_file"), f"targets.{name}.known_hosts_file"
         )
-    )
-    if missing_roots:
-        raise ConfigurationError(
-            f"projects.{name} requires remote_root for remote(s): {', '.join(missing_roots)}"
+        known_hosts_file = _resolve_user_path(known_hosts_raw, root) if known_hosts_raw else None
+        use_agent = item.get("use_ssh_agent", True)
+        strict = item.get("strict_host_key_checking", True)
+        passive = item.get("passive", True)
+        for field_name, setting in (
+            ("use_ssh_agent", use_agent),
+            ("strict_host_key_checking", strict),
+            ("passive", passive),
+        ):
+            if not isinstance(setting, bool):
+                raise ConfigError(f"targets.{name}.{field_name} must be a boolean")
+        if protocol == "ftp" and any(
+            key in item
+            for key in (
+                "ssh_host_alias",
+                "ssh_config_file",
+                "known_hosts_file",
+                "key_file",
+                "use_ssh_agent",
+                "strict_host_key_checking",
+            )
+        ):
+            raise ConfigError(f"targets.{name} contains SFTP-only settings for an FTP target")
+        targets[name] = TargetConfig(
+            name=name,
+            protocol=protocol,
+            host=host,
+            username=username,
+            remote_root=remote_root,
+            port=port,
+            port_explicit="port" in item,
+            password_env=password_env,
+            ssh_host_alias=alias,
+            ssh_config_file=ssh_config,
+            known_hosts_file=known_hosts_file,
+            key_file=key_file,
+            use_ssh_agent=use_agent,
+            strict_host_key_checking=strict,
+            passive=passive,
+            timeout=float(timeout),
         )
-
-    repository = Path(str(raw_repository)).expanduser()
-    if not repository.is_absolute():
-        repository = base / repository
-    repository = repository.resolve()
-    if not repository.is_dir():
-        raise ConfigurationError(f"projects.{name}.repository does not exist: {repository}")
-
-    state_value = values.get("local_state_dir")
-    state_dir = _resolve_optional_path(state_value, base)
-    explicit_target = values.get("target_id")
-    target_id = str(explicit_target).strip() if explicit_target is not None else None
-    if target_id == "":
-        raise ConfigurationError(f"projects.{name}.target_id must not be empty")
-    build = (
-        _load_build(values["build"], f"projects.{name}.build")
-        if "build" in values
-        else None
-    )
-    artifacts = _load_artifacts(
-        values.get("artifacts", []), f"projects.{name}.artifacts"
-    )
-
-    return ProjectConfig(
-        name=name,
-        repository=repository,
-        remote_root=remote_root,
-        include=_string_tuple(values.get("include"), ("**",)),
-        exclude=_string_tuple(values.get("exclude"), ()),
-        protected=_string_tuple(values.get("protected"), ()),
-        post_commands=_string_tuple(values.get("post_commands"), ()),
-        health_urls=_string_tuple(values.get("health_urls"), ()),
-        local_state_dir=state_dir,
-        remotes=project_remotes,
-        target_id=target_id,
-        build=build,
-        artifacts=artifacts,
-        build_origin="project" if build is not None else "none",
-        artifacts_origin="project",
-    )
+    return targets
 
 
-def select_remote(
-    config: AppConfig,
-    requested: str | None,
-) -> tuple[str, ServerConfig, dict[str, ProjectConfig]]:
-    """Resolve one remote and materialize its project-specific overrides.
+def _parse_deploy(raw: Any) -> DeployConfig:
+    """Validate retry count and delay."""
 
-    Args:
-        config: Loaded application configuration.
-        requested: CLI remote name, or ``None`` to use a safe configured default.
-
-    Returns:
-        Remote name, server settings, and resolved projects.
-    """
-
-    remote_name = requested or config.default_remote
-    if remote_name is None:
-        if len(config.remotes) == 1:
-            remote_name = next(iter(config.remotes))
-        else:
-            available = ", ".join(config.remotes)
-            raise ConfigurationError(
-                f"--remote is required; available remotes: {available}"
-            )
-    try:
-        server = config.remotes[remote_name]
-    except KeyError as exc:
-        available = ", ".join(config.remotes)
-        raise ConfigurationError(
-            f"unknown remote {remote_name!r}; available: {available}"
-        ) from exc
-
-    projects: dict[str, ProjectConfig] = {}
-    for name, project in config.projects.items():
-        override = project.remotes.get(remote_name)
-        projects[name] = replace(
-            project,
-            remote_root=(override.remote_root if override and override.remote_root else project.remote_root),
-            post_commands=(
-                override.post_commands
-                if override and override.post_commands is not None
-                else project.post_commands
-            ),
-            health_urls=(
-                override.health_urls
-                if override and override.health_urls is not None
-                else project.health_urls
-            ),
-            build=(
-                override.build
-                if override and override.build_configured
-                else project.build
-            ),
-            artifacts=(
-                override.artifacts
-                if override and override.artifacts is not None
-                else project.artifacts
-            ),
-            build_origin=(
-                f"remote:{remote_name}"
-                if override and override.build_configured
-                else project.build_origin
-            ),
-            artifacts_origin=(
-                f"remote:{remote_name}"
-                if override and override.artifacts is not None
-                else project.artifacts_origin
-            ),
-            remote=remote_name,
-            remotes={},
-        )
-    return remote_name, server, projects
+    table = _table(raw, "deploy")
+    _reject_unknown(table, {"retries", "retry_delay"}, "deploy")
+    retries = table.get("retries", 3)
+    delay = table.get("retry_delay", 2)
+    if not isinstance(retries, int) or isinstance(retries, bool) or retries < 1:
+        raise ConfigError("deploy.retries must be a positive integer")
+    if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
+        raise ConfigError("deploy.retry_delay must be a non-negative number")
+    return DeployConfig(retries, float(delay))
 
 
-def resolve_project_target(
-    server: ServerConfig,
-    project: ProjectConfig,
-    *,
-    bound_payloads: dict[str, Any] | None = None,
-    config: AppConfig | None = None,
-) -> Any:
-    """Resolve physical target identity for one project/remote pair.
-
-    When ``config`` is provided, rebuilds the global explicit-id binding table
-    from all remotes/projects so accidental cross-payload merges fail closed
-    even if callers omit ``bound_payloads``.
-
-    Args:
-        server: Selected remote server settings.
-        project: Resolved project (with remote_root already applied).
-        bound_payloads: Optional explicit-id → payload map used to reject merges.
-        config: Optional full app config for global binding enforcement.
-
-    Returns:
-        ``TargetIdentity`` for the project/remote combination.
-    """
-
-    from .target_identity import PhysicalTargetPayload, build_physical_payload, resolve_target_identity
-
-    bound = None
-    table = dict(bound_payloads or {})
-    if config is not None and project.target_id:
-        # Collect payloads already bound to this explicit id across the config.
-        for remote_name, remote_server in config.remotes.items():
-            other = config.projects.get(project.name)
-            if other is None or not other.target_id:
-                continue
-            if other.target_id != project.target_id:
-                continue
-            override = other.remotes.get(remote_name)
-            root = (
-                override.remote_root
-                if override is not None and override.remote_root is not None
-                else other.remote_root
-            )
-            if not root:
-                continue
-            payload = build_physical_payload(
-                protocol=str(remote_server.values.get("protocol", "sftp")),
-                host=str(remote_server.values.get("host", "")),
-                port=remote_server.values.get("port"),
-                project=other.name,
-                remote_root=root,
-            )
-            existing = table.get(project.target_id)
-            if existing is not None:
-                existing_payload = (
-                    existing
-                    if isinstance(existing, PhysicalTargetPayload)
-                    else None
-                )
-                if (
-                    existing_payload is not None
-                    and existing_payload.canonical_dict() != payload.canonical_dict()
-                ):
-                    raise ConfigurationError(
-                        f"explicit target_id {project.target_id!r} cannot merge "
-                        "distinct physical payloads"
-                    )
-            else:
-                table[project.target_id] = payload
-        # Also scan every project sharing the same explicit id.
-        for other_name, other in config.projects.items():
-            if other.target_id != project.target_id:
-                continue
-            for remote_name, remote_server in config.remotes.items():
-                override = other.remotes.get(remote_name)
-                root = (
-                    override.remote_root
-                    if override is not None and override.remote_root is not None
-                    else other.remote_root
-                )
-                if not root:
-                    # Resolved project already has remote_root applied.
-                    root = project.remote_root if other_name == project.name else other.remote_root
-                if not root:
-                    continue
-                payload = build_physical_payload(
-                    protocol=str(remote_server.values.get("protocol", "sftp")),
-                    host=str(remote_server.values.get("host", "")),
-                    port=remote_server.values.get("port"),
-                    project=other.name,
-                    remote_root=root,
-                )
-                existing = table.get(project.target_id)
-                if isinstance(existing, PhysicalTargetPayload):
-                    if existing.canonical_dict() != payload.canonical_dict():
-                        raise ConfigurationError(
-                            f"explicit target_id {project.target_id!r} cannot merge "
-                            "distinct physical payloads"
-                        )
-                else:
-                    table[project.target_id] = payload
-
-    if project.target_id and project.target_id in table:
-        bound = table[project.target_id]
-        if not isinstance(bound, PhysicalTargetPayload):
-            bound = None
-    return resolve_target_identity(
-        server,
-        project,
-        explicit_target_id=project.target_id,
-        bound_payload=bound,
-    )
-
-
-def build_config_summary(project: ProjectConfig) -> dict[str, Any]:
-    """Return a secret-safe summary for plan/dry-run rendering.
-
-    The summary intentionally includes only declared environment names and the
-    provider label. It never includes ``op://`` references or resolved values.
-
-    Args:
-        project: Resolved project configuration.
-
-    Returns:
-        JSON-compatible summary without secret references or values.
-    """
-
-    build = project.build
-    if build is None:
-        return {
-            "enabled": False,
-            "build_origin": project.build_origin,
-            "artifacts_origin": project.artifacts_origin,
-            "artifact_destinations": [item.destination for item in project.artifacts],
-        }
-    summary: dict[str, Any] = {
-        "enabled": True,
-        "runner": build.runner,
-        "build_origin": project.build_origin,
-        "artifacts_origin": project.artifacts_origin,
-        "commands": [list(command) for command in build.commands],
-        "cwd": build.cwd,
-        "timeout": build.timeout,
-        "env_names": list(build.env_allowlist),
-        "artifact_destinations": [item.destination for item in project.artifacts],
-    }
-    if build.docker is not None:
-        summary["docker"] = {
-            "image": build.docker.image,
-            "network": build.docker.network,
-            "platform": build.docker.platform,
-            "pull_policy": build.docker.pull_policy,
-        }
-    if build.onepassword is not None:
-        summary["secret_provider"] = "1password"
-        summary["secret_env_names"] = [name for name, _reference in build.onepassword.env]
-    return summary
-
-
-def _validate_remote_name(name: str) -> None:
-    """Reject remote names that are unsafe in CLI output or state paths.
-
-    Args:
-        name: Candidate remote identifier.
-
-    Returns:
-        None.
-    """
-
-    if not _REMOTE_NAME.fullmatch(name):
-        raise ConfigurationError(f"invalid remote name: {name!r}")
-
-
-def _validate_remote_root(value: str, field: str) -> str:
-    """Validate and normalize one absolute POSIX deployment root.
-
-    Args:
-        value: Candidate remote directory.
-        field: Configuration field name used in validation errors.
-
-    Returns:
-        Normalized absolute remote directory.
-    """
-
-    if not value.startswith("/") or "\\" in value:
-        raise ConfigurationError(f"{field} must be an absolute POSIX path")
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ConfigurationError(f"{field} cannot contain control characters")
-    raw_parts = value.split("/")
-    if ".." in raw_parts or "." in raw_parts:
-        raise ConfigurationError(f"{field} cannot contain traversal segments")
-    return PurePosixPath(value).as_posix().rstrip("/") or "/"
-
-
-def _load_build(value: Any, field: str) -> BuildConfig:
-    """Validate a host/Docker build configuration table.
-
-    Args:
-        value: Parsed TOML value.
-        field: Fully qualified field used in errors.
-
-    Returns:
-        Immutable build configuration.
-    """
+def _table(value: Any, name: str) -> dict[str, Any]:
+    """Require and return a TOML table."""
 
     if not isinstance(value, dict):
-        raise ConfigurationError(f"{field} must be a table")
-    allowed = {
-        "runner",
-        "commands",
-        "timeout",
-        "cwd",
-        "env_allowlist",
-        "docker",
-        "onepassword",
-    }
-    unknown = sorted(set(value) - allowed)
+        raise ConfigError(f"{name} must be a table")
+    return value
+
+
+def _reject_unknown(table: dict[str, Any], allowed: set[str], name: str) -> None:
+    """Reject misspelled or legacy fields instead of silently ignoring them."""
+
+    unknown = sorted(set(table) - allowed)
     if unknown:
-        raise ConfigurationError(f"{field} contains unsupported keys: {', '.join(unknown)}")
-    runner = str(value.get("runner", "host")).strip().lower()
-    if runner not in {"host", "docker"}:
-        raise ConfigurationError(f"{field}.runner must be 'host' or 'docker'")
-    commands = _command_matrix(value.get("commands"), f"{field}.commands")
-    timeout_value = value.get("timeout", 900)
-    if isinstance(timeout_value, bool) or not isinstance(timeout_value, int) or timeout_value <= 0:
-        raise ConfigurationError(f"{field}.timeout must be a positive integer")
-    cwd = _relative_config_path(value.get("cwd", "."), f"{field}.cwd", allow_dot=True)
-    env_allowlist = _env_name_tuple(
-        value.get("env_allowlist", []), f"{field}.env_allowlist"
-    )
-    docker = None
-    if "docker" in value:
-        docker = _load_docker(value["docker"], f"{field}.docker")
-    if runner == "docker" and docker is None:
-        raise ConfigurationError(f"{field}.docker is required for runner='docker'")
-    if runner == "host" and docker is not None:
-        raise ConfigurationError(f"{field}.docker requires runner='docker'")
-    onepassword = None
-    if "onepassword" in value:
-        onepassword = _load_onepassword(
-            value["onepassword"],
-            f"{field}.onepassword",
-            env_allowlist,
-        )
-    return BuildConfig(
-        runner=runner,
-        commands=commands,
-        timeout=timeout_value,
-        cwd=cwd,
-        env_allowlist=env_allowlist,
-        docker=docker,
-        onepassword=onepassword,
-    )
+        raise ConfigError(f"unknown {name} field(s): {', '.join(unknown)}")
 
 
-def _load_docker(value: Any, field: str) -> DockerBuildConfig:
-    """Validate the restricted Docker runner table."""
+def _string_tuple(value: Any, name: str, *, allow_empty: bool = True) -> tuple[str, ...]:
+    """Require a list of non-empty strings and return an immutable tuple."""
 
-    if not isinstance(value, dict):
-        raise ConfigurationError(f"{field} must be a table")
-    allowed = {"image", "platform", "network", "pull_policy"}
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise ConfigurationError(f"{field} contains unsupported keys: {', '.join(unknown)}")
-    image = str(value.get("image", "")).strip()
-    if not image:
-        raise ConfigurationError(f"{field}.image is required")
-    platform = str(value.get("platform", "linux/amd64")).strip()
-    if not platform or any(char.isspace() for char in platform):
-        raise ConfigurationError(f"{field}.platform must be a non-empty platform")
-    network = str(value.get("network", "none")).strip().lower()
-    if network not in {"none", "bridge"}:
-        raise ConfigurationError(f"{field}.network must be 'none' or 'bridge'")
-    pull_policy = str(value.get("pull_policy", "never")).strip().lower()
-    if pull_policy not in {"never", "missing"}:
-        raise ConfigurationError(f"{field}.pull_policy must be 'never' or 'missing'")
-    return DockerBuildConfig(
-        image=image,
-        platform=platform,
-        network=network,
-        pull_policy=pull_policy,
-    )
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ConfigError(f"{name} must be an array of non-empty strings")
+    result = tuple(item.strip() for item in value)
+    if not allow_empty and not result:
+        raise ConfigError(f"{name} must not be empty")
+    return result
 
 
-def _load_onepassword(
-    value: Any,
-    field: str,
-    env_allowlist: tuple[str, ...],
-) -> OnePasswordConfig:
-    """Validate opaque ``op://`` environment references without resolving them."""
-
-    if not isinstance(value, dict):
-        raise ConfigurationError(f"{field} must be a table")
-    unknown = sorted(set(value) - {"env"})
-    if unknown:
-        raise ConfigurationError(f"{field} contains unsupported keys: {', '.join(unknown)}")
-    raw_env = value.get("env")
-    if not isinstance(raw_env, dict) or not raw_env:
-        raise ConfigurationError(f"{field}.env must be a non-empty table")
-    pairs: list[tuple[str, str]] = []
-    for name, reference_value in raw_env.items():
-        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name) or name.startswith("OP_"):
-            raise ConfigurationError(f"{field}.env has invalid or reserved name {name!r}")
-        if name not in env_allowlist:
-            raise ConfigurationError(f"{field}.env.{name} must also appear in env_allowlist")
-        if not isinstance(reference_value, str) or not reference_value.startswith("op://"):
-            raise ConfigurationError(f"{field}.env.{name} must be an op:// reference")
-        if len(reference_value.split("/")) < 5:
-            raise ConfigurationError(f"{field}.env.{name} is not a complete op:// reference")
-        pairs.append((name, reference_value))
-    return OnePasswordConfig(env=tuple(sorted(pairs)))
-
-
-def _load_artifacts(value: Any, field: str) -> tuple[ArtifactConfig, ...]:
-    """Validate artifact file/tree mappings and destination uniqueness."""
-
-    if not isinstance(value, list):
-        raise ConfigurationError(f"{field} must be an array of tables")
-    artifacts: list[ArtifactConfig] = []
-    destinations: set[str] = set()
-    for index, item in enumerate(value):
-        item_field = f"{field}[{index}]"
-        if not isinstance(item, dict):
-            raise ConfigurationError(f"{item_field} must be a table")
-        unknown = sorted(set(item) - {"source", "destination", "kind"})
-        if unknown:
-            raise ConfigurationError(
-                f"{item_field} contains unsupported keys: {', '.join(unknown)}"
-            )
-        source = _relative_config_path(item.get("source"), f"{item_field}.source")
-        destination = _relative_config_path(
-            item.get("destination"), f"{item_field}.destination"
-        )
-        kind = str(item.get("kind", "")).strip().lower()
-        if kind not in {"file", "tree"}:
-            raise ConfigurationError(f"{item_field}.kind must be 'file' or 'tree'")
-        if destination in destinations:
-            raise ConfigurationError(f"{field} has duplicate destination {destination!r}")
-        destinations.add(destination)
-        artifacts.append(ArtifactConfig(source=source, destination=destination, kind=kind))
-    return tuple(artifacts)
-
-
-def _relative_config_path(value: Any, field: str, *, allow_dot: bool = False) -> str:
-    """Normalize a safe POSIX-relative configuration path."""
+def _required_string(value: Any, name: str) -> str:
+    """Require and normalize one non-empty string."""
 
     if not isinstance(value, str) or not value.strip():
-        raise ConfigurationError(f"{field} must be a non-empty relative path")
-    candidate = value.strip()
-    if "\\" in candidate or candidate.startswith("/"):
-        raise ConfigurationError(f"{field} must be a POSIX-relative path")
-    raw_parts = candidate.split("/")
-    if any(part in {"", ".."} for part in raw_parts):
-        raise ConfigurationError(f"{field} cannot contain empty or traversal segments")
-    if candidate == ".":
-        if allow_dot:
-            return candidate
-        raise ConfigurationError(f"{field} cannot be '.'")
-    if any(part == "." for part in raw_parts):
-        raise ConfigurationError(f"{field} cannot contain '.' segments")
-    return PurePosixPath(candidate).as_posix()
+        raise ConfigError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
-def _command_matrix(value: Any, field: str) -> tuple[tuple[str, ...], ...]:
-    """Normalize a non-empty list of argv arrays without shell strings."""
-
-    if not isinstance(value, list) or not value:
-        raise ConfigurationError(f"{field} must be a non-empty array of argv arrays")
-    commands: list[tuple[str, ...]] = []
-    for index, command in enumerate(value):
-        if not isinstance(command, list) or not command:
-            raise ConfigurationError(f"{field}[{index}] must be a non-empty argv array")
-        argv: list[str] = []
-        for arg in command:
-            if not isinstance(arg, str) or "\x00" in arg:
-                raise ConfigurationError(f"{field}[{index}] must contain only strings")
-            argv.append(arg)
-        if not argv[0].strip():
-            raise ConfigurationError(f"{field}[{index}][0] must not be empty")
-        commands.append(tuple(argv))
-    return tuple(commands)
-
-
-def _env_name_tuple(value: Any, field: str) -> tuple[str, ...]:
-    """Validate unique, non-reserved environment variable names."""
-
-    names = _string_tuple(value, ())
-    if len(names) != len(set(names)):
-        raise ConfigurationError(f"{field} contains duplicate names")
-    for name in names:
-        if not _ENV_NAME.fullmatch(name):
-            raise ConfigurationError(f"{field} contains invalid name {name!r}")
-    return names
-
-
-_FTPS_TLS_PATH_FIELDS = ("tls_ca_file", "tls_cert_file", "tls_key_file")
-# transport.py's build_ftps_ssl_context/ftps_tls_trust_digest also accept these
-# legacy, undocumented aliases (`server.get("tls_ca_file") or server.get("ca_file")`);
-# resolve/validate whichever key is actually present so neither name silently
-# skips the config-relative rule or the load-time existence check.
-_FTPS_TLS_PATH_ALIASES = {
-    "tls_ca_file": "ca_file",
-    "tls_cert_file": "cert_file",
-    "tls_key_file": "key_file",
-}
-
-
-def _resolve_ftps_tls_paths(values: dict[str, Any], *, base: Path, location: str) -> None:
-    """Resolve FTPS certificate paths config-relative and reject unreadable files.
-
-    P1-08: ``tls_ca_file``/``tls_cert_file``/``tls_key_file`` (and their
-    ``ca_file``/``cert_file``/``key_file`` aliases, scoped to ``protocol =
-    "ftps"`` entries only so they never touch SFTP's unrelated ``key_file``)
-    must follow the same "relative to deploy.toml's directory" rule as every
-    other configured path (README ``配置文件发现顺序``), instead of being
-    interpreted against the process's current working directory only at
-    connect time. Resolved values are written back into ``values`` in place
-    so downstream transport code needs no change. Existence/readability is
-    only enforced for entries actually configured as ``protocol = "ftps"``:
-    these fields are meaningless for other protocols and must not block an
-    otherwise-valid config.
-
-    Args:
-        values: Mutable parsed ``[server]``/``[remotes.NAME]`` table.
-        base: Directory containing the TOML file.
-        location: Human-readable table path used in error messages.
-
-    Returns:
-        None.
-
-    Raises:
-        ConfigurationError: When an ftps entry names a missing or unreadable file.
-    """
-
-    is_ftps = str(values.get("protocol", "sftp")).lower() == "ftps"
-    fields = list(_FTPS_TLS_PATH_FIELDS)
-    if is_ftps:
-        fields += list(_FTPS_TLS_PATH_ALIASES.values())
-    for field in fields:
-        raw_value = values.get(field)
-        if raw_value is None or not str(raw_value).strip():
-            continue
-        resolved = _resolve_optional_path(raw_value, base)
-        assert resolved is not None
-        if is_ftps:
-            if not resolved.is_file():
-                raise ConfigurationError(
-                    f"{location}.{field} does not exist: {resolved}"
-                )
-            try:
-                resolved.open("rb").close()
-            except OSError as exc:
-                raise ConfigurationError(
-                    f"{location}.{field} is not readable: {resolved}: {exc}"
-                ) from exc
-        values[field] = str(resolved)
-
-
-def _resolve_optional_path(value: Any, base: Path) -> Path | None:
-    """Resolve an optional path value relative to a configuration directory.
-
-    Args:
-        value: TOML value or ``None``.
-        base: Directory containing the TOML file.
-
-    Returns:
-        Absolute path, or ``None`` when no value was configured.
-    """
+def _optional_string(value: Any, name: str) -> str | None:
+    """Validate an optional non-empty string."""
 
     if value is None:
         return None
-    path = Path(str(value)).expanduser()
-    return (path if path.is_absolute() else base / path).resolve()
+    return _required_string(value, name)
 
 
-def _string_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
-    """Normalize a TOML string array.
+def _relative_remote(value: Any, name: str) -> PurePosixPath:
+    """Require a safe relative POSIX remote path."""
 
-    Args:
-        value: Parsed TOML value.
-        default: Value returned when the key is absent.
+    text = _required_string(value, name).replace("\\", "/")
+    path = PurePosixPath(text)
+    if path.is_absolute() or ".." in path.parts:
+        raise ConfigError(f"{name} must be a relative POSIX path")
+    return path
 
-    Returns:
-        Tuple of non-empty strings.
-    """
 
-    if value is None:
-        return default
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ConfigurationError("expected an array of strings")
-    return tuple(item for item in value if item)
+def _absolute_remote(value: Any, name: str) -> PurePosixPath:
+    """Require an absolute normalized POSIX remote root."""
+
+    text = _required_string(value, name).replace("\\", "/")
+    path = PurePosixPath(text)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ConfigError(f"{name} must be an absolute POSIX path")
+    return path
+
+
+def _resolve_user_path(value: str, root: Path) -> Path:
+    """Resolve a user/config-relative local path."""
+
+    expanded = Path(value).expanduser()
+    return expanded.resolve() if expanded.is_absolute() else (root / expanded).resolve()
+
+
+def _validate_patterns(patterns: tuple[str, ...]) -> None:
+    """Reject absolute and parent-traversing path patterns."""
+
+    for pattern in patterns:
+        normalized = pattern.replace("\\", "/")
+        if normalized.startswith("/") or ".." in PurePosixPath(normalized).parts:
+            raise ConfigError(f"unsafe path pattern: {pattern!r}")
