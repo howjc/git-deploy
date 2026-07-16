@@ -16,6 +16,7 @@ from git_deploy.planner import DeploymentPlan, Operation, UploadOperation
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
 from git_deploy.transports.base import Transport
+from git_deploy.transports.openssh_sftp import SSHConnectionPool
 
 TransportFactory = Callable[[TargetConfig], Transport]
 
@@ -49,31 +50,76 @@ def execute_plan(
         )
         print("No file changes; deployment state advanced to HEAD.")
         return
-    progress = ProgressReporter(verbose)
     with tempfile.TemporaryDirectory(prefix="git-deploy-") as directory:
-        frozen = _freeze_uploads(plan, repository, Path(directory))
-        transport = transport_factory(plan.target)
-        try:
-            _connect_with_retry(
+        frozen = freeze_uploads(plan, repository, Path(directory))
+        execute_frozen_plan(
+            plan,
+            config,
+            state_store,
+            frozen,
+            verbose=verbose,
+            transport_factory=transport_factory,
+        )
+
+
+def execute_frozen_plan(
+    plan: DeploymentPlan,
+    config: Config,
+    state_store: StateStore,
+    frozen: dict[str, Path],
+    *,
+    verbose: bool = False,
+    transport_factory: TransportFactory | None = None,
+    connection_pool: SSHConnectionPool | None = None,
+) -> None:
+    """Execute already frozen bytes and commit only this project's successful state.
+
+    Args:
+        plan: Frozen deployment plan.
+        config: Project retry settings.
+        state_store: Independent project target state.
+        frozen: Upload paths captured during the prepare phase.
+        verbose: Enable more frequent progress output.
+        transport_factory: Optional fake/custom transport factory.
+        connection_pool: Command-scoped Native OpenSSH connection pool.
+
+    Returns:
+        ``None`` after this project's remote operations and state commit succeed.
+    """
+
+    if not plan.operations:
+        state_store.save(
+            new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
+        )
+        print("No file changes; deployment state advanced to HEAD.")
+        return
+    progress = ProgressReporter(verbose)
+    transport = (
+        transport_factory(plan.target)
+        if transport_factory is not None
+        else create_transport(plan.target, connection_pool)
+    )
+    try:
+        _connect_with_retry(
+            transport,
+            attempts=config.deploy.retries,
+            delay=config.deploy.retry_delay,
+        )
+        for operation in plan.operations:
+            _execute_with_retry(
+                operation,
+                frozen,
                 transport,
+                progress,
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
-            for operation in plan.operations:
-                _execute_with_retry(
-                    operation,
-                    frozen,
-                    transport,
-                    progress,
-                    attempts=config.deploy.retries,
-                    delay=config.deploy.retry_delay,
-                )
-        except DeployError:
-            raise
-        except Exception as exc:
-            raise DeployError(f"deployment failed: {exc}") from exc
-        finally:
-            transport.close()
+    except DeployError:
+        raise
+    except Exception as exc:
+        raise DeployError(f"deployment failed: {exc}") from exc
+    finally:
+        transport.close()
     state_store.save(
         new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
     )
@@ -101,7 +147,7 @@ def _connect_with_retry(transport: Transport, *, attempts: int, delay: float) ->
                 time.sleep(delay)
 
 
-def _freeze_uploads(
+def freeze_uploads(
     plan: DeploymentPlan,
     repository: GitRepository,
     staging: Path,

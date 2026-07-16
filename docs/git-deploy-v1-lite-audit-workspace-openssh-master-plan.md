@@ -2485,14 +2485,14 @@ git-deploy prod
 
 ## P2：多仓 Workspace
 
-- [ ] 每仓独立 `deploy.toml`
-- [ ] Workspace 仅保存仓库 Path 与顺序
-- [ ] Prepare All Before Connect
-- [ ] Combined Plan
-- [ ] Confirm Once
-- [ ] Sequential Deploy
-- [ ] Shared SSH Connection Pool
-- [ ] 重跑自然收敛
+- [x] 每仓独立 `deploy.toml`
+- [x] Workspace 仅保存仓库 Path 与顺序
+- [x] Prepare All Before Connect
+- [x] Combined Plan
+- [x] Confirm Once
+- [x] Sequential Deploy
+- [x] Shared SSH Connection Pool
+- [x] 重跑自然收敛
 
 ---
 

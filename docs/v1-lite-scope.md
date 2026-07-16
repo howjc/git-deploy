@@ -10,12 +10,14 @@ v1-lite 的长期产品边界是“构建、找差异、上传”。
 - 未知远端内容永不删除；
 - 所有操作成功后才原子提交 `.git/git-deploy/<target>.json`；
 - 失败恢复方式是重新执行同一条命令。
+- Thin Workspace 只编排独立仓库的顺序与统一 Target；每仓保留自己的配置、Git、State 和 Lock。
 
 明确不做：
 
 - CI/CD、审批、RBAC、Web/TUI；
 - Expected State、Generation、CAS、Transaction、Deployment Manifest；
 - History、Verify、Recover、自动 Rollback；
+- Workspace 全局 State、跨仓事务、依赖图、Target Map 或默认并行；
 - Docker/1Password Build Provider、构建缓存或沙箱；
 - FTPS、远端 Hook、Health URL、Owner/Group 管理。
 
