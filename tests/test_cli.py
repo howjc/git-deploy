@@ -135,3 +135,67 @@ def test_doctor_reports_non_git_instead_of_exiting_early(
     monkeypatch.setattr(cli, "run_doctor", diagnosed)
 
     assert cli.main(["--config", str(path), "doctor"]) == 1
+
+
+def test_missing_output_after_successful_build_fails_before_remote(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful build that omits a required output cannot reach execution."""
+
+    path = write_config(git_project, create_outputs=False)
+    executed = False
+
+    def record(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        """Record any forbidden deployment call."""
+
+        nonlocal executed
+        executed = True
+
+    monkeypatch.setattr(cli, "execute_plan", record)
+
+    assert cli.main(["--config", str(path), "--yes"]) == 4
+    assert not executed
+    assert not (git_project / ".git/git-deploy/dev.json").exists()
+
+
+def test_build_created_dirty_worktree_is_reported_and_can_be_required_clean(
+    git_project: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Build-created worktree changes are visible and clean policy blocks them."""
+
+    warning_config = write_config(
+        git_project,
+        """
+[build]
+steps = ["touch generated.txt"]
+
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+    )
+    assert cli.main(["--config", str(warning_config), "--dry-run"]) == 0
+    assert "build changed the worktree" in capsys.readouterr().out
+
+    (git_project / "generated.txt").unlink()
+    strict_config = write_config(
+        git_project,
+        """
+[source]
+require_clean_worktree = true
+
+[build]
+steps = ["touch generated.txt"]
+
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+    )
+    assert cli.main(["--config", str(strict_config), "--dry-run"]) == 4

@@ -52,7 +52,7 @@ def test_repeated_daily_workflow_converges_and_preserves_unknown_remote(
 
     write_config(git_project)
     dist = git_project / "dist"
-    dist.mkdir()
+    dist.mkdir(exist_ok=True)
     asset = dist / "app.js"
     asset.write_text("asset-v1", encoding="utf-8")
     transport = FakeTransport()

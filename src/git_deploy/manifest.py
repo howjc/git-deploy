@@ -148,7 +148,9 @@ def scan_outputs(outputs: tuple[OutputConfig, ...]) -> dict[str, ScannedOutput]:
     scanned: dict[str, ScannedOutput] = {}
     for output in outputs:
         if not output.local.exists():
-            continue
+            # A missing configured root usually means a broken build or typo. It
+            # must not be interpreted as deliberate removal of every old output.
+            raise PlanError(f"configured output does not exist after build: {output.local}")
         if output.local.is_symlink():
             raise PlanError(f"output path must not be a symlink: {output.local}")
         if output.local.is_file():

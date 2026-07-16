@@ -33,8 +33,13 @@ def commit_all(root: Path, message: str = "change") -> str:
     return _git(root, "rev-parse", "HEAD").strip()
 
 
-def write_config(root: Path, body: str | None = None) -> Path:
-    """Write a minimal SFTP v1-lite configuration and return its path."""
+def write_config(
+    root: Path,
+    body: str | None = None,
+    *,
+    create_outputs: bool = True,
+) -> Path:
+    """Write a minimal SFTP config and optionally materialize its default output."""
 
     content = body or """
 default_target = "dev"
@@ -61,6 +66,8 @@ strict_host_key_checking = true
 retries = 2
 retry_delay = 0
 """
+    if body is None and create_outputs:
+        (root / "dist").mkdir(exist_ok=True)
     path = root / "deploy.toml"
     path.write_text(content.strip() + "\n", encoding="utf-8")
     return path

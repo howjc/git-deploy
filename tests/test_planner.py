@@ -107,6 +107,27 @@ def test_modified_source_is_uploaded(git_project: Path) -> None:
     ]
 
 
+def test_existing_empty_output_root_can_delete_owned_manifest_files(git_project: Path) -> None:
+    """An existing empty directory is an explicit current set, unlike a missing root."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    state = TargetState(
+        1,
+        "dev",
+        config.target(None).fingerprint,
+        repository.head(),
+        1,
+        {"public/dist/old.js": ManifestEntry("1" * 64, 3)},
+    )
+
+    plan = create_plan(config, config.target(None), repository, state, full=False)
+
+    assert [(type(item), item.remote_path) for item in plan.operations] == [
+        (DeleteOperation, "public/dist/old.js")
+    ]
+
+
 def test_protected_output_destination_fails_closed(git_project: Path) -> None:
     """Final protection also applies to output mappings, not only Git source."""
 
@@ -167,8 +188,46 @@ remote_root = "/srv/app"
         )
     )
 
-    with pytest.raises(PlanError, match="remote path conflict"):
+    with pytest.raises(PlanError, match="ownership conflict"):
         create_plan(config, config.target(None), GitRepository(git_project), None, full=False)
+
+
+def test_complete_ownership_conflict_is_rejected_when_source_is_unchanged(
+    git_project: Path,
+) -> None:
+    """Full ownership validation does not depend on a source operation this run."""
+
+    generated = git_project / "generated"
+    generated.mkdir()
+    (generated / "app.py").write_text("generated", encoding="utf-8")
+    config = load_config(
+        write_config(
+            git_project,
+            """
+[[outputs]]
+local = "generated"
+remote = "."
+
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+        )
+    )
+    repository = GitRepository(git_project)
+    state = TargetState(
+        1,
+        "dev",
+        config.target(None).fingerprint,
+        repository.head(),
+        1,
+        {"app.py": ManifestEntry("0" * 64, 9)},
+    )
+
+    with pytest.raises(PlanError, match="ownership conflict"):
+        create_plan(config, config.target(None), repository, state, full=False)
 
 
 def test_ssh_alias_is_resolved_and_frozen_into_plan(

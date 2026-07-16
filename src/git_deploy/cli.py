@@ -15,6 +15,7 @@ from git_deploy.errors import ConfigError, GitDeployError, PlanError, StateError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from git_deploy.planner import DeploymentPlan, create_plan, render_plan
+from git_deploy.config import resolve_target_for_plan
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,13 +88,11 @@ def _deploy(
 
     target = config.target(requested_target)
     repository.validate()
-    dirty = repository.is_dirty()
-    if dirty and config.source.require_clean_worktree:
+    before_build_status = repository.status_porcelain()
+    if before_build_status and config.source.require_clean_worktree:
         raise PlanError("worktree has uncommitted changes and source.require_clean_worktree is true")
-    if dirty:
+    if before_build_status:
         print("WARNING: uncommitted changes are not included; committed HEAD content will be deployed.")
-    if not args.skip_build:
-        run_build(config.build, config.project_root)
     try:
         state = state_store.load(target.name)
     except StateError:
@@ -101,7 +100,29 @@ def _deploy(
             raise
         print("WARNING: existing state is unreadable; --full will rebuild it after success.")
         state = None
-    plan = create_plan(config, target, repository, state, full=args.full)
+    resolved_target = resolve_target_for_plan(target)
+    target_fingerprint = resolved_target.fingerprint
+    if state is not None and state.target_fingerprint != target_fingerprint and not args.full:
+        raise PlanError("target identity changed since the last success; review it and rerun with --full")
+    if not args.skip_build:
+        run_build(config.build, config.project_root)
+        after_build_status = repository.status_porcelain()
+        if after_build_status and config.source.require_clean_worktree:
+            raise PlanError(
+                "build left uncommitted changes and source.require_clean_worktree is true"
+            )
+        if after_build_status != before_build_status:
+            print(
+                "WARNING: build changed the worktree; these changes are not included in source deployment."
+            )
+    plan = create_plan(
+        config,
+        target,
+        repository,
+        state,
+        full=args.full,
+        resolved_target=resolved_target,
+    )
     print(render_plan(plan))
     if args.dry_run:
         print("Dry-run complete: no remote connection and no state change.")

@@ -444,7 +444,24 @@ def _parse_outputs(raw: Any, root: Path) -> tuple[OutputConfig, ...]:
         if not isinstance(delete_removed, bool):
             raise ConfigError(f"outputs[{index}].delete_removed must be a boolean")
         outputs.append(OutputConfig(local, remote, delete_removed))
+    _validate_output_roots(outputs)
     return tuple(outputs)
+
+
+def _validate_output_roots(outputs: list[OutputConfig]) -> None:
+    """Reject equal or nested remote roots whose deletion ownership is ambiguous."""
+
+    for index, left in enumerate(outputs):
+        for right in outputs[index + 1 :]:
+            if (
+                left.remote == right.remote
+                or left.remote in right.remote.parents
+                or right.remote in left.remote.parents
+            ):
+                raise ConfigError(
+                    "output remote mappings must not be equal or nested: "
+                    f"{left.remote} and {right.remote}"
+                )
 
 
 def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:

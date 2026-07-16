@@ -75,6 +75,7 @@ def create_plan(
     state: TargetState | None,
     *,
     full: bool,
+    resolved_target: TargetConfig | None = None,
 ) -> DeploymentPlan:
     """Build the complete source/output plan without opening a remote connection.
 
@@ -91,13 +92,20 @@ def create_plan(
 
     repository.validate()
     head = repository.head()
-    resolved_target = resolve_target_for_plan(target)
+    resolved_target = resolved_target or resolve_target_for_plan(target)
     target_fingerprint = resolved_target.fingerprint
     effective_full = full or state is None
     if state is not None and state.target_fingerprint != target_fingerprint and not full:
         raise PlanError("target identity changed since the last success; review it and rerun with --full")
     current_outputs = scan_outputs(config.outputs)
-    source_operations = _plan_source(repository, config, state, head, effective_full)
+    entries = {entry.path: entry for entry in repository.list_head_entries()}
+    source_owned = {path for path in entries if is_source_managed(path, config.source)}
+    overlap = sorted(source_owned.intersection(current_outputs))
+    if overlap:
+        preview = ", ".join(overlap[:5])
+        suffix = " ..." if len(overlap) > 5 else ""
+        raise PlanError(f"source/output ownership conflict: {preview}{suffix}")
+    source_operations = _plan_source(repository, config, state, head, effective_full, entries)
     output_operations = _plan_outputs(config.outputs, current_outputs, state, effective_full)
     operations = _merge_operations((*source_operations, *output_operations), config)
     manifest = {path: item.entry for path, item in current_outputs.items()}
@@ -141,10 +149,10 @@ def _plan_source(
     state: TargetState | None,
     head: str,
     full: bool,
+    entries: dict[str, GitEntry],
 ) -> tuple[Operation, ...]:
     """Plan exact HEAD source blobs and Git-derived deletions."""
 
-    entries = {entry.path: entry for entry in repository.list_head_entries()}
     operations: list[Operation] = []
     if full:
         for path, entry in entries.items():

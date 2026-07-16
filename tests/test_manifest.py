@@ -39,6 +39,15 @@ def test_rejects_output_symlink(tmp_path: Path) -> None:
         scan_outputs((OutputConfig(output, PurePosixPath("dist")),))
 
 
+def test_missing_configured_output_fails_closed(tmp_path: Path) -> None:
+    """A missing output root cannot mean removal of all previously deployed files."""
+
+    missing = tmp_path / "dist"
+
+    with pytest.raises(PlanError, match="configured output does not exist"):
+        scan_outputs((OutputConfig(missing, PurePosixPath("public/dist")),))
+
+
 def test_state_is_isolated_and_round_trips(tmp_path: Path) -> None:
     """Each target uses its own schema-validated atomic JSON file."""
 
