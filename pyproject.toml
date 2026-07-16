@@ -1,7 +1,7 @@
 [project]
 name = "git-deploy"
-version = "0.3.2"
-description = "Git revision based deployment and rollback for Git projects"
+version = "1.0.0"
+description = "Git-aware local build and FTP/SFTP file synchronization"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,4 +18,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "pyftpdlib>=2.0.0",
+    "ruff>=0.12.0",
+    "ty>=0.0.1a15",
 ]

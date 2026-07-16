@@ -1,25 +1,37 @@
-"""Domain exceptions and stable CLI exit codes."""
+"""Public exception hierarchy and CLI exit-code mapping."""
+
+from __future__ import annotations
 
 
 class GitDeployError(Exception):
-    """Base error raised for an expected deployment failure."""
+    """Represent an expected user-facing git-deploy failure."""
 
     exit_code = 1
 
 
-class PolicyError(GitDeployError):
-    """Report a deployment blocked by a configured safety policy."""
+class ConfigError(GitDeployError):
+    """Report an invalid or unavailable v1-lite configuration."""
 
     exit_code = 2
 
 
-class RemoteDriftError(GitDeployError):
-    """Report remote bytes that do not match the declared source commit."""
+class BuildError(GitDeployError):
+    """Report a failed or timed-out local build step."""
 
     exit_code = 3
 
 
-class ConfigurationError(GitDeployError):
-    """Report invalid configuration, paths, or Git revision input."""
+class PlanError(GitDeployError):
+    """Report an unsafe or impossible local deployment plan."""
 
     exit_code = 4
+
+
+class StateError(PlanError):
+    """Report unreadable, corrupt, or incompatible lightweight state."""
+
+
+class DeployError(GitDeployError):
+    """Report a remote connection or file-operation failure."""
+
+    exit_code = 5

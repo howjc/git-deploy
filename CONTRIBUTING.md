@@ -1,27 +1,28 @@
 # Contributing to git-deploy
 
-## v0.3 产品范围
+## v1-lite 产品边界
 
-`git-deploy` 是面向个人和小团队的可靠文件部署 CLI，不是多人发布平台。变更应优先减少日常操作、提高部署/恢复可靠性并降低长期维护成本。
+`git-deploy` 只负责：本地构建、Git 源码差异、output SHA256 差异和 FTP/SFTP 文件同步。
 
-提交新功能提案前必须回答：
+新增能力必须直接缩短个人日常部署流程，且不能重新引入 Generation、CAS、Transaction、Rollback、Recover、远端 Expected State、构建沙箱或平台化 Application Layer。旧架构只在 `legacy/v0.3` 接受必要安全修复。
 
-1. 是否直接提高日常部署可靠性？
-2. 是否减少本人每次部署的操作？
-3. 是否降低长期维护成本？
-4. 能否不新增常驻依赖？
-5. 能否在 fake、fixture 或本地容器环境自动验证？
+## 实施纪律
 
-新功能只有至少满足前三项中的两项，才允许进入当前里程碑；第 4、5 项若回答“否”，必须说明替代方案、维护成本和自动门禁。仅为了未来 UI、平台化或理论完整性增加的抽象不予准入。
+- 新增或修改函数需写明用途、参数和返回值。
+- 文件安全、幂等、兼容回退和 state 提交边界需说明“为什么”。
+- 自动验证优先使用 Fake、fixture 或本地容器，不读取真实密钥，不连接生产服务器。
+- Build 必须发生在 Connect 之前；State 必须发生在全部远端操作成功之后。
+- 未知远端文件永不删除，protected 路径必须在最终合并计划再次校验。
+- 禁止手工编辑 `uv.lock`；使用 `uv lock` 更新。
 
-以下能力在 v0.3 冻结或不做：TUI/Web UI、非最新回滚、自动 GC、多用户/RBAC/审批、Kubernetes 发布、通用流水线 DSL、数据库 migration 自动回滚、自动 adopt 未知远端内容。重新评估必须基于重复出现的真实使用证据，并先更新 ADR、北极星和原子 TODO。
+## 门禁
 
-## 实施与验证
+```bash
+uv lock --check
+uv run pytest -q
+uv run ruff check src tests
+uv run ty check src
+uv build --clear
+```
 
-- 公共 application contract 变更必须同步更新 `docs/application-contract-v0.3.md` 和 contract tests。
-- 修改函数时补充用途、参数和返回值注释；安全边界说明为什么这样做。
-- 自动测试优先使用临时 Git 仓库、fake transport 或本地容器，不读取生产 secret，不写生产服务器。
-- 每项任务运行其精确测试、Ruff 和 ty；打包/入口变化还要运行 lock check 和 build。
-- 禁止手工编辑 `uv.lock` 或生成代码，禁止用 `--force` 绕过 identity、policy、integrity、generation 或 transaction 门禁。
-
-完整产品边界见 [v0.3 简化稳定版北极星](docs/planning/2026-07-14-git-deploy-v0.3-simplified-northstar.md)。
+入口、版本或打包变更还需要隔离安装 wheel 并运行 `git-deploy --version`、`git-deploy --help` 和最小 dry-run。

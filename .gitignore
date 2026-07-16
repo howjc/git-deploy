@@ -1,5 +1,6 @@
 .venv/
 dist/
+tmp/
 .pytest_cache/
 .ruff_cache/
 .coverage

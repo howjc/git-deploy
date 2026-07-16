@@ -1,108 +1,53 @@
-# t.bt.cn 三项目部署配置模板
-# 使用：复制为 deploy.toml（已被 .gitignore 忽略，可安全填写密码）后按实际环境修改。
-#   python3 deploy.py --config deploy.toml all
-#   python3 deploy.py --config deploy.toml --dry-run master   # 预演
-#
-# 路径约定与《部署与主站接入指南》(docs/deployment/2026-07-05-*.md) 一致。
+# Copy to deploy.toml in the Git project root; deploy.toml should remain untracked.
+default_target = "dev"
 
-[server]
-protocol = "sftp"          # sftp | ftp | ftps；post_commands 仅 sftp 可用
-
-# 方式一：直接写全（ftp/ftps 必须用这种方式，不支持下面的 ssh_host_alias）
-host = "192.168.1.100"
-port = 22                  # ftp/ftps 默认 21
-username = "deploy"
-
-# 方式二（仅 sftp）：复用 ~/.ssh/config 里已有的 Host 别名，自动补齐上面几项缺失字段
-# （host/port/username 若在本段显式写了，永远以显式值为准，别名只填补缺失项）。
-# 底层直接调用系统 `ssh -G <alias>` 拿最终生效配置（不建连接、官方推荐的预览方式），
-# 与你直接执行 `ssh prod-master` 时的解析结果完全一致，包括 Include/Match/多个
-# 通配符 Host 块合并等语法——不是脚本自己重新实现一遍 ssh_config 解析：
-# ssh_host_alias = "prod-master"       # 对应 ~/.ssh/config 里的 `Host prod-master` 块
-# ssh_config_file = "~/.ssh/config"    # 默认就是这个路径，一般无需改
-# 注意：暂不支持 ProxyJump/ProxyCommand 跳板机，命中会打印警告并尝试直连
-
-# 密码二选一：password_env 指向环境变量（推荐，避免明文）；或直接写 password
-password_env = "TBT_DEPLOY_PASSWORD"
-# password = ""
-# SFTP 可改用密钥登录（设置后 password/password_env 作为 passphrase，可留空；
-# 未设置 key_file 且开启了 ssh_host_alias 时，会自动取该 Host 块解析出的全部
-# IdentityFile，按 ssh 同样的顺序逐一尝试）。
-# 若 key_file / IdentityFile 指向的是 .pub 公钥文件（私钥只在 ssh-agent 里，
-# 例如 1Password SSH agent 托管、本地不落私钥的场景），脚本会按公钥指纹去
-# agent 中精确匹配唯一一把私钥来用，不会因此把 agent 里其他私钥也拿去尝试。
-# key_file = "~/.ssh/id_ed25519"
-# SFTP 默认不探测 ssh-agent / ~/.ssh 下的密钥，只用上面显式给出的 password 或 key_file，
-# 避免 paramiko 把 agent（含 1Password SSH agent）里挂载的每把私钥都拿去对服务器试登录
-# （会被当成批量登录尝试触发风控/fail2ban，并弹一堆 1Password 授权请求）。
-# 确需走 agent 探测才打开：
-# use_ssh_agent = true
-timeout = 15
-# passive = true           # 仅 ftp/ftps：被动模式（默认 true）
-
-# ── 主控（Go，git.bt.cn/innovation_groups/bt_master）─────────────────────────
-[projects.master]
-source = "../../tbt-master"                 # 相对 deploy.py 所在目录或绝对路径
-build = [
-  "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/tbt-master ./cmd/tbt-master",
-]
-
-# 二进制：上传后由 post_commands 重启（rename 原子替换，运行中进程不受影响）
-[[projects.master.uploads]]
-local = "dist/tbt-master"
-remote = "/www/tbt/master/tbt-master"
-
-# 迁移 SQL 同步到远端（执行仍走人工/发布流程，脚本只负责送达）
-[[projects.master.uploads]]
-local = "migrations"
-remote = "/www/tbt/master/migrations"
-
-# 配置模板不含密钥，远端 prod.yaml 由运维手工维护，故不上传 configs/
-# post_commands 仅 SFTP 生效；FTP 部署时请人工重启
-post_commands = [
-  "supervisorctl restart tbt-master",
-  "sleep 2 && supervisorctl status tbt-master",
-]
-
-# ── Web 后端（PHP BFF，git.bt.cn/innovation_groups/boce）────────────────────
-[projects.web]
-source = "../../tbt-web-backend"
-build = [
-  "composer install --no-dev --optimize-autoloader",
-]
-
-[[projects.web.uploads]]
-local = "."                                  # 整仓源码 + vendor
-remote = "/www/wwwroot/t.bt.cn"
+[source]
+include = ["**"]
 exclude = [
-  # .git / .env 由脚本强制排除，无需在此列出
-  "tests", "docs", "tmp", "runtime/*",       # runtime 缓存留远端自生成
-  ".phpunit.cache", ".phpunit.result.cache", "phpunit.xml", "red-captures",
-  "README.md", ".env.example", ".gitignore",
+  "tests/**",
+  "docs/**",
 ]
-
-post_commands = [
-  # 宝塔 PHP 8.3 重载 fpm，使 opcache 生效
-  "/etc/init.d/php-fpm-83 reload || systemctl reload php-fpm-83",
+protect = [
+  "storage/private/**",
 ]
+require_clean_worktree = false
 
-# ── Web 前端（Vue，git.bt.cn/innovation_groups/boce-frontend）───────────────
-[projects.frontend]
-source = "../../tbt-web-frontend"
-build = [
-  "npm ci",
-  "npm run build",                           # vue-tsc 类型检查 + vite build → dist/
+# Trusted shell commands run serially in the project root.
+[build]
+steps = [
+  "pnpm install --frozen-lockfile",
+  "pnpm run build",
+  "composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction",
 ]
+timeout = 900
 
-# 公共静态资源（不含 admin-private，见下）
-[[projects.frontend.uploads]]
+[[outputs]]
 local = "dist"
-remote = "/www/tbt/frontend/dist"
-exclude = ["admin-private"]
+remote = "public/dist"
+delete_removed = true
 
-# 管理端私有 chunk：必须落在 Nginx root 之外，由 BFF AdminGate 网关出流（安全红线）
-[[projects.frontend.uploads]]
-local = "dist/admin-private"
-remote = "/www/tbt/frontend/private/admin-private"
+[[outputs]]
+local = "vendor"
+remote = "vendor"
+delete_removed = true
 
-post_commands = []
+[targets.dev]
+protocol = "sftp"
+ssh_host_alias = "project-dev"
+username = "deploy"
+remote_root = "/srv/project-dev"
+strict_host_key_checking = true
+use_ssh_agent = true
+
+[targets.prod]
+protocol = "ftp"
+host = "ftp.example.com"
+username = "deploy"
+password_env = "DEPLOY_FTP_PASSWORD"
+remote_root = "/public_html"
+passive = true
+timeout = 15
+
+[deploy]
+retries = 3
+retry_delay = 2

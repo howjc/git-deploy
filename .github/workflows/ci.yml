@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "agent/**", "rewrite/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Check lockfile is up to date
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Ruff
+        run: uv run ruff check src tests
+
+      - name: ty (type check)
+        run: uv run ty check src
+
+      - name: Build package
+        run: uv build --clear
+
+      - name: Install built wheel in isolation and smoke test
+        run: |
+          uv venv --clear /tmp/git-deploy-smoke
+          uv pip install --python /tmp/git-deploy-smoke/bin/python dist/*.whl
+          /tmp/git-deploy-smoke/bin/git-deploy --version
+          /tmp/git-deploy-smoke/bin/git-deploy --help
