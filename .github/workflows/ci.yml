@@ -14,13 +14,19 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          cache-suffix: py-${{ matrix.python-version }}
+
+      - name: Verify Python matrix interpreter
+        run: |
+          uv run python -c \
+            "import sys; expected='${{ matrix.python-version }}'; actual=f'{sys.version_info.major}.{sys.version_info.minor}'; print(sys.version); assert actual == expected, (actual, expected)"
 
       - name: Check lockfile is up to date
         run: uv lock --check
