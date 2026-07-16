@@ -31,7 +31,7 @@ class ProgressReporter:
             nonlocal last_percent
             effective_total = reported_total if reported_total is not None else total
             percent = 100 if effective_total <= 0 else min(100, int(transferred * 100 / effective_total))
-            if self.verbose or percent == 100 or percent >= last_percent + 10:
+            if self.verbose or transferred == 0 or percent == 100 or percent >= last_percent + 10:
                 print(f"\rUPLOAD {path}: {percent:3d}%", end="", file=sys.stderr, flush=True)
                 last_percent = percent
                 if percent == 100:

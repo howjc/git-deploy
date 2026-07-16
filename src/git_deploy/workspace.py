@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from git_deploy.builder import run_build
-from git_deploy.config import Config, load_config
+from git_deploy.config import Config, TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.deployer import TransportFactory
 from git_deploy.doctor import DoctorResult, run_doctor
 from git_deploy.errors import ConfigError, PlanError
 from git_deploy.git import GitRepository
+from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
 from git_deploy.planner import UploadOperation
 from git_deploy.prepared import PreparedDeployment, execute_prepared, prepare_project
 from git_deploy.transports import create_transport
-from git_deploy.transports.openssh_sftp import SSHConnectionPool
+from git_deploy.transports.openssh_sftp import OpenSSHMaster, SSHConnectionPool
+
+REPOSITORY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +51,24 @@ class WorkspaceConfig:
         return target
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspacePreflight:
+    """Bind one repository to its loaded config and frozen physical target."""
+
+    repository: WorkspaceRepository
+    config: Config
+    target: TargetConfig
+
+
 def load_workspace(path: Path) -> WorkspaceConfig:
-    """Load a workspace containing only repository name/path/order."""
+    """Load a workspace containing only repository name/path/order.
+
+    Args:
+        path: Workspace TOML selected by discovery or ``--workspace``.
+
+    Returns:
+        Validated thin-workspace configuration in declared order.
+    """
 
     path = path.expanduser().resolve()
     try:
@@ -82,6 +102,11 @@ def load_workspace(path: Path) -> WorkspaceConfig:
                 f"unknown repositories[{index}] field(s): {', '.join(extra)}"
             )
         name = _required_string(value.get("name"), f"repositories[{index}].name")
+        if name in {".", ".."} or not REPOSITORY_NAME_PATTERN.fullmatch(name):
+            raise ConfigError(
+                f"repositories[{index}].name must match [A-Za-z0-9._-]+ "
+                "and be at most 64 characters"
+            )
         path_text = _required_string(value.get("path"), f"repositories[{index}].path")
         if name in names:
             raise ConfigError(f"duplicate workspace repository name: {name}")
@@ -113,40 +138,77 @@ def prepare_workspace(
 ) -> tuple[str, tuple[PreparedDeployment, ...]]:
     """Prepare every repository before any remote connection can occur."""
 
-    target = workspace.target(requested_target)
+    target, preflight = preflight_workspace(workspace, requested_target, require_git=True)
     prepared: list[PreparedDeployment] = []
+    locks: list[TargetLock | None] = []
     try:
-        # Load and validate the shared target name for every repository before
-        # the first expensive build or lock acquisition.
-        for repository in workspace.repositories:
-            load_config(repository.config_path).target(target)
-        for repository in workspace.repositories:
-            print(f"Preparing {repository.name}...")
+        # Acquire every independent repository lock before the first Build so a
+        # later busy repository cannot waste or invalidate earlier preparation.
+        for item in preflight:
+            if item.target.runtime_dir is None:
+                raise PlanError("workspace deployment preflight lacks a Git runtime directory")
+            lock = TargetLock(item.target.runtime_dir, target)
+            lock.acquire()
+            locks.append(lock)
+        for index, item in enumerate(preflight):
+            print(f"Preparing {item.repository.name}...")
             prepared.append(
                 prepare_project(
-                    repository.name,
-                    repository.config_path,
+                    item.repository.name,
+                    item.repository.config_path,
                     target,
                     full=full,
                     skip_build=skip_build,
+                    prepared_config=item.config,
+                    prepared_target=item.target,
+                    prepared_lock=locks[index],
                 )
             )
+            locks[index] = None
         return target, tuple(prepared)
     except BaseException:
         for item in reversed(prepared):
             item.close()
+        for lock in reversed(locks):
+            if lock is not None:
+                lock.release()
         raise
 
 
 def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...]) -> str:
-    """Render every repository operation and one deterministic total summary."""
+    """Render every repository operation and one deterministic total summary.
+
+    Args:
+        target: Shared logical target name.
+        prepared: Fully frozen projects awaiting one confirmation.
+
+    Returns:
+        Combined plan including physical endpoints, commits, and frozen bytes.
+    """
 
     lines = [f"Workspace Target: {target}"]
     uploads = 0
     deletes = 0
+    frozen_bytes = 0
     for item in prepared:
         lines.append("")
         lines.append(f"[{item.name}]")
+        alias = (
+            f"{item.plan.target.ssh_host_alias} -> "
+            if item.plan.target.ssh_host_alias
+            else ""
+        )
+        lines.append(
+            "  Target: "
+            f"{alias}{item.plan.target.username}@{item.plan.target.host}:"
+            f"{item.plan.target.port}:{item.plan.target.remote_root} "
+            f"({item.plan.target.protocol})"
+        )
+        lines.append(f"  Mode: {'FULL' if item.plan.full else 'INCREMENTAL'}")
+        lines.append(
+            f"  Commit: {item.plan.previous_commit or '<first deployment>'} -> "
+            f"{item.plan.head}"
+        )
         if not item.plan.operations:
             lines.append("  No changes")
         else:
@@ -158,7 +220,14 @@ def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...])
         )
         uploads += item.plan.upload_count
         deletes += item.plan.delete_count
-    lines.extend(("", f"Total: {uploads} upload(s), {deletes} delete(s)"))
+        frozen_bytes += item.frozen_bytes
+    lines.extend(
+        (
+            "",
+            f"Total: {uploads} upload(s), {deletes} delete(s), "
+            f"{frozen_bytes} frozen byte(s)",
+        )
+    )
     return "\n".join(lines)
 
 
@@ -190,15 +259,20 @@ def execute_workspace(
 
 
 def run_workspace_build(workspace: WorkspaceConfig, requested_target: str | None) -> None:
-    """Validate all repository targets, then run every build sequentially."""
+    """Validate all repository targets, then run every build sequentially.
 
-    target = workspace.target(requested_target)
-    configs = tuple(load_config(item.config_path) for item in workspace.repositories)
-    for config in configs:
-        config.target(target)
-    for repository, config in zip(workspace.repositories, configs, strict=True):
-        print(f"Building {repository.name}...")
-        run_build(config.build, config.project_root)
+    Args:
+        workspace: Validated workspace and repository order.
+        requested_target: Shared explicit/default target name.
+
+    Returns:
+        ``None`` after all builds succeed.
+    """
+
+    _, preflight = preflight_workspace(workspace, requested_target, require_git=False)
+    for item in preflight:
+        print(f"Building {item.repository.name}...")
+        run_build(item.config.build, item.config.project_root)
 
 
 def run_workspace_doctor(
@@ -207,23 +281,63 @@ def run_workspace_doctor(
     *,
     create_root: bool,
 ) -> tuple[tuple[str, tuple[DoctorResult, ...]], ...]:
-    """Run per-repository diagnostics with one shared Native OpenSSH pool."""
+    """Run per-repository diagnostics with one shared Native OpenSSH pool.
+
+    Args:
+        workspace: Validated workspace and repository order.
+        requested_target: Shared explicit/default target name.
+        create_root: Whether all-preflight-success may create missing roots.
+
+    Returns:
+        Repository names paired with ordered diagnostic results.
+    """
 
     target_name = workspace.target(requested_target)
-    loaded: list[tuple[WorkspaceRepository, Config, GitRepository, StateStore]] = []
+    loaded: list[
+        tuple[
+            WorkspaceRepository,
+            Config,
+            GitRepository,
+            StateStore,
+            TargetConfig | None,
+            str | None,
+        ]
+    ] = []
     for item in workspace.repositories:
         config = load_config(item.config_path)
-        config.target(target_name)
+        target = config.target(target_name)
         repository = GitRepository(config.project_root)
         try:
             common = repository.common_dir()
         except PlanError:
             common = config.project_root / ".git"
-        loaded.append((item, config, repository, StateStore(common)))
+        store = StateStore(common)
+        try:
+            resolved = resolve_target_for_plan(target, runtime_dir=store.base)
+            _validate_native_tools(resolved)
+            error = None
+        except Exception as exc:
+            resolved = None
+            error = str(exc)
+        loaded.append((item, config, repository, store, resolved, error))
+    preflight_error: str | None = None
+    errors = [error for *_, error in loaded if error is not None]
+    if not errors:
+        try:
+            _validate_remote_ownership(
+                tuple(
+                    WorkspacePreflight(item, config, resolved)
+                    for item, config, _, _, resolved, _ in loaded
+                    if resolved is not None
+                )
+            )
+        except ConfigError as exc:
+            preflight_error = str(exc)
     pool = SSHConnectionPool()
     results: list[tuple[str, tuple[DoctorResult, ...]]] = []
     try:
-        for item, config, repository, store in loaded:
+        workspace_failed = bool(errors or preflight_error)
+        for item, config, repository, store, resolved, error in loaded:
             target = config.target(target_name)
             checks = run_doctor(
                 config,
@@ -232,11 +346,108 @@ def run_workspace_doctor(
                 store,
                 create_root=create_root,
                 transport_factory=lambda selected: create_transport(selected, pool),
+                pre_resolved_target=resolved,
+                resolution_error=error or preflight_error,
+                remote_checks=not workspace_failed,
             )
             results.append((item.name, checks))
         return tuple(results)
     finally:
         pool.close_all()
+
+
+def preflight_workspace(
+    workspace: WorkspaceConfig,
+    requested_target: str | None,
+    *,
+    require_git: bool,
+) -> tuple[str, tuple[WorkspacePreflight, ...]]:
+    """Resolve every physical target and ownership boundary before any build.
+
+    Args:
+        workspace: Parsed thin-workspace configuration.
+        requested_target: Unified explicit/default target name.
+        require_git: Whether deployment preflight must validate Git/common-dir.
+
+    Returns:
+        Shared target name and repository contexts in deployment order.
+    """
+
+    target_name = workspace.target(requested_target)
+    contexts: list[WorkspacePreflight] = []
+    for item in workspace.repositories:
+        config = load_config(item.config_path)
+        target = config.target(target_name)
+        runtime_dir = None
+        if require_git:
+            repository = GitRepository(config.project_root)
+            repository.validate()
+            runtime_dir = StateStore(repository.common_dir()).base
+        resolved = resolve_target_for_plan(target, runtime_dir=runtime_dir)
+        _validate_native_tools(resolved)
+        contexts.append(WorkspacePreflight(item, config, resolved))
+    result = tuple(contexts)
+    _validate_remote_ownership(result)
+    return target_name, result
+
+
+def _validate_native_tools(target: TargetConfig) -> None:
+    """Discover POSIX OpenSSH tools during preflight without connecting.
+
+    Args:
+        target: Frozen target that may select the Native backend.
+
+    Returns:
+        ``None`` when required local commands are valid or not applicable.
+    """
+
+    if target.protocol == "sftp" and target.ssh_host_alias:
+        OpenSSHMaster(target).key
+
+
+def _validate_remote_ownership(contexts: tuple[WorkspacePreflight, ...]) -> None:
+    """Reject equal or nested roots on one resolved physical endpoint.
+
+    Args:
+        contexts: All resolved repositories before any Build or Lock.
+
+    Returns:
+        ``None`` when every remote ownership boundary is disjoint.
+    """
+
+    for index, left in enumerate(contexts):
+        for right in contexts[index + 1 :]:
+            left_target = left.target
+            right_target = right.target
+            left_endpoint = (
+                left_target.protocol,
+                left_target.host.lower() if left_target.host else None,
+                left_target.username,
+                left_target.port,
+            )
+            right_endpoint = (
+                right_target.protocol,
+                right_target.host.lower() if right_target.host else None,
+                right_target.username,
+                right_target.port,
+            )
+            if left_endpoint != right_endpoint:
+                continue
+            left_root = left_target.remote_root
+            right_root = right_target.remote_root
+            if (
+                left_root == right_root
+                or left_root in right_root.parents
+                or right_root in left_root.parents
+            ):
+                endpoint = (
+                    f"{left_target.username}@{left_target.host}:{left_target.port}"
+                )
+                raise ConfigError(
+                    f"workspace repositories {left.repository.name!r} and "
+                    f"{right.repository.name!r} manage overlapping remote roots: "
+                    f"{endpoint}:{left_root} and {endpoint}:{right_root}"
+                )
 
 
 def _required_string(value: Any, name: str) -> str:

@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.2.0/git_deploy-1.2.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.2.1/git_deploy-1.2.1-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -85,6 +85,8 @@ retry_delay = 2
 - 完整读取 OpenSSH Config、Include、ProxyJump 和 ProxyCommand；
 - 继承当前 `SSH_AUTH_SOCK`，兼容 WSL 中的 1Password SSH Agent；
 - 使用临时 ControlMaster，多文件只建立一次认证连接；
+- 连接前复核 Alias，并将已审阅的 HostName、User、Port 固定到实际 OpenSSH 命令；
+- `timeout` 只生成 OpenSSH `ConnectTimeout`，不会中断 1Password 授权或完整文件传输；
 - 不读取私钥、不管理 Agent Socket、不启用 Agent Forwarding；
 - 只调用当前环境的 POSIX `ssh`/`sftp`，不会回退 Windows `ssh.exe`。
 
@@ -156,6 +158,8 @@ git-deploy build prod
 ```
 
 部署前会先完成所有仓库的 Target 校验、Build、Plan 和上传字节冻结；任一 Prepare 失败时不会建立远端连接。全部成功后显示 Combined Plan，只确认一次，并按配置顺序部署。相同 Native OpenSSH Endpoint 会共用当前命令生命周期内的一条 ControlMaster。
+
+所有仓库的物理 Endpoint 和 Remote Root 会在首个 Build 前解析；同一 Endpoint 上相同或父子嵌套的 Root 会直接拒绝，避免两个独立 State 相互覆盖。Combined Plan 会展示每仓冻结后的 Host/User/Port、Remote Root、模式、Commit 边界和冻结字节总量。
 
 如果当前目录同时有 `deploy.toml` 与 `deploy.workspace.toml`，必须用 `--config` 或 `--workspace` 显式选择。Workspace 不提供并行、依赖图、Target Map、共享 State、全局事务或自动回滚；中途失败后直接重跑，已成功仓库会自然成为 No-op。
 
@@ -231,7 +235,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.2.0-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.2.1-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

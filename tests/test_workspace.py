@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from git_deploy.workspace import (
     prepare_workspace,
     render_workspace_plan,
     run_workspace_build,
+    run_workspace_doctor,
 )
 
 
@@ -209,6 +211,28 @@ def test_prepare_failure_releases_earlier_locks_before_any_execution(tmp_path: P
     assert store.load("dev") is None
 
 
+def test_all_workspace_locks_are_available_before_first_build(tmp_path: Path) -> None:
+    """A busy later repository fails before an earlier Build and releases prior locks."""
+
+    first = _create_repository(
+        tmp_path,
+        "api",
+        build_steps=('printf built > build-marker',),
+    )
+    second = _create_repository(tmp_path, "web")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
+    first_store = StateStore(GitRepository(first).common_dir())
+    second_store = StateStore(GitRepository(second).common_dir())
+
+    with TargetLock(second_store.base, "dev"):
+        with pytest.raises(PlanError, match="already being deployed"):
+            prepare_workspace(workspace, None, full=False, skip_build=False)
+
+    assert not (first / "build-marker").exists()
+    with TargetLock(first_store.base, "dev"):
+        pass
+
+
 def test_sequential_failure_then_workspace_rerun_converges(tmp_path: Path) -> None:
     """A succeeds, B fails, C waits; rerun makes A no-op and completes B/C."""
 
@@ -317,6 +341,255 @@ def test_workspace_execution_passes_one_command_scoped_pool_in_order(
     assert pool.closed == 1
 
 
+@pytest.mark.parametrize(
+    ("first_root", "second_root"),
+    [
+        ("/srv/app", "/srv/app"),
+        ("/srv/app", "/srv/app/public"),
+        ("/srv/app/public", "/srv/app"),
+    ],
+)
+def test_workspace_rejects_equal_or_nested_remote_roots_before_build_or_lock(
+    tmp_path: Path,
+    first_root: str,
+    second_root: str,
+) -> None:
+    """One physical remote path cannot be owned by two repository States."""
+
+    first = _create_repository(
+        tmp_path,
+        "api",
+        remote_root=first_root,
+        build_steps=('printf built > build-marker',),
+    )
+    second = _create_repository(tmp_path, "web", remote_root=second_root)
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
+
+    with pytest.raises(ConfigError, match="overlapping remote roots"):
+        prepare_workspace(workspace, None, full=False, skip_build=False)
+
+    assert not (first / "build-marker").exists()
+    for repository in (first, second):
+        store = StateStore(GitRepository(repository).common_dir())
+        with TargetLock(store.base, "dev"):
+            pass
+
+
+def test_workspace_allows_sibling_roots_and_same_text_on_different_endpoints(
+    tmp_path: Path,
+) -> None:
+    """Ownership comparison groups by resolved protocol/host/user/port."""
+
+    first = _create_repository(tmp_path, "api", remote_root="/srv/api", host="host-a")
+    second = _create_repository(tmp_path, "web", remote_root="/srv/web", host="host-a")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
+    _, prepared = prepare_workspace(workspace, None, full=False, skip_build=True)
+    for item in prepared:
+        item.close()
+
+    third_root = tmp_path / "other"
+    third_root.mkdir()
+    third = _create_repository(third_root, "admin", remote_root="/srv/api", host="host-b")
+    mixed_workspace = _write_workspace(
+        tmp_path,
+        (("api", first), ("admin", third)),
+    )
+    _, prepared = prepare_workspace(
+        load_workspace(mixed_workspace), None, full=False, skip_build=True
+    )
+    for item in prepared:
+        item.close()
+
+
+def test_workspace_rejects_ftp_root_collision(tmp_path: Path) -> None:
+    """FTP repositories use the same physical ownership comparison."""
+
+    first = _create_repository(tmp_path, "api", protocol="ftp", remote_root="/public")
+    second = _create_repository(tmp_path, "web", protocol="ftp", remote_root="/public/assets")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
+
+    with pytest.raises(ConfigError, match="overlapping remote roots"):
+        prepare_workspace(workspace, None, full=False, skip_build=True)
+
+
+def test_aliases_resolving_to_same_endpoint_are_grouped_before_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different Alias text cannot hide an overlapping resolved endpoint."""
+
+    first = _create_repository(
+        tmp_path,
+        "api",
+        alias="prod-api",
+        remote_root="/srv/app",
+        build_steps=('printf built > build-marker',),
+    )
+    second = _create_repository(
+        tmp_path,
+        "web",
+        alias="prod-web",
+        remote_root="/srv/app/public",
+    )
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
+    real_run = subprocess.run
+
+    def resolve(command, **kwargs):  # noqa: ANN001, ANN202
+        """Resolve both aliases to one physical endpoint."""
+
+        if command[0] == "ssh":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "hostname 192.0.2.10\nuser deploy\nport 2222\n",
+                "",
+            )
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("git_deploy.config.subprocess.run", resolve)
+    monkeypatch.setattr(
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+
+    with pytest.raises(ConfigError, match="overlapping remote roots"):
+        prepare_workspace(workspace, None, full=False, skip_build=False)
+    assert not (first / "build-marker").exists()
+
+
+def test_alias_drift_after_workspace_prepare_keeps_state_and_remote_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmation-window Alias edit aborts before master, mutation, or State."""
+
+    repository = _create_repository(tmp_path, "api", alias="project-prod")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", repository),)))
+    real_run = subprocess.run
+    current_host = "192.0.2.10"
+    commands: list[list[str]] = []
+
+    def run(command, **kwargs):  # noqa: ANN001, ANN202
+        """Resolve a mutable Alias and forbid no command explicitly."""
+
+        command = list(command)
+        commands.append(command)
+        if (command[0] == "ssh" or command[0].endswith("/ssh")) and "-G" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"hostname {current_host}\nuser deploy\nport 22\n",
+                "",
+            )
+        if command[0] in {"git", "/usr/bin/git"}:
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("git_deploy.config.subprocess.run", run)
+    monkeypatch.setattr("git_deploy.transports.openssh_sftp.subprocess.run", run)
+    monkeypatch.setattr(
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+    _, prepared = prepare_workspace(workspace, None, full=False, skip_build=True)
+    current_host = "192.0.2.99"
+
+    with pytest.raises(DeployError, match="stale target"):
+        execute_workspace(prepared)
+
+    assert not any("-MNf" in command for command in commands)
+    assert not any(command[0].endswith("/sftp") for command in commands)
+    assert StateStore(GitRepository(repository).common_dir()).load("dev") is None
+
+
+def test_combined_plan_displays_endpoint_root_commit_mode_and_frozen_bytes(
+    tmp_path: Path,
+) -> None:
+    """One confirmation shows every physical target and commit boundary."""
+
+    repository = _create_repository(tmp_path, "api")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", repository),)))
+    target, prepared = prepare_workspace(workspace, None, full=False, skip_build=True)
+
+    rendered = render_workspace_plan(target, prepared)
+
+    assert "deploy@example.invalid:22:/srv/api" in rendered
+    assert "Mode: FULL" in rendered
+    assert "Commit: <first deployment> ->" in rendered
+    assert "frozen byte(s)" in rendered
+    assert "PASSWORD" not in rendered
+    prepared[0].close()
+
+
+def test_workspace_doctor_preflights_all_before_any_remote_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later target-resolution failure blocks earlier create-root connections."""
+
+    first = _create_repository(tmp_path, "api")
+    second = _create_repository(tmp_path, "web")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
+    calls = 0
+    original = workspace_module.resolve_target_for_plan
+
+    def resolve(target, **kwargs):  # noqa: ANN001, ANN202
+        """Fail only the later repository's target preflight."""
+
+        if target.remote_root.as_posix() == "/srv/web":
+            raise ConfigError("invalid later alias")
+        return original(target, **kwargs)
+
+    def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003
+        """Record any forbidden transport creation."""
+
+        nonlocal calls
+        calls += 1
+        raise AssertionError("remote transport must not be created")
+
+    monkeypatch.setattr(workspace_module, "resolve_target_for_plan", resolve)
+    monkeypatch.setattr(workspace_module, "create_transport", forbidden)
+
+    results = run_workspace_doctor(workspace, None, create_root=True)
+
+    assert calls == 0
+    assert any(
+        not result.ok and "invalid later alias" in result.detail
+        for _, checks in results
+        for result in checks
+    )
+
+
+def test_insufficient_temporary_disk_fails_before_freeze_and_releases_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepare reports required temporary bytes and leaves no lock held."""
+
+    repository = _create_repository(tmp_path, "api")
+    workspace = load_workspace(_write_workspace(tmp_path, (("api", repository),)))
+    monkeypatch.setattr(
+        "git_deploy.prepared.shutil.disk_usage",
+        lambda path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(PlanError, match="insufficient temporary disk space"):
+        prepare_workspace(workspace, None, full=False, skip_build=True)
+
+    store = StateStore(GitRepository(repository).common_dir())
+    with TargetLock(store.base, "dev"):
+        pass
+
+
+@pytest.mark.parametrize("name", ["bad name", "line\\nbreak", "x" * 65])
+def test_workspace_rejects_unsafe_repository_names(tmp_path: Path, name: str) -> None:
+    """Log/temp-prefix repository labels use a small printable alphabet."""
+
+    repository = _create_repository(tmp_path, "api")
+    workspace_path = _write_workspace(tmp_path, ((name, repository),))
+
+    with pytest.raises(ConfigError, match="name must match"):
+        load_workspace(workspace_path)
+
+
 def _create_repository(
     workspace: Path,
     name: str,
@@ -324,6 +597,10 @@ def _create_repository(
     target: str = "dev",
     build_steps: tuple[str, ...] = (),
     missing_output: bool = False,
+    protocol: str = "sftp",
+    host: str = "example.invalid",
+    remote_root: str | None = None,
+    alias: str | None = None,
 ) -> Path:
     """Create one independent Git project and minimal deploy configuration."""
 
@@ -340,16 +617,30 @@ def _create_repository(
     output = ""
     if missing_output:
         output = '\n[[outputs]]\nlocal = "dist"\nremote = "public/dist"\n'
+    selected_root = remote_root or f"/srv/{name}"
+    if protocol == "ftp":
+        connection = (
+            'protocol = "ftp"\n'
+            f'host = "{host}"\n'
+            'username = "deploy"\n'
+            'password_env = "DEPLOY_FTP_PASSWORD"\n'
+        )
+    elif alias is not None:
+        connection = f'protocol = "sftp"\nssh_host_alias = "{alias}"\n'
+    else:
+        connection = (
+            'protocol = "sftp"\n'
+            f'host = "{host}"\n'
+            'username = "deploy"\n'
+        )
     (root / "deploy.toml").write_text(
         (
             f'default_target = "{target}"\n\n'
             '[source]\ninclude = ["**"]\n\n'
             f"[build]\nsteps = [{steps}]\n\n"
             f"[targets.{target}]\n"
-            'protocol = "sftp"\n'
-            'host = "example.invalid"\n'
-            'username = "deploy"\n'
-            f'remote_root = "/srv/{name}"\n\n'
+            f"{connection}"
+            f'remote_root = "{selected_root}"\n\n'
             '[deploy]\nretries = 1\nretry_delay = 0\n'
             f"{output}"
         ),

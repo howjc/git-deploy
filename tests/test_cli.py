@@ -211,3 +211,11 @@ def test_init_creates_scaffold_without_existing_config(
     assert cli.main(["init"]) == 0
     assert (git_project / "deploy.toml").is_file()
     assert cli.main(["init"]) == 2
+
+
+def test_create_root_is_rejected_outside_doctor(git_project: Path) -> None:
+    """Deploy cannot silently accept a Doctor-only mutation option."""
+
+    path = write_config(git_project)
+
+    assert cli.main(["--config", str(path), "--create-root", "--dry-run"]) == 2

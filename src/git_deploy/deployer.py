@@ -134,7 +134,7 @@ def _connect_with_retry(transport: Transport, *, attempts: int, delay: float) ->
             transport.ensure_root()
             return
         except Exception as exc:
-            transport.close()
+            transport.invalidate_connection()
             if attempt >= attempts:
                 raise DeployError(
                     f"remote connection failed after {attempts} attempt(s): {exc}"
@@ -181,6 +181,32 @@ def freeze_uploads(
     return frozen
 
 
+def estimate_frozen_bytes(plan: DeploymentPlan, repository: GitRepository) -> int:
+    """Estimate exact temporary storage needed by all planned uploads.
+
+    Args:
+        plan: Deployment operations whose upload bytes will be frozen.
+        repository: Git reader used to size committed source blobs.
+
+    Returns:
+        Total bytes required, excluding small filesystem metadata overhead.
+    """
+
+    total = 0
+    for operation in plan.operations:
+        if not isinstance(operation, UploadOperation):
+            continue
+        if operation.origin == "source":
+            if not operation.git_path:
+                raise PlanError(f"source upload lacks a Git path: {operation.remote_path}")
+            total += repository.blob_size(plan.head, operation.git_path)
+        elif operation.size is not None:
+            total += operation.size
+        elif operation.local_path is not None:
+            total += operation.local_path.stat().st_size
+    return total
+
+
 def _execute_with_retry(
     operation: Operation,
     frozen: dict[str, Path],
@@ -195,7 +221,7 @@ def _execute_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             if attempt > 1:
-                transport.close()
+                transport.invalidate_connection()
                 _connect_with_retry(transport, attempts=1, delay=0)
             if isinstance(operation, UploadOperation):
                 local = frozen[operation.remote_path]

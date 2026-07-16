@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import os
 import hashlib
+import math
+import os
 import shutil
 import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 
-from git_deploy.config import TargetConfig, resolve_ssh_target
+from git_deploy.config import TargetConfig, resolve_current_ssh_alias
 from git_deploy.errors import DeployError
 from git_deploy.transports.base import ProgressCallback, Transport
 
@@ -27,6 +29,14 @@ class OpenSSHEndpointKey:
     host: str
     username: str
     port: int
+
+
+class PathProbeResult(Enum):
+    """Classify one native SFTP path probe without hiding remote errors."""
+
+    EXISTS = "exists"
+    MISSING = "missing"
+    ERROR = "error"
 
 
 class OpenSSHMaster:
@@ -53,7 +63,8 @@ class OpenSSHMaster:
     def key(self) -> OpenSSHEndpointKey:
         """Return the connection-pool identity excluding remote root."""
 
-        resolved = resolve_ssh_target(self.target)
+        if not self.target.ssh_resolved or not self.target.host or not self.target.username:
+            raise DeployError("Native OpenSSH backend requires a frozen resolved target")
         config = (
             str(self.target.ssh_config_file)
             if self.target.ssh_config_explicit or self.target.ssh_config_file.is_file()
@@ -64,9 +75,9 @@ class OpenSSHMaster:
             self.sftp,
             config,
             self.alias,
-            resolved.host,
-            resolved.username,
-            resolved.port,
+            self.target.host,
+            self.target.username,
+            self.target.port,
         )
 
     def connect(self) -> None:
@@ -74,6 +85,7 @@ class OpenSSHMaster:
 
         if self.connected:
             return
+        self._assert_alias_current()
         root = self.target.runtime_dir or Path(tempfile.gettempdir()) / "git-deploy"
         socket_root = _control_socket_root(root, self.target.name)
         socket_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -92,6 +104,7 @@ class OpenSSHMaster:
             f"ControlPath={control_path}",
             "-o",
             "ControlPersist=60",
+            *self._pinned_endpoint_arguments(),
             "-MNf",
             self.alias,
         ]
@@ -102,10 +115,9 @@ class OpenSSHMaster:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=max(self.target.timeout, 1),
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
             shutil.rmtree(directory, ignore_errors=True)
             raise DeployError(
                 f"OpenSSH authentication failed for target {self.target.name}: {exc}"
@@ -136,6 +148,7 @@ class OpenSSHMaster:
                 *self._config_arguments(),
                 "-o",
                 f"ControlPath={self.control_path}",
+                *self._pinned_endpoint_arguments(),
                 "-O",
                 operation,
                 self.alias,
@@ -145,6 +158,20 @@ class OpenSSHMaster:
             text=True,
             check=False,
         )
+
+    def is_healthy(self) -> bool:
+        """Return whether OpenSSH still recognizes the cached master.
+
+        Returns:
+            ``True`` only after a successful local control-socket check.
+        """
+
+        if not self.connected:
+            return False
+        try:
+            return self.control_command("check").returncode == 0
+        except OSError:
+            return False
 
     def run_batch(
         self,
@@ -167,13 +194,14 @@ class OpenSSHMaster:
                 "-",
                 "-o",
                 f"ControlPath={self.control_path}",
+                *self._pinned_endpoint_arguments(),
                 self.alias,
             ],
             input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=max(self.target.timeout, 1),
+            env={**os.environ, "LC_ALL": "C"},
             check=False,
         )
         if check and result.returncode != 0:
@@ -204,6 +232,51 @@ class OpenSSHMaster:
             return ["-F", str(self.target.ssh_config_file)]
         return []
 
+    def _pinned_endpoint_arguments(self) -> list[str]:
+        """Keep alias policy while pinning the endpoint approved in the plan.
+
+        Returns:
+            OpenSSH options for frozen host/user/port and connect timeout.
+        """
+
+        if not self.target.host or not self.target.username:
+            raise DeployError("Native OpenSSH target lacks a frozen host or username")
+        return [
+            "-o",
+            f"HostName={self.target.host}",
+            "-o",
+            f"User={self.target.username}",
+            "-o",
+            f"Port={self.target.port}",
+            "-o",
+            f"ConnectTimeout={max(1, math.ceil(self.target.timeout))}",
+        ]
+
+    def _assert_alias_current(self) -> None:
+        """Reject SSH config drift between plan review and real connection.
+
+        Returns:
+            ``None`` only when current and approved endpoints are identical.
+        """
+
+        try:
+            current = resolve_current_ssh_alias(
+                self.target,
+                ssh_executable=self.ssh,
+            )
+        except Exception as exc:
+            raise DeployError(
+                f"stale target: cannot re-resolve SSH alias {self.alias!r}; re-run required: {exc}"
+            ) from exc
+        frozen = (self.target.host, self.target.username, self.target.port)
+        observed = (current.host, current.username, current.port)
+        if observed != frozen:
+            raise DeployError(
+                "stale target: SSH alias changed after plan; re-run required "
+                f"(approved {frozen[1]}@{frozen[0]}:{frozen[2]}, "
+                f"now {observed[1]}@{observed[0]}:{observed[2]})"
+            )
+
 
 class SSHConnectionPool:
     """Reuse native OpenSSH masters within one foreground command."""
@@ -214,16 +287,41 @@ class SSHConnectionPool:
         self._masters: dict[OpenSSHEndpointKey, OpenSSHMaster] = {}
 
     def acquire(self, target: TargetConfig) -> OpenSSHMaster:
-        """Return an existing endpoint master or establish it once."""
+        """Return one healthy endpoint master, replacing a dead cached one.
+
+        Args:
+            target: Prepared Native OpenSSH target requesting a connection.
+
+        Returns:
+            Reused healthy or newly established endpoint master.
+        """
 
         candidate = OpenSSHMaster(target)
         key = candidate.key
         existing = self._masters.get(key)
         if existing is not None:
-            return existing
+            if existing.is_healthy():
+                return existing
+            self.invalidate(existing)
         candidate.connect()
         self._masters[key] = candidate
         return candidate
+
+    def invalidate(self, master: OpenSSHMaster) -> None:
+        """Evict and close one failed master by identity.
+
+        Args:
+            master: Cached connection that must never be reused.
+
+        Returns:
+            ``None`` after eviction and cleanup.
+        """
+
+        for key, existing in tuple(self._masters.items()):
+            if existing is master:
+                self._masters.pop(key, None)
+                break
+        master.close()
 
     def close_all(self) -> None:
         """Close every pooled master and clear the pool idempotently."""
@@ -266,7 +364,7 @@ class OpenSSHSFTPTransport(Transport):
     def root_exists(self) -> bool:
         """Check the configured remote root without creating it."""
 
-        return self._exists(self.target.remote_root.as_posix())
+        return self._probe(self.target.remote_root.as_posix()) is PathProbeResult.EXISTS
 
     def ensure_root(self) -> None:
         """Create every missing remote-root component through SFTP batch mode."""
@@ -288,6 +386,7 @@ class OpenSSHSFTPTransport(Transport):
         temporary = f"{target}.git-deploy-{uuid.uuid4().hex}.tmp"
         master = self._require_master()
         try:
+            callback(0, local_path.stat().st_size)
             master.run_batch(
                 (
                     f"put {_quote_sftp(str(local_path))} {_quote_sftp(temporary)}",
@@ -310,7 +409,7 @@ class OpenSSHSFTPTransport(Transport):
         """Delete an owned file while treating a confirmed absence as success."""
 
         target = self._absolute(remote_path)
-        if not self._exists(target):
+        if self._probe(target) is PathProbeResult.MISSING:
             return
         self._require_master().run_batch(
             (f"rm {_quote_sftp(target)}",),
@@ -325,6 +424,22 @@ class OpenSSHSFTPTransport(Transport):
         if master is not None and self._owns_master:
             master.close()
 
+    def invalidate_connection(self) -> None:
+        """Evict a failed pooled master so retries create a new connection.
+
+        Returns:
+            ``None`` after the failed connection is no longer reusable.
+        """
+
+        master = self.master
+        self.master = None
+        if master is None:
+            return
+        if self.pool is not None:
+            self.pool.invalidate(master)
+        else:
+            master.close()
+
     def _publish_temporary(self, temporary: str, target: str) -> None:
         """Prefer direct rename, then use a recoverable backup swap."""
 
@@ -336,7 +451,7 @@ class OpenSSHSFTPTransport(Transport):
         )
         if direct.returncode == 0:
             return
-        if not self._exists(target):
+        if self._probe(target) is PathProbeResult.MISSING:
             raise DeployError(
                 f"OpenSSH SFTP publish failed for {target}: {direct.stderr.strip()}"
             )
@@ -375,21 +490,35 @@ class OpenSSHSFTPTransport(Transport):
         for component in PurePosixPath(absolute).parts[1:]:
             current /= component
             value = current.as_posix()
-            if not self._exists(value):
+            if self._probe(value) is PathProbeResult.MISSING:
                 self._require_master().run_batch(
                     (f"mkdir {_quote_sftp(value)}",),
                     operation=f"create directory {value}",
                 )
 
-    def _exists(self, absolute: str) -> bool:
-        """Return whether one absolute remote path can be listed."""
+    def _probe(self, absolute: str) -> PathProbeResult:
+        """Return exists/missing and raise for every ambiguous probe failure.
+
+        Args:
+            absolute: Absolute remote path inspected through SFTP.
+
+        Returns:
+            ``EXISTS`` or confirmed ``MISSING``; ``ERROR`` raises instead.
+        """
 
         result = self._require_master().run_batch(
             (f"ls {_quote_sftp(absolute)}",),
             operation=f"inspect {absolute}",
             check=False,
         )
-        return result.returncode == 0
+        detail = "\n".join((result.stdout, result.stderr)).strip()
+        classification = _classify_path_probe(result.returncode, detail, absolute)
+        if classification is not PathProbeResult.ERROR:
+            return classification
+        raise DeployError(
+            f"OpenSSH SFTP inspect failed for target {self.target.name} "
+            f"at {absolute} (exit {result.returncode}): {detail or '<no error detail>'}"
+        )
 
     def _absolute(self, relative: str) -> str:
         """Join a safe relative operation path below the configured root."""
@@ -429,6 +558,57 @@ def _quote_sftp(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _is_confirmed_missing(detail: str, remote_path: str) -> bool:
+    """Recognize remote-path absence without swallowing a missing control socket.
+
+    Args:
+        detail: C-locale stdout/stderr from the failed SFTP batch.
+        remote_path: Exact remote path whose existence was queried.
+
+    Returns:
+        ``True`` only for an explicit diagnostic tied to the remote path.
+    """
+
+    path = remote_path.lower()
+    for raw_line in detail.splitlines():
+        line = " ".join(raw_line.strip().split()).lower()
+        if "no such file or directory" in line:
+            if "couldn't stat remote file:" in line:
+                return True
+            if path in line and line.startswith(("ls ", "stat ")):
+                return True
+        if (
+            path in line
+            and line.endswith("not found")
+            and line.startswith(("can't ls:", "can't stat:"))
+        ):
+            return True
+    return False
+
+
+def _classify_path_probe(
+    returncode: int,
+    detail: str,
+    remote_path: str,
+) -> PathProbeResult:
+    """Map one SFTP result to exists, confirmed missing, or ambiguous error.
+
+    Args:
+        returncode: SFTP process exit status.
+        detail: Combined C-locale diagnostic output.
+        remote_path: Exact path queried by the batch.
+
+    Returns:
+        One explicit three-state probe classification.
+    """
+
+    if returncode == 0:
+        return PathProbeResult.EXISTS
+    if _is_confirmed_missing(detail, remote_path):
+        return PathProbeResult.MISSING
+    return PathProbeResult.ERROR
+
+
 def _safe_name(value: str) -> str:
     """Return a filesystem-safe short prefix for private socket directories."""
 
@@ -453,5 +633,6 @@ __all__ = [
     "OpenSSHEndpointKey",
     "OpenSSHMaster",
     "OpenSSHSFTPTransport",
+    "PathProbeResult",
     "SSHConnectionPool",
 ]

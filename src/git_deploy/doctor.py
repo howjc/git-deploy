@@ -30,6 +30,9 @@ def run_doctor(
     *,
     create_root: bool = False,
     transport_factory=create_transport,  # noqa: ANN001
+    pre_resolved_target: TargetConfig | None = None,
+    resolution_error: str | None = None,
+    remote_checks: bool = True,
 ) -> tuple[DoctorResult, ...]:
     """Run local checks then connect once to validate the selected remote root.
 
@@ -39,17 +42,25 @@ def run_doctor(
         repository: Git worktree reader.
         state_store: Lightweight target-state reader.
         transport_factory: Injectable adapter factory for tests.
+        pre_resolved_target: Workspace-frozen target resolved before any connection.
+        resolution_error: Preflight failure that must short-circuit remote checks.
+        remote_checks: Whether this invocation may connect after local diagnostics.
 
     Returns:
         Ordered diagnostic results; callers decide the exit code.
     """
 
     results: list[DoctorResult] = [DoctorResult("config", True, str(config.path))]
-    resolved_target = target
-    try:
-        resolved_target = resolve_target_for_plan(target, runtime_dir=state_store.base)
-    except Exception as exc:
-        results.append(DoctorResult("target config", False, str(exc)))
+    resolved_target = pre_resolved_target or target
+    resolution_ok = resolution_error is None
+    if resolution_error is not None:
+        results.append(DoctorResult("target config", False, resolution_error))
+    elif pre_resolved_target is None:
+        try:
+            resolved_target = resolve_target_for_plan(target, runtime_dir=state_store.base)
+        except Exception as exc:
+            resolution_ok = False
+            results.append(DoctorResult("target config", False, str(exc)))
     try:
         repository.validate()
         results.append(DoctorResult("git", True, repository.head()))
@@ -78,6 +89,17 @@ def run_doctor(
         )
     except Exception as exc:
         results.append(DoctorResult("state", False, str(exc)))
+    if not resolution_ok:
+        return tuple(results)
+    if not remote_checks:
+        results.append(
+            DoctorResult(
+                "target",
+                False,
+                "remote checks skipped because workspace preflight failed",
+            )
+        )
+        return tuple(results)
     try:
         transport: Transport = transport_factory(resolved_target)
         if isinstance(transport, OpenSSHSFTPTransport):

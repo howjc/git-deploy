@@ -108,18 +108,28 @@ class FTPTransport(Transport):
             raise DeployError(f"FTP upload failed for {remote_path}: {exc}") from exc
 
     def delete(self, remote_path: str) -> None:
-        """Delete one file; only explicit not-found replies count as success.
+        """Delete one file after a language-independent parent listing probe.
 
         Args:
             remote_path: Normalized relative target path.
+
+        Returns:
+            ``None`` after confirmed absence or successful deletion.
         """
 
+        ftp = self._require_ftp()
+        target = self._absolute(remote_path)
+        parent = PurePosixPath(target).parent.as_posix()
+        name = PurePosixPath(target).name
         try:
-            self._require_ftp().delete(self._absolute(remote_path))
+            entries = ftp.nlst(parent)
+        except ftplib.Error as exc:
+            raise DeployError(f"FTP existence probe failed for {remote_path}: {exc}") from exc
+        if not any(PurePosixPath(entry.rstrip("/")).name == name for entry in entries):
+            return
+        try:
+            ftp.delete(target)
         except ftplib.error_perm as exc:
-            message = str(exc).lower()
-            if any(marker in message for marker in ("not found", "no such file", "does not exist")):
-                return
             raise DeployError(f"FTP delete failed for {remote_path}: {exc}") from exc
         except ftplib.Error as exc:
             raise DeployError(f"FTP delete failed for {remote_path}: {exc}") from exc

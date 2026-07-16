@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 from git_deploy.errors import ConfigError
 
 Protocol = Literal["sftp", "ftp"]
+RESERVED_TARGET_NAMES = frozenset({"build", "doctor", "init"})
 
 DEFAULT_EXCLUDE = (
     ".git/**",
@@ -196,7 +197,54 @@ def resolve_ssh_target(target: TargetConfig) -> ResolvedSSHConfig:
     query = target.ssh_host_alias or target.host
     if not query:
         raise ConfigError(f"SFTP target {target.name} has no host or ssh_host_alias")
-    command = ["ssh", "-G"]
+    return _resolve_ssh_query(target, query, honor_explicit=True, ssh_executable="ssh")
+
+
+def resolve_current_ssh_alias(
+    target: TargetConfig,
+    *,
+    ssh_executable: str = "ssh",
+) -> ResolvedSSHConfig:
+    """Resolve the current effective endpoint for a prepared OpenSSH alias.
+
+    Args:
+        target: Prepared target retaining its alias and frozen endpoint fields.
+        ssh_executable: Previously validated POSIX OpenSSH executable.
+
+    Returns:
+        The alias endpoint as it resolves immediately before connection.
+    """
+
+    if not target.ssh_host_alias:
+        raise ConfigError(f"SFTP target {target.name} has no ssh_host_alias")
+    return _resolve_ssh_query(
+        target,
+        target.ssh_host_alias,
+        honor_explicit=False,
+        ssh_executable=ssh_executable,
+    )
+
+
+def _resolve_ssh_query(
+    target: TargetConfig,
+    query: str,
+    *,
+    honor_explicit: bool,
+    ssh_executable: str,
+) -> ResolvedSSHConfig:
+    """Delegate OpenSSH configuration parsing and normalize its endpoint.
+
+    Args:
+        target: Validated or prepared SFTP target providing config context.
+        query: Host/Alias passed to ``ssh -G``.
+        honor_explicit: Whether target fields override OpenSSH output.
+        ssh_executable: OpenSSH executable used for local-only parsing.
+
+    Returns:
+        Effective host, username, port, and usable identity files.
+    """
+
+    command = [ssh_executable, "-G"]
     if target.ssh_config_explicit or target.ssh_config_file.is_file():
         command.extend(["-F", str(target.ssh_config_file)])
     command.append(query)
@@ -226,18 +274,22 @@ def resolve_ssh_target(target: TargetConfig) -> ResolvedSSHConfig:
         or (proxy_command and proxy_command.lower() != "none")
     ):
         raise ConfigError("ProxyJump/ProxyCommand is not supported by the v1-lite SFTP transport")
-    host = target.host or _first_ssh_value(resolved, "hostname") or query
-    username = target.username or _first_ssh_value(resolved, "user")
+    host = (
+        target.host if honor_explicit else None
+    ) or _first_ssh_value(resolved, "hostname") or query
+    username = (
+        target.username if honor_explicit else None
+    ) or _first_ssh_value(resolved, "user")
     if not username:
         raise ConfigError(f"SFTP target {target.name} did not resolve a username")
     port = target.port
     resolved_port = _first_ssh_value(resolved, "port")
-    if not target.port_explicit and resolved_port:
+    if (not honor_explicit or not target.port_explicit) and resolved_port:
         try:
             port = int(resolved_port)
         except ValueError as exc:
             raise ConfigError(f"SSH target {query} resolved an invalid port: {resolved_port}") from exc
-    if target.key_file is not None:
+    if honor_explicit and target.key_file is not None:
         key_files = (str(target.key_file),)
     else:
         candidates = (
@@ -483,6 +535,12 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
     for name, value in table.items():
         if not isinstance(name, str) or not name or "/" in name or "\\" in name or name in {".", ".."}:
             raise ConfigError(f"invalid target name: {name!r}")
+        # The intentionally flat CLI dispatches these words as actions, so
+        # accepting them as targets would create an unreachable configuration.
+        if name in RESERVED_TARGET_NAMES:
+            raise ConfigError(
+                f"target name {name!r} is reserved by the flat CLI; choose another name"
+            )
         item = _table(value, f"targets.{name}")
         _reject_unknown(
             item,
