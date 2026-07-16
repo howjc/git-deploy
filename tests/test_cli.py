@@ -40,7 +40,7 @@ def test_dry_run_never_calls_deployer(
 
         raise AssertionError("execute_plan must not be called")
 
-    monkeypatch.setattr(cli, "execute_plan", forbidden)
+    monkeypatch.setattr(cli, "execute_prepared", forbidden)
 
     assert cli.main(["--config", str(path), "--dry-run", "--skip-build"]) == 0
     assert "Dry-run complete" in capsys.readouterr().out
@@ -67,8 +67,8 @@ def test_build_failure_prevents_deployer_call(
         nonlocal called
         called = True
 
-    monkeypatch.setattr(cli, "run_build", fail_build)
-    monkeypatch.setattr(cli, "execute_plan", record_deploy)
+    monkeypatch.setattr("git_deploy.prepared.run_build", fail_build)
+    monkeypatch.setattr(cli, "execute_prepared", record_deploy)
 
     assert cli.main(["--config", str(path), "--yes"]) == 3
     assert not called
@@ -152,7 +152,7 @@ def test_missing_output_after_successful_build_fails_before_remote(
         nonlocal executed
         executed = True
 
-    monkeypatch.setattr(cli, "execute_plan", record)
+    monkeypatch.setattr(cli, "execute_prepared", record)
 
     assert cli.main(["--config", str(path), "--yes"]) == 4
     assert not executed

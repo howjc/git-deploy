@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.1.0/git_deploy-1.1.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.2.0/git_deploy-1.2.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -130,6 +130,35 @@ git-deploy init
 
 `init` 会根据 pnpm/npm/yarn/Composer lockfile 提供保守的 Build/Output 建议，但 Target 全部保持注释，必须由用户编辑，不连接服务器也不写密码。
 
+## Thin Workspace
+
+多个独立 Git 仓库可由一个极薄的 `deploy.workspace.toml` 按顺序编排。每仓仍保留自己的 `deploy.toml`、Build、Git 历史、State 和 Target Lock；Workspace 只保存名称、相对路径、顺序和统一的 Target 名：
+
+```toml
+default_target = "dev"
+
+[[repositories]]
+name = "api"
+path = "api"
+
+[[repositories]]
+name = "web"
+path = "web"
+```
+
+在 Workspace 根目录运行与单仓相同的命令：
+
+```bash
+git-deploy prod --dry-run
+git-deploy prod --yes
+git-deploy doctor prod
+git-deploy build prod
+```
+
+部署前会先完成所有仓库的 Target 校验、Build、Plan 和上传字节冻结；任一 Prepare 失败时不会建立远端连接。全部成功后显示 Combined Plan，只确认一次，并按配置顺序部署。相同 Native OpenSSH Endpoint 会共用当前命令生命周期内的一条 ControlMaster。
+
+如果当前目录同时有 `deploy.toml` 与 `deploy.workspace.toml`，必须用 `--config` 或 `--workspace` 显式选择。Workspace 不提供并行、依赖图、Target Map、共享 State、全局事务或自动回滚；中途失败后直接重跑，已成功仓库会自然成为 No-op。
+
 ### 退出码
 
 | 退出码 | 含义 |
@@ -202,7 +231,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.1.0-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.2.0-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

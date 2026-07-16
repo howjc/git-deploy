@@ -1,0 +1,15 @@
+# Copy to deploy.workspace.toml in a directory containing independent Git projects.
+# Each listed repository keeps its own untracked deploy.toml, State, and Target Lock.
+default_target = "dev"
+
+[[repositories]]
+name = "api"
+path = "api"
+
+[[repositories]]
+name = "web"
+path = "web"
+
+[[repositories]]
+name = "admin"
+path = "admin"
