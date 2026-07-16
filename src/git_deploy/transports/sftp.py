@@ -71,13 +71,32 @@ class SFTPTransport(Transport):
 
         self._mkdirs(self.target.remote_root.as_posix())
 
-    def upload(self, local_path: Path, remote_path: str, callback: ProgressCallback) -> None:
+    def root_exists(self) -> bool:
+        """Return whether the configured SFTP root exists."""
+
+        try:
+            self._require_sftp().stat(self.target.remote_root.as_posix())
+            return True
+        except OSError as exc:
+            if getattr(exc, "errno", None) in {errno.ENOENT, 2}:
+                return False
+            raise DeployError(f"cannot inspect SFTP root {self.target.remote_root}: {exc}") from exc
+
+    def upload(
+        self,
+        local_path: Path,
+        remote_path: str,
+        callback: ProgressCallback,
+        *,
+        executable: bool = False,
+    ) -> None:
         """Upload to a temporary name and safely replace the destination.
 
         Args:
             local_path: Frozen local file to stream.
             remote_path: Normalized relative target path.
             callback: Byte progress callback.
+            executable: Publish committed executables as ``0755``; other files as ``0644``.
         """
 
         sftp = self._require_sftp()
@@ -86,6 +105,7 @@ class SFTPTransport(Transport):
         temporary = f"{target}.git-deploy-{uuid.uuid4().hex}.tmp"
         try:
             sftp.put(str(local_path), temporary, callback=callback, confirm=True)
+            sftp.chmod(temporary, 0o755 if executable else 0o644)
             self._publish_temporary(temporary, target)
         except Exception as exc:
             try:

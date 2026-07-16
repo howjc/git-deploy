@@ -8,14 +8,15 @@ from pathlib import Path
 
 from git_deploy import __version__
 from git_deploy.builder import run_build
-from git_deploy.config import Config, discover_config, load_config
+from git_deploy.config import Config, discover_config, load_config, resolve_target_for_plan
 from git_deploy.deployer import execute_plan
 from git_deploy.doctor import run_doctor
 from git_deploy.errors import ConfigError, GitDeployError, PlanError, StateError
 from git_deploy.git import GitRepository
+from git_deploy.initializer import initialize_project
+from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
 from git_deploy.planner import DeploymentPlan, create_plan, render_plan
-from git_deploy.config import resolve_target_for_plan
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="git-deploy",
         description="Git-aware local build and FTP/SFTP file synchronization",
     )
-    parser.add_argument("action", nargs="?", help="target name, 'build', or 'doctor'")
+    parser.add_argument("action", nargs="?", help="target name, 'build', 'doctor', or 'init'")
     parser.add_argument("doctor_target", nargs="?", help="optional target for doctor")
     parser.add_argument("--dry-run", action="store_true", help="build and print the plan without connecting")
     parser.add_argument("--skip-build", action="store_true", help="skip configured build steps")
@@ -33,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true", help="deploy without interactive confirmation")
     parser.add_argument("--config", type=Path, help="path to deploy.toml")
     parser.add_argument("--verbose", action="store_true", help="show detailed upload progress")
+    parser.add_argument(
+        "--create-root",
+        action="store_true",
+        help="allow doctor to create a missing remote root",
+    )
     parser.add_argument("--version", action="version", version=f"git-deploy {__version__}")
     return parser
 
@@ -50,6 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.action == "init":
+            _validate_init_args(args)
+            destination = args.config if args.config is not None else None
+            created = initialize_project(Path.cwd(), destination)
+            print(f"Created {created}; edit target settings, then run git-deploy --dry-run.")
+            return 0
         config = load_config(discover_config(args.config))
         if args.action == "build":
             _validate_build_args(args)
@@ -60,14 +72,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "doctor":
             _validate_doctor_args(args)
             try:
-                doctor_git_dir = repository.git_dir()
+                doctor_git_dir = repository.common_dir()
             except PlanError:
                 doctor_git_dir = config.project_root / ".git"
             state_store = StateStore(doctor_git_dir)
-            return _doctor(config, args.doctor_target, repository, state_store)
+            return _doctor(config, args.doctor_target, args, repository, state_store)
         if args.doctor_target is not None:
             parser.error("deployment accepts at most one TARGET positional argument")
-        state_store = StateStore(repository.git_dir())
+        state_store = StateStore(repository.common_dir())
         return _deploy(config, args.action, args, repository, state_store)
     except GitDeployError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -87,63 +99,74 @@ def _deploy(
     """Run build, local planning, optional confirmation, and deployment."""
 
     target = config.target(requested_target)
-    repository.validate()
-    before_build_status = repository.status_porcelain()
-    if before_build_status and config.source.require_clean_worktree:
-        raise PlanError("worktree has uncommitted changes and source.require_clean_worktree is true")
-    if before_build_status:
-        print("WARNING: uncommitted changes are not included; committed HEAD content will be deployed.")
-    try:
-        state = state_store.load(target.name)
-    except StateError:
-        if not args.full:
-            raise
-        print("WARNING: existing state is unreadable; --full will rebuild it after success.")
-        state = None
-    resolved_target = resolve_target_for_plan(target)
-    target_fingerprint = resolved_target.fingerprint
-    if state is not None and state.target_fingerprint != target_fingerprint and not args.full:
-        raise PlanError("target identity changed since the last success; review it and rerun with --full")
-    if not args.skip_build:
-        run_build(config.build, config.project_root)
-        after_build_status = repository.status_porcelain()
-        if after_build_status and config.source.require_clean_worktree:
-            raise PlanError(
-                "build left uncommitted changes and source.require_clean_worktree is true"
-            )
-        if after_build_status != before_build_status:
-            print(
-                "WARNING: build changed the worktree; these changes are not included in source deployment."
-            )
-    plan = create_plan(
-        config,
-        target,
-        repository,
-        state,
-        full=args.full,
-        resolved_target=resolved_target,
-    )
-    print(render_plan(plan))
-    if args.dry_run:
-        print("Dry-run complete: no remote connection and no state change.")
+    with TargetLock(state_store.base, target.name):
+        repository.validate()
+        legacy_store = StateStore(repository.git_dir())
+        if state_store.migrate_from(legacy_store, target.name):
+            print("Migrated target state from the linked worktree Git dir to Git common dir.")
+        before_build_status = repository.status_porcelain()
+        if before_build_status and config.source.require_clean_worktree:
+            raise PlanError("worktree has uncommitted changes and source.require_clean_worktree is true")
+        if before_build_status:
+            print("WARNING: uncommitted changes are not included; committed HEAD content will be deployed.")
+        try:
+            state = state_store.load(target.name)
+        except StateError:
+            if not args.full:
+                raise
+            print("WARNING: existing state is unreadable; --full will rebuild it after success.")
+            state = None
+        resolved_target = resolve_target_for_plan(target, runtime_dir=state_store.base)
+        target_fingerprint = resolved_target.fingerprint
+        if state is not None and state.target_fingerprint != target_fingerprint and not args.full:
+            raise PlanError("target identity changed since the last success; review it and rerun with --full")
+        if not args.skip_build:
+            run_build(config.build, config.project_root)
+            after_build_status = repository.status_porcelain()
+            if after_build_status and config.source.require_clean_worktree:
+                raise PlanError(
+                    "build left uncommitted changes and source.require_clean_worktree is true"
+                )
+            if after_build_status != before_build_status:
+                print(
+                    "WARNING: build changed the worktree; these changes are not included in source deployment."
+                )
+        plan = create_plan(
+            config,
+            target,
+            repository,
+            state,
+            full=args.full,
+            resolved_target=resolved_target,
+        )
+        print(render_plan(plan))
+        if args.dry_run:
+            print("Dry-run complete: no remote connection and no state change.")
+            return 0
+        if plan.operations and not args.yes:
+            _confirm(plan)
+        execute_plan(plan, config, repository, state_store, verbose=args.verbose)
+        print(f"Deployment completed: {plan.upload_count} upload(s), {plan.delete_count} delete(s).")
         return 0
-    if plan.operations and not args.yes:
-        _confirm(plan)
-    execute_plan(plan, config, repository, state_store, verbose=args.verbose)
-    print(f"Deployment completed: {plan.upload_count} upload(s), {plan.delete_count} delete(s).")
-    return 0
 
 
 def _doctor(
     config: Config,
     requested_target: str | None,
+    args: argparse.Namespace,
     repository: GitRepository,
     state_store: StateStore,
 ) -> int:
     """Render focused diagnostics and return failure when any check fails."""
 
     target = config.target(requested_target)
-    results = run_doctor(config, target, repository, state_store)
+    results = run_doctor(
+        config,
+        target,
+        repository,
+        state_store,
+        create_root=args.create_root,
+    )
     for result in results:
         marker = "OK" if result.ok else "FAIL"
         print(f"[{marker}] {result.name}: {result.detail}")
@@ -165,7 +188,7 @@ def _validate_build_args(args: argparse.Namespace) -> None:
 
     if args.doctor_target is not None:
         raise ConfigError("build does not accept a target")
-    if args.dry_run or args.skip_build or args.full or args.yes:
+    if args.dry_run or args.skip_build or args.full or args.yes or args.create_root:
         raise ConfigError("build does not accept deploy-only flags")
 
 
@@ -174,6 +197,15 @@ def _validate_doctor_args(args: argparse.Namespace) -> None:
 
     if args.dry_run or args.skip_build or args.full or args.yes:
         raise ConfigError("doctor does not accept deploy-only flags")
+
+
+def _validate_init_args(args: argparse.Namespace) -> None:
+    """Reject flags that would imply build, remote, or mutation behavior for init."""
+
+    if args.doctor_target is not None:
+        raise ConfigError("init does not accept a target")
+    if args.dry_run or args.skip_build or args.full or args.yes or args.verbose or args.create_root:
+        raise ConfigError("init does not accept deploy or doctor flags")
 
 
 if __name__ == "__main__":

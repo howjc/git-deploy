@@ -57,6 +57,13 @@ class GitRepository:
         path = Path(value)
         return path.resolve() if path.is_absolute() else (self.root / path).resolve()
 
+    def common_dir(self) -> Path:
+        """Return the shared Git metadata directory used by all linked worktrees."""
+
+        value = self._run("rev-parse", "--git-common-dir").decode().strip()
+        path = Path(value)
+        return path.resolve() if path.is_absolute() else (self.root / path).resolve()
+
     def is_dirty(self) -> bool:
         """Return whether tracked or untracked worktree changes exist."""
 

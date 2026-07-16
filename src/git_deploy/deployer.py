@@ -157,6 +157,7 @@ def _execute_with_retry(
                     local,
                     operation.remote_path,
                     progress.callback(operation.remote_path, local.stat().st_size),
+                    executable=operation.executable,
                 )
             else:
                 transport.delete(operation.remote_path)

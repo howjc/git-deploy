@@ -279,3 +279,37 @@ remote_root = "/srv/app"
     state = TargetState(1, "dev", plan.target_fingerprint, repository.head(), 1, {})
     with pytest.raises(PlanError, match="identity changed"):
         create_plan(config, config.target(None), repository, state, full=False)
+
+
+def test_executable_source_is_preserved_for_sftp_and_rejected_for_ftp(
+    git_project: Path,
+) -> None:
+    """Executable Git mode is explicit and FTP cannot silently drop it."""
+
+    script = git_project / "deploy.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    commit_all(git_project, "add executable")
+    repository = GitRepository(git_project)
+    sftp_config = load_config(write_config(git_project))
+
+    plan = create_plan(sftp_config, sftp_config.target(None), repository, None, full=False)
+    operation = next(item for item in plan.operations if item.remote_path == "deploy.sh")
+    assert isinstance(operation, UploadOperation)
+    assert operation.executable
+
+    ftp_config = load_config(
+        write_config(
+            git_project,
+            """
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+""",
+        )
+    )
+    with pytest.raises(PlanError, match="executable mode"):
+        create_plan(ftp_config, ftp_config.target(None), repository, None, full=False)

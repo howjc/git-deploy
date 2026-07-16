@@ -133,6 +133,35 @@ remote_root = "/srv/app"
         load_config(path)
 
 
+@pytest.mark.parametrize("field", ["host", "username", "port", "password_env", "key_file"])
+def test_native_alias_rejects_paramiko_connection_fields(
+    git_project: Path,
+    field: str,
+) -> None:
+    """Native alias targets cannot mix a second, conflicting connection model."""
+
+    values = {
+        "host": '"host"',
+        "username": '"deploy"',
+        "port": "2222",
+        "password_env": '"PASSWORD"',
+        "key_file": '"~/.ssh/id_ed25519"',
+    }
+    path = write_config(
+        git_project,
+        f"""
+[targets.dev]
+protocol = "sftp"
+ssh_host_alias = "project-dev"
+{field} = {values[field]}
+remote_root = "/srv/app"
+""",
+    )
+
+    with pytest.raises(ConfigError, match="Native OpenSSH.*conflicts"):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     ("path", "pattern", "expected"),
     [

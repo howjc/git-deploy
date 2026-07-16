@@ -30,6 +30,7 @@ class UploadOperation:
     local_path: Path | None = None
     git_path: str | None = None
     size: int | None = None
+    executable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,17 @@ def create_plan(
         suffix = " ..." if len(overlap) > 5 else ""
         raise PlanError(f"source/output ownership conflict: {preview}{suffix}")
     source_operations = _plan_source(repository, config, state, head, effective_full, entries)
+    if resolved_target.protocol == "ftp":
+        executable_paths = [
+            operation.remote_path
+            for operation in source_operations
+            if isinstance(operation, UploadOperation) and operation.executable
+        ]
+        if executable_paths:
+            raise PlanError(
+                "FTP cannot guarantee executable mode for source path(s): "
+                + ", ".join(executable_paths[:5])
+            )
     output_operations = _plan_outputs(config.outputs, current_outputs, state, effective_full)
     operations = _merge_operations((*source_operations, *output_operations), config)
     manifest = {path: item.entry for path, item in current_outputs.items()}
@@ -158,7 +170,14 @@ def _plan_source(
         for path, entry in entries.items():
             if is_source_managed(path, config.source):
                 _require_regular_git_entry(entry)
-                operations.append(UploadOperation(path, "source", git_path=path))
+                operations.append(
+                    UploadOperation(
+                        path,
+                        "source",
+                        git_path=path,
+                        executable=entry.mode == "100755",
+                    )
+                )
         return tuple(operations)
     if state is None:
         raise PlanError("internal planner error: incremental source plan has no state")
@@ -172,7 +191,14 @@ def _plan_source(
             if entry is None:
                 raise PlanError(f"changed source is missing from HEAD: {change.path}")
             _require_regular_git_entry(entry)
-            operations.append(UploadOperation(change.path, "source", git_path=change.path))
+            operations.append(
+                UploadOperation(
+                    change.path,
+                    "source",
+                    git_path=change.path,
+                    executable=entry.mode == "100755",
+                )
+            )
     return tuple(operations)
 
 
@@ -233,6 +259,7 @@ def _merge_operations(operations: tuple[Operation, ...], config: Config) -> tupl
                 operation.local_path,
                 operation.git_path,
                 operation.size,
+                operation.executable,
             )
         else:
             normalized_operation = DeleteOperation(normalized, operation.origin)

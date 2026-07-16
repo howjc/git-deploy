@@ -34,10 +34,7 @@ delete_removed = true
 [targets.dev]
 protocol = "sftp"
 ssh_host_alias = "project-dev"
-username = "deploy"
 remote_root = "/srv/project-dev"
-strict_host_key_checking = true
-use_ssh_agent = true
 
 [targets.prod]
 protocol = "ftp"

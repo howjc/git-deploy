@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.0.1/git_deploy-1.0.1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.1.0/git_deploy-1.1.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -61,9 +61,7 @@ delete_removed = true
 [targets.dev]
 protocol = "sftp"
 ssh_host_alias = "project-dev"
-username = "deploy"
 remote_root = "/srv/project-dev"
-strict_host_key_checking = true
 
 [targets.prod]
 protocol = "ftp"
@@ -82,15 +80,15 @@ retry_delay = 2
 
 以下保护规则始终生效，不能被配置移除：`.env`、`.env.*`、`uploads/**`、`runtime/**`、`storage/cert/**`、`**/*.key`、`**/*.pem`。默认也排除 `.git/**`、`node_modules/**` 和 `storage/logs/**`。
 
-SFTP 默认验证 Host Key 并支持：
+配置 `ssh_host_alias` 时自动使用当前环境的 Native OpenSSH：
 
-- OpenSSH Config 与 `ssh_host_alias`；
-- SSH Agent（包括 1Password SSH Agent）；
-- `key_file`；
-- 可选 `password_env`；
-- 可选项目专用 `known_hosts_file`。
+- 完整读取 OpenSSH Config、Include、ProxyJump 和 ProxyCommand；
+- 继承当前 `SSH_AUTH_SOCK`，兼容 WSL 中的 1Password SSH Agent；
+- 使用临时 ControlMaster，多文件只建立一次认证连接；
+- 不读取私钥、不管理 Agent Socket、不启用 Agent Forwarding；
+- 只调用当前环境的 POSIX `ssh`/`sftp`，不会回退 Windows `ssh.exe`。
 
-v1.0 的 Paramiko 传输层暂不支持 OpenSSH `ProxyJump`/`ProxyCommand`；`ssh -G` 解析到这些字段时会在连接前明确拒绝。
+Alias Target 只配置 `ssh_host_alias`、可选 `ssh_config_file` 和 `remote_root`；不要混入 `host`、`username`、`port`、`key_file` 或 `password_env`。只配置 `host`/`username` 的 SFTP Target 继续使用 Paramiko，支持 `key_file`、`password_env`、`known_hosts_file` 和 SSH Agent。
 
 FTP 必须通过 `password_env` 读取密码，不接受 TOML 明文密码。v1-lite 不支持 FTPS、远端命令、owner/group 或远端健康检查。
 
@@ -119,9 +117,18 @@ git-deploy prod --full --yes
 git-deploy build
 git-deploy doctor
 git-deploy doctor prod
+git-deploy doctor prod --create-root
 ```
 
-`doctor` 检查配置、Git、构建命令、output 路径、state、连接和远端根目录；远端根目录不存在时会尝试创建。
+`doctor` 默认只检查配置、Git、构建命令、output、state、连接和远端根目录，不创建远端内容；只有 `--create-root` 才允许创建缺失 Root。Native OpenSSH Doctor 会显示 backend、系统命令绝对路径、Alias 和解析后的 Endpoint，并提示认证可能触发当前 SSH Agent。
+
+新仓库可先生成无凭据模板：
+
+```bash
+git-deploy init
+```
+
+`init` 会根据 pnpm/npm/yarn/Composer lockfile 提供保守的 Build/Output 建议，但 Target 全部保持注释，必须由用户编辑，不连接服务器也不写密码。
 
 ### 退出码
 
@@ -147,10 +154,11 @@ git diff --no-renames --name-status -z LAST_COMMIT..HEAD
 
 outputs 在构建后扫描并计算 SHA256。只有上次 state 已记录、当前已删除且对应 `delete_removed = true` 的产物才会触发远端删除；工具永远不会扫描并清理未知远端内容。
 
-每个 target 的 state 独立保存在：
+每个 target 的 state 和进程锁保存在 Git Common Dir，多个 linked worktree 共享：
 
 ```text
 .git/git-deploy/<target>.json
+.git/git-deploy/<target>.lock
 ```
 
 只有所有上传和删除成功后才原子更新 state。中途失败会保留旧 state；重新执行同一条 `git-deploy` 即可覆盖已完成文件并继续收敛。
@@ -161,6 +169,7 @@ outputs 在构建后扫描并计算 SHA256。只有上次 state 已记录、当�
 - 源码上传固定为 committed `HEAD`，不会读取同路径的脏工作区内容。
 - output 在连接前复制并复核 hash，避免计划与上传字节不一致。
 - SFTP 先上传临时文件再替换；兼容回退先备份旧目标，替换失败会恢复旧文件。
+- Git `100755` 文件通过 SFTP 发布为 `0755`；FTP 无法保证可执行位，因此会在连接前拒绝。
 - FTP 只承诺二进制上传、目录创建和幂等文件操作，不声称原子替换或 POSIX 权限语义。
 - 本工具只同步文件；数据库、消息队列、缓存刷新、进程重启和服务器备份不在职责内。
 
@@ -193,9 +202,9 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.0.1-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.1.0-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```
 
-详细范围、取舍和实施记录见 [v1-lite 破坏性重构方案](docs/git-deploy-v1-lite-destructive-refactor-plan.md) 与 [v1-lite Scope](docs/v1-lite-scope.md)。
+WSL、1Password、OpenSSH Config、Windows Hello 人工验收与故障排查见 [Native OpenSSH / WSL 指南](docs/native-openssh-wsl.md)。详细范围和实施记录见 [OpenSSH/Workspace 总方案](docs/git-deploy-v1-lite-audit-workspace-openssh-master-plan.md)。
