@@ -1,10 +1,10 @@
 # git-deploy v1-lite 最新代码审计、多仓 Workspace 与 Native OpenSSH 总方案
 
-> 仓库：`howjc/git-deploy`  
-> 审计分支：`main`  
-> 最新审计提交：`4da20713b1fa9f38ccce4f353e7e9896ab97df3f`  
-> 当前版本：`v1.0.0`  
-> 文档日期：`2026-07-16`  
+> 仓库：`howjc/git-deploy`
+> 审计分支：`main`
+> 最新审计提交：`4da20713b1fa9f38ccce4f353e7e9896ab97df3f`
+> 当前版本：`v1.0.0`
+> 文档日期：`2026-07-16`
 > 总体结论：**v1-lite 重构方向正确；先完成 v1.0.1 安全修复，再落地 v1.1 Native OpenSSH，最后实现 v1.2 Thin Workspace。**
 
 ---
@@ -1199,7 +1199,7 @@ v1.2 增加 Thin Workspace
 
 # Native OpenSSH / 1Password SSH Agent / WSL 专项设计
 
-> 本章节是前述单仓可靠性与 Thin Workspace 设计的认证和传输专项实现方案。  
+> 本章节是前述单仓可靠性与 Thin Workspace 设计的认证和传输专项实现方案。
 > 核心原则：**配置 SSH 主机别名时，git-deploy 完整委托给系统 OpenSSH。**
 
 ## 1. 背景
