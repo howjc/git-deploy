@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from git_deploy.builder import run_build
-from git_deploy.config import Config, load_config, resolve_target_for_plan
-from git_deploy.deployer import TransportFactory, execute_frozen_plan, freeze_uploads
+from git_deploy.config import Config, TargetConfig, load_config, resolve_target_for_plan
+from git_deploy.deployer import (
+    TransportFactory,
+    estimate_frozen_bytes,
+    execute_frozen_plan,
+    freeze_uploads,
+)
 from git_deploy.errors import PlanError, StateError
 from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
@@ -27,6 +33,7 @@ class PreparedDeployment:
     state_store: StateStore
     plan: DeploymentPlan
     frozen: dict[str, Path]
+    frozen_bytes: int
     _temporary: tempfile.TemporaryDirectory[str]
     _lock: TargetLock
     _closed: bool = False
@@ -50,6 +57,9 @@ def prepare_project(
     *,
     full: bool,
     skip_build: bool,
+    prepared_config: Config | None = None,
+    prepared_target: TargetConfig | None = None,
+    prepared_lock: TargetLock | None = None,
 ) -> PreparedDeployment:
     """Preflight, build, plan, and freeze one project with zero remote connection.
 
@@ -59,18 +69,22 @@ def prepare_project(
         requested_target: Unified explicit/default target name.
         full: Force full current ownership upload and State rebuild.
         skip_build: Skip configured trusted build steps.
+        prepared_config: Workspace-preloaded immutable project configuration.
+        prepared_target: Workspace-pre-resolved physical target for this project.
+        prepared_lock: Workspace lock already acquired before any project Build.
 
     Returns:
         A locked deployment whose upload bytes cannot change after confirmation.
     """
 
-    config = load_config(config_path)
+    config = prepared_config or load_config(config_path)
     target = config.target(requested_target)
     repository = GitRepository(config.project_root)
     repository.validate()
     state_store = StateStore(repository.common_dir())
-    lock = TargetLock(state_store.base, target.name)
-    lock.acquire()
+    lock = prepared_lock or TargetLock(state_store.base, target.name)
+    if prepared_lock is None:
+        lock.acquire()
     temporary: tempfile.TemporaryDirectory[str] | None = None
     try:
         legacy_store = StateStore(repository.git_dir())
@@ -94,7 +108,9 @@ def prepare_project(
                 raise
             print(f"[{name}] WARNING: unreadable State will be rebuilt after full success.")
             state = None
-        resolved_target = resolve_target_for_plan(target, runtime_dir=state_store.base)
+        resolved_target = prepared_target or resolve_target_for_plan(
+            target, runtime_dir=state_store.base
+        )
         if (
             state is not None
             and state.target_fingerprint != resolved_target.fingerprint
@@ -125,6 +141,13 @@ def prepare_project(
             full=full,
             resolved_target=resolved_target,
         )
+        frozen_bytes = estimate_frozen_bytes(plan, repository)
+        available = shutil.disk_usage(tempfile.gettempdir()).free
+        if frozen_bytes > available:
+            raise PlanError(
+                f"[{name}] insufficient temporary disk space to freeze uploads: "
+                f"need {frozen_bytes} byte(s), available {available}"
+            )
         temporary = tempfile.TemporaryDirectory(prefix=f"git-deploy-{name}-")
         frozen = freeze_uploads(plan, repository, Path(temporary.name))
         return PreparedDeployment(
@@ -134,6 +157,7 @@ def prepare_project(
             state_store,
             plan,
             frozen,
+            frozen_bytes,
             temporary,
             lock,
         )

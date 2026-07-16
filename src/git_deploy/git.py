@@ -170,6 +170,23 @@ class GitRepository:
         except OSError as exc:
             raise PlanError(f"cannot stage committed source {path!r}: {exc}") from exc
 
+    def blob_size(self, commit: str, path: str) -> int:
+        """Return the byte size of one committed blob before staging it.
+
+        Args:
+            commit: Frozen deployment commit.
+            path: Relative Git path owned by the source plan.
+
+        Returns:
+            Exact blob size reported by Git.
+        """
+
+        raw = self._run("cat-file", "-s", f"{commit}:{path}").decode().strip()
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise PlanError(f"Git returned an invalid blob size for {path!r}: {raw!r}") from exc
+
     def _run(self, *arguments: str) -> bytes:
         """Run Git with byte-safe output and convert failures to plan errors."""
 

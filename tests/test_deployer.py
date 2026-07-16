@@ -10,7 +10,7 @@ from git_deploy.config import load_config
 from git_deploy.deployer import execute_plan
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.git import GitRepository
-from git_deploy.manifest import StateStore, TargetState
+from git_deploy.manifest import ManifestEntry, StateStore, TargetState
 from git_deploy.planner import create_plan
 from git_deploy.transports.base import ProgressCallback, Transport
 from tests.conftest import commit_all, write_config
@@ -96,6 +96,29 @@ class FailOnPathTransport(FakeTransport):
         if remote_path == self.failed_path:
             raise OSError("network interrupted")
         super().upload(local_path, remote_path, callback, executable=executable)
+
+
+class FailDeleteTransport(FakeTransport):
+    """Fail every delete probe/operation and record retry invalidation."""
+
+    def __init__(self) -> None:
+        """Initialize delete attempts and invalidation evidence."""
+
+        super().__init__()
+        self.delete_attempts = 0
+        self.invalidations = 0
+
+    def delete(self, remote_path: str) -> None:
+        """Simulate a permission/dead-session error instead of absence."""
+
+        self.delete_attempts += 1
+        raise OSError("Permission denied")
+
+    def invalidate_connection(self) -> None:
+        """Record that retries discard the failed connection."""
+
+        self.invalidations += 1
+        self.close()
 
 
 def test_success_uploads_exact_head_and_commits_state(git_project: Path) -> None:
@@ -252,3 +275,32 @@ def test_partial_failure_then_rerun_converges(git_project: Path) -> None:
         "public/dist/asset.js": b"asset",
     }
     assert store.load("dev") is not None
+
+
+def test_delete_probe_error_keeps_state_and_delete_intent(git_project: Path) -> None:
+    """An ambiguous delete failure cannot advance State or lose the next retry."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    target = config.target(None)
+    old = TargetState(
+        1,
+        "dev",
+        target.fingerprint,
+        repository.head(),
+        1,
+        {"public/dist/old.js": ManifestEntry("0" * 64, 1)},
+    )
+    store.save(old)
+    plan = create_plan(config, target, repository, old, full=False)
+    failed = FailDeleteTransport()
+
+    with pytest.raises(DeployError, match="Permission denied"):
+        execute_plan(plan, config, repository, store, transport_factory=lambda selected: failed)
+
+    assert failed.delete_attempts == config.deploy.retries
+    assert failed.invalidations == config.deploy.retries - 1
+    assert store.load("dev") == old
+    rerun = create_plan(config, target, repository, store.load("dev"), full=False)
+    assert [operation.remote_path for operation in rerun.operations] == ["public/dist/old.js"]

@@ -162,6 +162,25 @@ remote_root = "/srv/app"
         load_config(path)
 
 
+@pytest.mark.parametrize("name", ["build", "doctor", "init"])
+def test_rejects_flat_cli_reserved_target_names(git_project: Path, name: str) -> None:
+    """Target names cannot be shadowed by the CLI's action words."""
+
+    path = write_config(
+        git_project,
+        f"""
+[targets.{name}]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+    )
+
+    with pytest.raises(ConfigError, match="reserved by the flat CLI"):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     ("path", "pattern", "expected"),
     [

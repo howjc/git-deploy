@@ -177,7 +177,19 @@ def _deploy_project(
     requested_target: str | None,
     args: argparse.Namespace,
 ) -> int:
-    """Prepare frozen bytes, confirm, and deploy one independent project."""
+    """Prepare frozen bytes, confirm, and deploy one independent project.
+
+    Args:
+        config: Loaded independent project configuration.
+        requested_target: Explicit/default target name.
+        args: Validated flat CLI options.
+
+    Returns:
+        Zero after dry-run or successful deployment.
+    """
+
+    if args.create_root:
+        raise ConfigError("--create-root is only valid with doctor")
 
     prepared = prepare_project(
         config.project_root.name,
@@ -208,7 +220,19 @@ def _deploy_workspace(
     requested_target: str | None,
     args: argparse.Namespace,
 ) -> int:
-    """Prepare every project, confirm once, and deploy in listed order."""
+    """Prepare every project, confirm once, and deploy in listed order.
+
+    Args:
+        workspace: Loaded thin-workspace configuration.
+        requested_target: Shared explicit/default target name.
+        args: Validated flat CLI options.
+
+    Returns:
+        Zero after workspace dry-run or successful sequential deployment.
+    """
+
+    if args.create_root:
+        raise ConfigError("--create-root is only valid with doctor")
 
     target, prepared = prepare_workspace(
         workspace,

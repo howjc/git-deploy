@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+import git_deploy.doctor as doctor_module
 from git_deploy.config import load_config
 from git_deploy.doctor import run_doctor
+from git_deploy.errors import ConfigError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from tests.conftest import write_config
@@ -89,3 +93,42 @@ def test_doctor_is_read_only_unless_create_root_is_explicit(git_project: Path) -
     )
     assert next(item for item in created if item.name == "target").ok
     assert transport.created == 1
+
+
+def test_doctor_resolution_failure_short_circuits_create_root(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid target resolution records failure without creating a transport."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    created = 0
+
+    def fail_resolution(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Simulate an invalid SSH Alias/config preflight."""
+
+        raise ConfigError("cannot resolve prepared endpoint")
+
+    def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003
+        """Record any unsafe remote construction."""
+
+        nonlocal created
+        created += 1
+        raise AssertionError("transport creation is forbidden")
+
+    monkeypatch.setattr(doctor_module, "resolve_target_for_plan", fail_resolution)
+    results = run_doctor(
+        config,
+        config.target(None),
+        repository,
+        StateStore(repository.common_dir()),
+        create_root=True,
+        transport_factory=forbidden,
+    )
+
+    assert created == 0
+    assert any(
+        result.name == "target config" and not result.ok and "cannot resolve" in result.detail
+        for result in results
+    )

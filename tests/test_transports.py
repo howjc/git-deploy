@@ -64,6 +64,11 @@ class FakeFTP:
 
         raise ftplib.error_perm(self.message)
 
+    def nlst(self, path: str) -> list[str]:
+        """List the target only for the permission-error fixture."""
+
+        return [f"{path}/old.txt"] if "Permission" in self.message else []
+
 
 class FakeSSHClient:
     """Record Paramiko connection options without opening a socket."""

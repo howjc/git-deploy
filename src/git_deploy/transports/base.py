@@ -54,6 +54,15 @@ class Transport(ABC):
     def close(self) -> None:
         """Close all network resources, tolerating repeated calls."""
 
+    def invalidate_connection(self) -> None:
+        """Discard a failed connection before retrying it.
+
+        Returns:
+            ``None`` after the default transport resources are closed.
+        """
+
+        self.close()
+
     def __enter__(self) -> Transport:
         """Connect and return this transport as a context manager."""
 

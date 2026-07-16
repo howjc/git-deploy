@@ -67,6 +67,8 @@ git-deploy prod --yes
 
 `--yes` 只跳过 git-deploy 自己的确认，不设置 `BatchMode=yes`，因此不会禁用 Agent 或生物认证交互。
 
+连接前会重新执行 `ssh -G` 比较 HostName、User 和 Port，并在真实命令中固定已审阅的值；确认期间 Alias 发生变化会要求重新规划。Target `timeout` 作为 OpenSSH `ConnectTimeout`，不会作为 1Password/Windows Hello 授权或完整 SFTP Batch 的 Python 进程超时。
+
 ## 多仓人工验收
 
 Workspace 内多个仓库使用同一 Alias 时执行：
@@ -76,6 +78,8 @@ git-deploy prod --yes
 ```
 
 确认只建立一个 ControlMaster、只授权一次，然后按配置顺序部署。若 api 成功、web 失败，则后续仓库不执行；重跑后 api 为 No-op，web 继续并最终收敛。
+
+Workspace 会在首个 Build 前解析全部物理 Endpoint，并拒绝同一 Endpoint 上相同或嵌套的 Remote Root。失效的共享 Master 会从命令级 Pool 驱逐，文件重试会建立新 Master。
 
 ## 故障排查
 
