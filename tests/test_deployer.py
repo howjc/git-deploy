@@ -19,10 +19,11 @@ from tests.conftest import commit_all, write_config
 class FakeTransport(Transport):
     """Record remote mutations and optionally fail uploads."""
 
-    def __init__(self, failures: int = 0) -> None:
-        """Create a fake that fails the requested number of upload attempts."""
+    def __init__(self, failures: int = 0, connect_failures: int = 0) -> None:
+        """Create a fake with requested upload and initial-connect failures."""
 
         self.failures = failures
+        self.connect_failures = connect_failures
         self.connects = 0
         self.closed = 0
         self.files: dict[str, bytes] = {}
@@ -32,6 +33,9 @@ class FakeTransport(Transport):
         """Record one connection."""
 
         self.connects += 1
+        if self.connect_failures:
+            self.connect_failures -= 1
+            raise OSError("temporary connection failure")
 
     def ensure_root(self) -> None:
         """Accept the synthetic remote root."""
@@ -106,6 +110,22 @@ def test_per_file_retry_does_not_rebuild_plan(git_project: Path) -> None:
     assert transport.files["app.py"] == b"print('v1')\n"
     assert store.load("dev") is not None
     assert transport.connects == 2
+
+
+def test_initial_connection_and_root_check_are_retried(git_project: Path) -> None:
+    """Transient failure before the first upload uses the same retry policy."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    transport = FakeTransport(connect_failures=1)
+
+    execute_plan(plan, config, repository, store, transport_factory=lambda target: transport)
+
+    assert transport.connects == 2
+    assert transport.files["app.py"] == b"print('v1')\n"
+    assert store.load("dev") is not None
 
 
 def test_source_freeze_stays_bound_to_planned_commit_after_head_moves(

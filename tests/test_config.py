@@ -96,6 +96,44 @@ remote_root = "/public_html"
 
 
 @pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("public/assets", "public/assets"),
+        ("public/assets", "public/assets/js"),
+        (".", "vendor"),
+    ],
+)
+def test_rejects_equal_or_nested_output_remote_roots(
+    git_project: Path,
+    left: str,
+    right: str,
+) -> None:
+    """Output ownership is unambiguous even before either directory has files."""
+
+    path = write_config(
+        git_project,
+        f"""
+[[outputs]]
+local = "dist"
+remote = "{left}"
+
+[[outputs]]
+local = "vendor"
+remote = "{right}"
+
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+    )
+
+    with pytest.raises(ConfigError, match="equal or nested"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
     ("path", "pattern", "expected"),
     [
         ("app.py", "**", True),

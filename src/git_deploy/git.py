@@ -60,7 +60,12 @@ class GitRepository:
     def is_dirty(self) -> bool:
         """Return whether tracked or untracked worktree changes exist."""
 
-        return bool(self._run("status", "--porcelain", "--untracked-files=normal"))
+        return bool(self.status_porcelain())
+
+    def status_porcelain(self) -> bytes:
+        """Return stable porcelain status for pre/post-build comparison."""
+
+        return self._run("status", "--porcelain", "--untracked-files=normal")
 
     def commit_exists(self, commit: str) -> bool:
         """Return whether a state commit still resolves to a commit object.

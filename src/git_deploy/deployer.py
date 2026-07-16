@@ -54,8 +54,11 @@ def execute_plan(
         frozen = _freeze_uploads(plan, repository, Path(directory))
         transport = transport_factory(plan.target)
         try:
-            transport.connect()
-            transport.ensure_root()
+            _connect_with_retry(
+                transport,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
             for operation in plan.operations:
                 _execute_with_retry(
                     operation,
@@ -74,6 +77,28 @@ def execute_plan(
     state_store.save(
         new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
     )
+
+
+def _connect_with_retry(transport: Transport, *, attempts: int, delay: float) -> None:
+    """Connect and ensure the remote root with the configured retry policy."""
+
+    for attempt in range(1, attempts + 1):
+        try:
+            transport.connect()
+            transport.ensure_root()
+            return
+        except Exception as exc:
+            transport.close()
+            if attempt >= attempts:
+                raise DeployError(
+                    f"remote connection failed after {attempts} attempt(s): {exc}"
+                ) from exc
+            print(
+                f"Retry {attempt}/{attempts - 1} for remote connection after error: {exc}",
+                flush=True,
+            )
+            if delay:
+                time.sleep(delay)
 
 
 def _freeze_uploads(
@@ -125,8 +150,7 @@ def _execute_with_retry(
         try:
             if attempt > 1:
                 transport.close()
-                transport.connect()
-                transport.ensure_root()
+                _connect_with_retry(transport, attempts=1, delay=0)
             if isinstance(operation, UploadOperation):
                 local = frozen[operation.remote_path]
                 transport.upload(
