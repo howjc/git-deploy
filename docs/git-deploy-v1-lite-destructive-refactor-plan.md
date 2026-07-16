@@ -1665,7 +1665,7 @@ State 不更新
 - [x] 修复 Alpha 问题
 - [x] `v1.0.0-beta.1`
 - [x] 连续日常使用验证
-- [ ] `v1.0.0`
+- [x] `v1.0.0`
 
 ---
 
@@ -1907,3 +1907,4 @@ Git-aware Build & Deployment Sync Tool
 - 2026-07-16：Alpha 审查修复 exact-commit 源码冻结、OpenSSH 实际端点冻结与断线重连，并新增重复日常部署 soak；Alpha SFTP State 升级 Beta 时需核对目标后执行一次 `--full`。
 - 2026-07-16：已发布 `v1.0.0-beta.1`；下载复核 wheel SHA256 为 `bff4ac477e73813312f48e4707f98a6903965b1771d3048baa273b75f7cb2d01`，sdist SHA256 为 `d7b263748ffccc80e4c7e673930ea5182b5f4cbe06ebdaff6dd00d91c7f028ff`。
 - 2026-07-16：连续使用门禁覆盖持久 Fake Remote 多轮 soak，以及真实 FTP/SFTP 上完整 Planner → Deployer → State 的首次与增量部署。
+- 2026-07-16：PR #5 已合并到 main，并从 merge commit 发布正式版 `v1.0.0`；下载复核 wheel SHA256 为 `8ce5475b121dbfff5c27a06c11db81e342ebe79989d974369db7d93be12fc257`，sdist SHA256 为 `ace4371c7096749e70320e72692e8dd2e85cc1a96257b4019a34967c80effe75`。
