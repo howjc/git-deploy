@@ -1521,7 +1521,7 @@ State 不更新
 - [x] 新增 v1 Scope 文档
 - [x] 标记 v0.3 Legacy
 - [x] 禁止旧架构功能合入
-- [ ] 建立重构 PR
+- [x] 建立重构 PR
 
 ## Phase B：基础骨架
 
@@ -1902,3 +1902,4 @@ Git-aware Build & Deployment Sync Tool
 - 2026-07-16：SFTP Target 增加可选 `known_hosts_file`，用于自动化环境固定 Host Key；不改变默认读取系统 known_hosts 的行为。
 - 2026-07-16：`outputs.remote = "."` 允许显式映射远端根目录，最终路径仍经过 protect、冲突和越界检查。
 - 2026-07-16：Phase L 的 Beta、连续日常使用与 v1.0.0 保留为发布后阶段；本轮发布目标为 `v1.0.0-alpha.1`。
+- 2026-07-16：重构分支已推送并建立 Draft PR #5（`rewrite/v1-lite` → `main`）。
