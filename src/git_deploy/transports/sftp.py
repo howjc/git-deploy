@@ -5,14 +5,13 @@ from __future__ import annotations
 import errno
 import os
 import posixpath
-import subprocess
 import uuid
 from pathlib import Path, PurePosixPath
 
 import paramiko
 
-from git_deploy.config import TargetConfig
-from git_deploy.errors import DeployError
+from git_deploy.config import TargetConfig, resolve_ssh_target
+from git_deploy.errors import ConfigError, DeployError
 from git_deploy.transports.base import ProgressCallback, Transport
 
 
@@ -193,53 +192,16 @@ class SFTPTransport(Transport):
 def _resolve_ssh_settings(target: TargetConfig) -> dict[str, object]:
     """Resolve host/user/port/identity files using OpenSSH's own parser."""
 
-    host = target.host
-    username = target.username
-    port = target.port
-    key_files: list[str] = [str(target.key_file)] if target.key_file else []
-    if target.ssh_host_alias:
-        command = ["ssh", "-G"]
-        if target.ssh_config_file:
-            command.extend(["-F", str(target.ssh_config_file)])
-        command.append(target.ssh_host_alias)
-        try:
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        except OSError as exc:
-            raise DeployError(f"cannot execute ssh -G for {target.ssh_host_alias}: {exc}") from exc
-        if result.returncode != 0:
-            raise DeployError(f"cannot resolve SSH alias {target.ssh_host_alias}: {result.stderr.strip()}")
-        resolved: dict[str, list[str]] = {}
-        for line in result.stdout.splitlines():
-            if not line.strip():
-                continue
-            key, _, value = line.partition(" ")
-            resolved.setdefault(key.lower(), []).append(value.strip())
-        proxy_jump = _first(resolved, "proxyjump")
-        proxy_command = _first(resolved, "proxycommand")
-        if (proxy_jump and proxy_jump.lower() != "none") or (
-            proxy_command and proxy_command.lower() != "none"
-        ):
-            raise DeployError("ProxyJump/ProxyCommand is not supported by the v1-lite SFTP transport")
-        host = target.host or _first(resolved, "hostname") or target.ssh_host_alias
-        username = target.username or _first(resolved, "user")
-        if not target.port_explicit and _first(resolved, "port"):
-            port = int(_first(resolved, "port") or "22")
-        if not key_files:
-            key_files = [
-                os.path.expanduser(item)
-                for item in resolved.get("identityfile", [])
-                if item.lower() != "none"
-            ]
-    if not host or not username:
-        raise DeployError(f"SFTP target {target.name} did not resolve both host and username")
-    return {"host": host, "username": username, "port": port, "key_files": key_files}
-
-
-def _first(values: dict[str, list[str]], key: str) -> str | None:
-    """Return the first non-empty OpenSSH setting value."""
-
-    items = values.get(key, [])
-    return items[0] if items else None
+    try:
+        resolved = resolve_ssh_target(target)
+    except ConfigError as exc:
+        raise DeployError(str(exc)) from exc
+    return {
+        "host": resolved.host,
+        "username": resolved.username,
+        "port": resolved.port,
+        "key_files": list(resolved.key_files),
+    }
 
 
 def _password(target: TargetConfig) -> str | None:

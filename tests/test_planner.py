@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -168,3 +169,54 @@ remote_root = "/srv/app"
 
     with pytest.raises(PlanError, match="remote path conflict"):
         create_plan(config, config.target(None), GitRepository(git_project), None, full=False)
+
+
+def test_ssh_alias_is_resolved_and_frozen_into_plan(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reviewed plans bind the effective SSH endpoint, not a movable alias string."""
+
+    config = load_config(
+        write_config(
+            git_project,
+            """
+[targets.dev]
+protocol = "sftp"
+ssh_host_alias = "project-dev"
+remote_root = "/srv/app"
+""",
+        )
+    )
+    endpoint = {"host": "192.0.2.10"}
+    calls = 0
+    real_run = subprocess.run
+
+    def resolve(*args, **kwargs) -> subprocess.CompletedProcess[str]:  # noqa: ANN002, ANN003
+        """Return a movable alias while recording resolution count."""
+
+        if args and args[0] and args[0][0] != "ssh":
+            return real_run(*args, **kwargs)
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=f"hostname {endpoint['host']}\nuser deploy\nport 2222\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("git_deploy.config.subprocess.run", resolve)
+    repository = GitRepository(git_project)
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    endpoint["host"] = "192.0.2.99"
+
+    assert plan.target.ssh_resolved
+    assert plan.target.host == "192.0.2.10"
+    assert plan.target_fingerprint == "sftp:deploy@192.0.2.10:2222:/srv/app"
+    assert plan.target.fingerprint == plan.target_fingerprint
+    assert calls == 1
+
+    state = TargetState(1, "dev", plan.target_fingerprint, repository.head(), 1, {})
+    with pytest.raises(PlanError, match="identity changed"):
+        create_plan(config, config.target(None), repository, state, full=False)

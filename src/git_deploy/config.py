@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
@@ -73,20 +74,39 @@ class TargetConfig:
     password_env: str | None = None
     ssh_host_alias: str | None = None
     ssh_config_file: Path = Path("~/.ssh/config")
+    ssh_config_explicit: bool = False
     known_hosts_file: Path | None = None
     key_file: Path | None = None
     use_ssh_agent: bool = True
     strict_host_key_checking: bool = True
     passive: bool = True
     timeout: float = 15.0
+    ssh_resolved: bool = False
+    resolved_key_files: tuple[str, ...] = ()
 
     @property
     def fingerprint(self) -> str:
         """Return a stable non-secret identity for state-target binding."""
 
-        host = self.ssh_host_alias or self.host or ""
-        user = self.username or ""
-        return f"{self.protocol}:{user}@{host}:{self.port}:{self.remote_root}"
+        if self.protocol == "sftp" and not self.ssh_resolved:
+            resolved = resolve_ssh_target(self)
+            return (
+                f"sftp:{resolved.username}@{resolved.host}:{resolved.port}:"
+                f"{self.remote_root}"
+            )
+        if self.protocol == "sftp":
+            return f"sftp:{self.username or ''}@{self.host or ''}:{self.port}:{self.remote_root}"
+        return f"ftp:{self.username or ''}@{self.host or ''}:{self.port}:{self.remote_root}"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSSHConfig:
+    """Contain effective non-secret OpenSSH connection settings."""
+
+    host: str
+    username: str
+    port: int
+    key_files: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +171,114 @@ def discover_config(explicit: Path | None = None) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".config/git-deploy/deploy.toml").resolve()
+
+
+def resolve_ssh_target(target: TargetConfig) -> ResolvedSSHConfig:
+    """Resolve effective SFTP host, user, port, and identity files with ``ssh -G``.
+
+    Args:
+        target: Validated SFTP target whose explicit values override OpenSSH output.
+
+    Returns:
+        Effective non-secret settings used by both target binding and Paramiko.
+    """
+
+    if target.ssh_resolved:
+        if not target.host or not target.username:
+            raise ConfigError(f"resolved SFTP target {target.name} lacks host or username")
+        return ResolvedSSHConfig(
+            target.host,
+            target.username,
+            target.port,
+            target.resolved_key_files,
+        )
+    query = target.ssh_host_alias or target.host
+    if not query:
+        raise ConfigError(f"SFTP target {target.name} has no host or ssh_host_alias")
+    command = ["ssh", "-G"]
+    if target.ssh_config_explicit or target.ssh_config_file.is_file():
+        command.extend(["-F", str(target.ssh_config_file)])
+    command.append(query)
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ConfigError(f"cannot execute ssh -G for {query}: {exc}") from exc
+    if result.returncode != 0:
+        raise ConfigError(f"cannot resolve SSH target {query}: {result.stderr.strip()}")
+    resolved: dict[str, list[str]] = {}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        key, separator, value = line.partition(" ")
+        if separator:
+            resolved.setdefault(key.lower(), []).append(value.strip())
+    proxy_jump = _first_ssh_value(resolved, "proxyjump")
+    proxy_command = _first_ssh_value(resolved, "proxycommand")
+    if (proxy_jump and proxy_jump.lower() != "none") or (
+        proxy_command and proxy_command.lower() != "none"
+    ):
+        raise ConfigError("ProxyJump/ProxyCommand is not supported by the v1-lite SFTP transport")
+    host = target.host or _first_ssh_value(resolved, "hostname") or query
+    username = target.username or _first_ssh_value(resolved, "user")
+    if not username:
+        raise ConfigError(f"SFTP target {target.name} did not resolve a username")
+    port = target.port
+    resolved_port = _first_ssh_value(resolved, "port")
+    if not target.port_explicit and resolved_port:
+        try:
+            port = int(resolved_port)
+        except ValueError as exc:
+            raise ConfigError(f"SSH target {query} resolved an invalid port: {resolved_port}") from exc
+    if target.key_file is not None:
+        key_files = (str(target.key_file),)
+    else:
+        candidates = (
+            os.path.expanduser(item)
+            for item in resolved.get("identityfile", [])
+            if item.lower() != "none"
+        )
+        # OpenSSH prints default IdentityFile paths even when absent. Passing those
+        # paths to Paramiko can prevent a configured SSH Agent from being tried.
+        key_files = tuple(item for item in candidates if Path(item).is_file())
+    return ResolvedSSHConfig(host, username, port, key_files)
+
+
+def resolve_target_for_plan(target: TargetConfig) -> TargetConfig:
+    """Freeze effective non-secret connection identity into a deployment target.
+
+    Args:
+        target: Selected validated target from the loaded configuration.
+
+    Returns:
+        A target whose SFTP alias/config values can no longer drift after review.
+    """
+
+    if target.protocol != "sftp" or target.ssh_resolved:
+        return target
+    resolved = resolve_ssh_target(target)
+    return replace(
+        target,
+        host=resolved.host,
+        username=resolved.username,
+        port=resolved.port,
+        port_explicit=True,
+        ssh_host_alias=None,
+        ssh_resolved=True,
+        resolved_key_files=resolved.key_files,
+    )
+
+
+def _first_ssh_value(values: dict[str, list[str]], key: str) -> str | None:
+    """Return the first effective OpenSSH value for one lowercase keyword."""
+
+    items = values.get(key, [])
+    return items[0] if items else None
 
 
 def load_config(path: Path) -> Config:
@@ -413,6 +541,7 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
             password_env=password_env,
             ssh_host_alias=alias,
             ssh_config_file=ssh_config,
+            ssh_config_explicit="ssh_config_file" in item,
             known_hosts_file=known_hosts_file,
             key_file=key_file,
             use_ssh_agent=use_agent,

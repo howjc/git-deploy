@@ -12,11 +12,11 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ## 安装
 
-需要 Python 3.11+ 和 Git。Alpha 版本通过 GitHub Release 分发 wheel：
+需要 Python 3.11+ 和 Git。Beta 版本通过 GitHub Release 分发 wheel：
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.0.0-alpha.1/git_deploy-1.0.0a1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.0.0-beta.1/git_deploy-1.0.0b1-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -191,7 +191,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.0.0a1-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.0.0b1-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

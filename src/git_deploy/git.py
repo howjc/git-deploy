@@ -139,10 +139,11 @@ class GitRepository:
             changes.append(GitChange(status, os.fsdecode(path_raw)))
         return tuple(sorted(changes, key=lambda item: (item.path, item.status)))
 
-    def export_head_file(self, path: str, destination: Path) -> None:
-        """Write the exact committed HEAD blob to a local staging path.
+    def export_file(self, commit: str, path: str, destination: Path) -> None:
+        """Write one exact committed blob to a local staging path.
 
         Args:
+            commit: Frozen commit object ID captured by the deployment plan.
             path: Relative Git path selected by the source planner.
             destination: Safe temporary file path to create.
 
@@ -151,7 +152,7 @@ class GitRepository:
         """
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        data = self._run("cat-file", "blob", f"HEAD:{path}")
+        data = self._run("cat-file", "blob", f"{commit}:{path}")
         try:
             destination.write_bytes(data)
         except OSError as exc:

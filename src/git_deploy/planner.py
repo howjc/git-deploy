@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from git_deploy.config import Config, OutputConfig, TargetConfig, is_protected, is_source_managed
+from git_deploy.config import (
+    Config,
+    OutputConfig,
+    TargetConfig,
+    is_protected,
+    is_source_managed,
+    resolve_target_for_plan,
+)
 from git_deploy.errors import PlanError
 from git_deploy.git import GitEntry, GitRepository
 from git_deploy.manifest import ManifestEntry, ScannedOutput, TargetState, scan_outputs
@@ -41,6 +48,7 @@ class DeploymentPlan:
     """Contain deterministic operations and the next complete local state inputs."""
 
     target: TargetConfig
+    target_fingerprint: str
     head: str
     previous_commit: str | None
     operations: tuple[Operation, ...]
@@ -83,8 +91,10 @@ def create_plan(
 
     repository.validate()
     head = repository.head()
+    resolved_target = resolve_target_for_plan(target)
+    target_fingerprint = resolved_target.fingerprint
     effective_full = full or state is None
-    if state is not None and state.target_fingerprint != target.fingerprint and not full:
+    if state is not None and state.target_fingerprint != target_fingerprint and not full:
         raise PlanError("target identity changed since the last success; review it and rerun with --full")
     current_outputs = scan_outputs(config.outputs)
     source_operations = _plan_source(repository, config, state, head, effective_full)
@@ -92,7 +102,8 @@ def create_plan(
     operations = _merge_operations((*source_operations, *output_operations), config)
     manifest = {path: item.entry for path, item in current_outputs.items()}
     return DeploymentPlan(
-        target=target,
+        target=resolved_target,
+        target_fingerprint=target_fingerprint,
         head=head,
         previous_commit=state.last_commit if state else None,
         operations=operations,

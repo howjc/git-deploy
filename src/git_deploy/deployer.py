@@ -45,7 +45,7 @@ def execute_plan(
 
     if not plan.operations:
         state_store.save(
-            new_state(plan.target.name, plan.target.fingerprint, plan.head, plan.output_manifest)
+            new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
         )
         print("No file changes; deployment state advanced to HEAD.")
         return
@@ -71,7 +71,9 @@ def execute_plan(
             raise DeployError(f"deployment failed: {exc}") from exc
         finally:
             transport.close()
-    state_store.save(new_state(plan.target.name, plan.target.fingerprint, plan.head, plan.output_manifest))
+    state_store.save(
+        new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
+    )
 
 
 def _freeze_uploads(
@@ -90,7 +92,7 @@ def _freeze_uploads(
         if operation.origin == "source":
             if not operation.git_path:
                 raise PlanError(f"source upload lacks a Git path: {operation.remote_path}")
-            repository.export_head_file(operation.git_path, destination)
+            repository.export_file(plan.head, operation.git_path, destination)
         else:
             if operation.local_path is None:
                 raise PlanError(f"output upload lacks a local path: {operation.remote_path}")
@@ -121,6 +123,10 @@ def _execute_with_retry(
 
     for attempt in range(1, attempts + 1):
         try:
+            if attempt > 1:
+                transport.close()
+                transport.connect()
+                transport.ensure_root()
             if isinstance(operation, UploadOperation):
                 local = frozen[operation.remote_path]
                 transport.upload(

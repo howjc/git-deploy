@@ -105,6 +105,7 @@ def test_real_sftp_upload_replace_and_idempotent_delete(
         username="deploy",
         remote_root=PurePosixPath("/srv/application"),
         port=port,
+        port_explicit=True,
         password_env="TEST_SFTP_PASSWORD",
         known_hosts_file=known_hosts,
         use_ssh_agent=False,

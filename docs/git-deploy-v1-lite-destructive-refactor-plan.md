@@ -1662,7 +1662,7 @@ State 不更新
 - [x] Node 项目试用
 - [x] PHP 项目试用
 - [x] FTP 项目试用
-- [ ] 修复 Alpha 问题
+- [x] 修复 Alpha 问题
 - [ ] `v1.0.0-beta.1`
 - [ ] 连续日常使用验证
 - [ ] `v1.0.0`
@@ -1904,3 +1904,4 @@ Git-aware Build & Deployment Sync Tool
 - 2026-07-16：Phase L 的 Beta、连续日常使用与 v1.0.0 保留为发布后阶段；本轮发布目标为 `v1.0.0-alpha.1`。
 - 2026-07-16：重构分支已推送并建立 Draft PR #5（`rewrite/v1-lite` → `main`）。
 - 2026-07-16：已发布 GitHub prerelease `v1.0.0-alpha.1`；下载复核 wheel SHA256 为 `c20b85a0aef2430954e3a471e64770eb2891c39a6fcf4b00e7416b92643cffbb`，sdist SHA256 为 `d813d5f6935a125c81c5da889b68007f5ee9dece848ca37a793e17b64504311f`。
+- 2026-07-16：Alpha 审查修复 exact-commit 源码冻结、OpenSSH 实际端点冻结与断线重连，并新增重复日常部署 soak；Alpha SFTP State 升级 Beta 时需核对目标后执行一次 `--full`。

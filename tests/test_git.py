@@ -40,7 +40,7 @@ def test_export_uses_committed_head_not_dirty_worktree(git_project: Path, tmp_pa
     (git_project / "app.py").write_text("print('dirty')\n", encoding="utf-8")
     destination = tmp_path / "staged.py"
 
-    repository.export_head_file("app.py", destination)
+    repository.export_file(repository.head(), "app.py", destination)
 
     assert destination.read_text(encoding="utf-8") == "print('v1')\n"
     assert repository.is_dirty()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import errno
 import ftplib
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 
 import pytest
 import subprocess
@@ -190,7 +190,8 @@ def test_ssh_alias_uses_openssh_resolution(monkeypatch: pytest.MonkeyPatch) -> N
     assert settings["host"] == "192.0.2.10"
     assert settings["username"] == "deploy"
     assert settings["port"] == 2222
-    assert settings["key_files"] == [str(Path("~/.ssh/id_ed25519").expanduser())]
+    assert settings["key_files"] == []
+    assert target.fingerprint == "sftp:deploy@192.0.2.10:2222:/root"
 
 
 def test_sftp_connect_enables_only_explicit_agent_discovery(monkeypatch: pytest.MonkeyPatch) -> None:

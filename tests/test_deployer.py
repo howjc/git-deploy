@@ -13,7 +13,7 @@ from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore, TargetState
 from git_deploy.planner import create_plan
 from git_deploy.transports.base import ProgressCallback, Transport
-from tests.conftest import write_config
+from tests.conftest import commit_all, write_config
 
 
 class FakeTransport(Transport):
@@ -105,6 +105,29 @@ def test_per_file_retry_does_not_rebuild_plan(git_project: Path) -> None:
 
     assert transport.files["app.py"] == b"print('v1')\n"
     assert store.load("dev") is not None
+    assert transport.connects == 2
+
+
+def test_source_freeze_stays_bound_to_planned_commit_after_head_moves(
+    git_project: Path,
+) -> None:
+    """A later commit cannot change bytes or State identity of an approved plan."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    planned_head = plan.head
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    commit_all(git_project, "move HEAD after planning")
+    transport = FakeTransport()
+
+    execute_plan(plan, config, repository, store, transport_factory=lambda target: transport)
+
+    assert transport.files["app.py"] == b"print('v1')\n"
+    state = store.load("dev")
+    assert state is not None
+    assert state.last_commit == planned_head
 
 
 def test_terminal_failure_keeps_old_state(git_project: Path) -> None:
@@ -122,7 +145,7 @@ def test_terminal_failure_keeps_old_state(git_project: Path) -> None:
         execute_plan(plan, config, repository, store, transport_factory=lambda target: transport)
 
     assert store.load("dev") == old
-    assert transport.closed == 1
+    assert transport.closed == 2
 
 
 def test_empty_plan_advances_commit_without_connecting(git_project: Path) -> None:
