@@ -40,7 +40,19 @@ class FakeTransport(Transport):
     def ensure_root(self) -> None:
         """Accept the synthetic remote root."""
 
-    def upload(self, local_path: Path, remote_path: str, callback: ProgressCallback) -> None:
+    def root_exists(self) -> bool:
+        """Report that the synthetic remote root is ready."""
+
+        return True
+
+    def upload(
+        self,
+        local_path: Path,
+        remote_path: str,
+        callback: ProgressCallback,
+        *,
+        executable: bool = False,
+    ) -> None:
         """Read frozen bytes, failing first when configured."""
 
         if self.failures:
@@ -71,12 +83,19 @@ class FailOnPathTransport(FakeTransport):
         super().__init__()
         self.failed_path = failed_path
 
-    def upload(self, local_path: Path, remote_path: str, callback: ProgressCallback) -> None:
+    def upload(
+        self,
+        local_path: Path,
+        remote_path: str,
+        callback: ProgressCallback,
+        *,
+        executable: bool = False,
+    ) -> None:
         """Fail the selected path while retaining previously uploaded files."""
 
         if remote_path == self.failed_path:
             raise OSError("network interrupted")
-        super().upload(local_path, remote_path, callback)
+        super().upload(local_path, remote_path, callback, executable=executable)
 
 
 def test_success_uploads_exact_head_and_commits_state(git_project: Path) -> None:

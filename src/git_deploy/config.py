@@ -83,6 +83,7 @@ class TargetConfig:
     timeout: float = 15.0
     ssh_resolved: bool = False
     resolved_key_files: tuple[str, ...] = ()
+    runtime_dir: Path | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -220,8 +221,9 @@ def resolve_ssh_target(target: TargetConfig) -> ResolvedSSHConfig:
             resolved.setdefault(key.lower(), []).append(value.strip())
     proxy_jump = _first_ssh_value(resolved, "proxyjump")
     proxy_command = _first_ssh_value(resolved, "proxycommand")
-    if (proxy_jump and proxy_jump.lower() != "none") or (
-        proxy_command and proxy_command.lower() != "none"
+    if not target.ssh_host_alias and (
+        (proxy_jump and proxy_jump.lower() != "none")
+        or (proxy_command and proxy_command.lower() != "none")
     ):
         raise ConfigError("ProxyJump/ProxyCommand is not supported by the v1-lite SFTP transport")
     host = target.host or _first_ssh_value(resolved, "hostname") or query
@@ -249,18 +251,23 @@ def resolve_ssh_target(target: TargetConfig) -> ResolvedSSHConfig:
     return ResolvedSSHConfig(host, username, port, key_files)
 
 
-def resolve_target_for_plan(target: TargetConfig) -> TargetConfig:
+def resolve_target_for_plan(
+    target: TargetConfig,
+    *,
+    runtime_dir: Path | None = None,
+) -> TargetConfig:
     """Freeze effective non-secret connection identity into a deployment target.
 
     Args:
         target: Selected validated target from the loaded configuration.
+        runtime_dir: Shared Git state root for locks and private SSH sockets.
 
     Returns:
         A target whose SFTP alias/config values can no longer drift after review.
     """
 
     if target.protocol != "sftp" or target.ssh_resolved:
-        return target
+        return replace(target, runtime_dir=runtime_dir or target.runtime_dir)
     resolved = resolve_ssh_target(target)
     return replace(
         target,
@@ -268,9 +275,11 @@ def resolve_target_for_plan(target: TargetConfig) -> TargetConfig:
         username=resolved.username,
         port=resolved.port,
         port_explicit=True,
-        ssh_host_alias=None,
+        # Preserve the alias for the Native OpenSSH backend. The resolved host,
+        # user and port still freeze identity and prevent post-review drift.
         ssh_resolved=True,
         resolved_key_files=resolved.key_files,
+        runtime_dir=runtime_dir,
     )
 
 
@@ -535,6 +544,26 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
         ):
             if not isinstance(setting, bool):
                 raise ConfigError(f"targets.{name}.{field_name} must be a boolean")
+        if protocol == "sftp" and alias:
+            conflicting = sorted(
+                key
+                for key in (
+                    "host",
+                    "username",
+                    "port",
+                    "password_env",
+                    "known_hosts_file",
+                    "key_file",
+                    "use_ssh_agent",
+                    "strict_host_key_checking",
+                )
+                if key in item
+            )
+            if conflicting:
+                raise ConfigError(
+                    f"targets.{name} ssh_host_alias uses Native OpenSSH and conflicts with: "
+                    + ", ".join(conflicting)
+                )
         if protocol == "ftp" and any(
             key in item
             for key in (

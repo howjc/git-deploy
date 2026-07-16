@@ -45,6 +45,11 @@ class FakeSFTP:
 
         self.calls.append(("remove", path, None))
 
+    def chmod(self, path: str, mode: int) -> None:
+        """Record the mode applied before publication."""
+
+        self.calls.append(("chmod", path, str(mode)))
+
 
 class FakeFTP:
     """Provide configurable FTP delete replies."""

@@ -44,13 +44,13 @@ class TargetState:
 
 
 class StateStore:
-    """Read and atomically commit target state below the worktree Git dir."""
+    """Read and atomically commit target state below the shared Git common dir."""
 
     def __init__(self, git_dir: Path) -> None:
         """Bind state storage to a Git metadata directory.
 
         Args:
-            git_dir: Result of ``git rev-parse --git-dir``.
+            git_dir: Result of ``git rev-parse --git-common-dir``.
         """
 
         self.base = git_dir / "git-deploy"
@@ -133,6 +133,26 @@ class StateStore:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             raise StateError(f"cannot atomically write state {path}: {exc}") from exc
+
+    def migrate_from(self, legacy: StateStore, target: str) -> bool:
+        """Copy a valid per-worktree state into common storage when still absent.
+
+        Args:
+            legacy: Store rooted at the old ``git rev-parse --git-dir`` path.
+            target: Selected target name.
+
+        Returns:
+            ``True`` only when a legacy state was copied. The old file is retained
+            so downgrade or interrupted migration cannot lose deployment evidence.
+        """
+
+        if legacy.base == self.base or self.path_for(target).exists():
+            return False
+        state = legacy.load(target)
+        if state is None:
+            return False
+        self.save(state)
+        return True
 
 
 def scan_outputs(outputs: tuple[OutputConfig, ...]) -> dict[str, ScannedOutput]:

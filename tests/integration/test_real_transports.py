@@ -14,8 +14,7 @@ from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 
-from git_deploy.config import TargetConfig
-from git_deploy.config import load_config
+from git_deploy.config import TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.deployer import execute_plan
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
@@ -118,17 +117,28 @@ def test_real_sftp_upload_replace_and_idempotent_delete(
     )
     first = tmp_path / "first"
     second = tmp_path / "second"
+    script = tmp_path / "script.sh"
     first.write_bytes(b"one")
     second.write_bytes(b"two")
+    script.write_bytes(b"#!/bin/sh\n")
     transport = SFTPTransport(target)
     try:
         transport.connect()
         transport.ensure_root()
         transport.upload(first, "nested/app.txt", lambda done, total: None)
         transport.upload(second, "nested/app.txt", lambda done, total: None)
+        transport.upload(
+            script,
+            "nested/script.sh",
+            lambda done, total: None,
+            executable=True,
+        )
         assert _docker(
             "exec", container, "cat", "/srv/application/nested/app.txt"
         ) == "two"
+        assert _docker(
+            "exec", container, "stat", "-c", "%a", "/srv/application/nested/script.sh"
+        ) == "755"
         transport.delete("nested/app.txt")
         transport.delete("nested/app.txt")
     finally:
@@ -181,13 +191,16 @@ def _deploy_project(root: Path) -> int:
 
     config = load_config(root / "deploy.toml")
     repository = GitRepository(root)
-    store = StateStore(repository.git_dir())
+    store = StateStore(repository.common_dir())
+    target = config.target(None)
+    resolved_target = resolve_target_for_plan(target, runtime_dir=store.base)
     plan = create_plan(
         config,
-        config.target(None),
+        target,
         repository,
         store.load("dev"),
         full=False,
+        resolved_target=resolved_target,
     )
     execute_plan(plan, config, repository, store)
     return len(plan.operations)
@@ -261,3 +274,86 @@ retry_delay = 0
     commit_all(git_project, "FTP daily change")
     assert _deploy_project(git_project) == 1
     assert (root / "e2e/app.py").read_text(encoding="utf-8") == "print('v2')\n"
+
+
+def _install_native_test_key(container: str, root: Path) -> Path:
+    """Generate a throwaway key and authorize it in the isolated OpenSSH fixture."""
+
+    key = root / "id_ed25519"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        check=True,
+    )
+    _docker("cp", str(key) + ".pub", f"{container}:/tmp/git-deploy-test-key.pub")
+    _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "mkdir -p /home/deploy/.ssh && "
+        "cat /tmp/git-deploy-test-key.pub >> /home/deploy/.ssh/authorized_keys && "
+        "chown -R deploy:deploy /home/deploy/.ssh && "
+        "chmod 700 /home/deploy/.ssh && chmod 600 /home/deploy/.ssh/authorized_keys",
+    )
+    return key
+
+
+def test_complete_native_openssh_alias_and_proxyjump_cycle(
+    git_project: Path,
+    sftp_server,
+    tmp_path: Path,
+) -> None:
+    """Native OpenSSH honors alias, key, non-default port, ControlMaster, and ProxyJump."""
+
+    container, port, known_hosts = sftp_server
+    key = _install_native_test_key(container, tmp_path)
+    host_key = _docker(
+        "exec", container, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"
+    ).split()
+    with known_hosts.open("a", encoding="utf-8") as handle:
+        handle.write(f"127.0.0.1 {host_key[0]} {host_key[1]}\n")
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        f"""
+Host fixture-gateway
+    HostName 127.0.0.1
+    Port {port}
+    User deploy
+    IdentityFile {key}
+    IdentitiesOnly yes
+    UserKnownHostsFile {known_hosts}
+    StrictHostKeyChecking yes
+
+Host fixture-proxy-target
+    HostName 127.0.0.1
+    Port 22
+    User deploy
+    IdentityFile {key}
+    IdentitiesOnly yes
+    UserKnownHostsFile {known_hosts}
+    StrictHostKeyChecking yes
+    ProxyJump fixture-gateway
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    write_config(
+        git_project,
+        f"""
+[targets.dev]
+protocol = "sftp"
+ssh_host_alias = "fixture-proxy-target"
+ssh_config_file = "{ssh_config}"
+remote_root = "/srv/application/native-e2e"
+
+[deploy]
+retries = 2
+retry_delay = 0
+""",
+    )
+
+    assert _deploy_project(git_project) == 1
+    assert _docker(
+        "exec", container, "cat", "/srv/application/native-e2e/app.py"
+    ) == "print('v1')"
+    assert _deploy_project(git_project) == 0

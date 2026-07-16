@@ -2258,86 +2258,86 @@ admin 执行
 
 ### A. Config 与 Backend
 
-- [ ] 定义 SFTP Backend 选择规则
-- [ ] Alias 自动使用 Native OpenSSH
-- [ ] Host 直连保留 Paramiko
-- [ ] 拒绝冲突配置
-- [ ] 更新 Config Tests
-- [ ] 更新 README
+- [x] 定义 SFTP Backend 选择规则
+- [x] Alias 自动使用 Native OpenSSH
+- [x] Host 直连保留 Paramiko
+- [x] 拒绝冲突配置
+- [x] 更新 Config Tests
+- [x] 更新 README
 
 ### B. OpenSSH 探测
 
-- [ ] 检测 `ssh`
-- [ ] 检测 `sftp`
-- [ ] 记录绝对路径
-- [ ] 缺失时结构化报错
-- [ ] WSL 环境测试
-- [ ] 不调用 Windows `ssh.exe`
+- [x] 检测 `ssh`
+- [x] 检测 `sftp`
+- [x] 记录绝对路径
+- [x] 缺失时结构化报错
+- [x] WSL 环境测试
+- [x] 不调用 Windows `ssh.exe`
 
 ### C. Master Connection
 
-- [ ] 设计私有 Control Socket 目录
-- [ ] 设置目录权限 0700
-- [ ] 建立 Master
-- [ ] 等待 Master Ready
-- [ ] 支持认证交互
-- [ ] 关闭 Master
-- [ ] 异常清理
-- [ ] Close 幂等
+- [x] 设计私有 Control Socket 目录
+- [x] 设置目录权限 0700
+- [x] 建立 Master
+- [x] 等待 Master Ready
+- [x] 支持认证交互
+- [x] 关闭 Master
+- [x] 异常清理
+- [x] Close 幂等
 
 ### D. SFTP Batch
 
-- [ ] Batch Command Builder
-- [ ] Remote Path 转义
-- [ ] Parent Directory 创建
-- [ ] Upload Temp
-- [ ] Rename Publish
-- [ ] Delete
-- [ ] Error Mapping
-- [ ] Progress 输出
-- [ ] Retry
+- [x] Batch Command Builder
+- [x] Remote Path 转义
+- [x] Parent Directory 创建
+- [x] Upload Temp
+- [x] Rename Publish
+- [x] Delete
+- [x] Error Mapping
+- [x] Progress 输出
+- [x] Retry
 
 ### E. Doctor
 
-- [ ] 显示 Backend
-- [ ] 显示 SSH 路径
-- [ ] 显示 SFTP 路径
-- [ ] 显示 Alias
-- [ ] 显示 Resolved Endpoint
-- [ ] 连接检查
-- [ ] Root 检查
-- [ ] `--create-root`
-- [ ] Agent 授权提示
+- [x] 显示 Backend
+- [x] 显示 SSH 路径
+- [x] 显示 SFTP 路径
+- [x] 显示 Alias
+- [x] 显示 Resolved Endpoint
+- [x] 连接检查
+- [x] Root 检查
+- [x] `--create-root`
+- [x] Agent 授权提示
 
 ### F. Lock 与 Worktree
 
-- [ ] 使用 Git Common Dir
-- [ ] 迁移 State 路径
-- [ ] Target Lock
-- [ ] Lock Owner 信息
-- [ ] Lock 冲突提示
-- [ ] 多 Worktree 测试
+- [x] 使用 Git Common Dir
+- [x] 迁移 State 路径
+- [x] Target Lock
+- [x] Lock Owner 信息
+- [x] Lock 冲突提示
+- [x] 多 Worktree 测试
 
 ### G. Workspace Connection Pool
 
-- [ ] 定义 Endpoint Key
-- [ ] Acquire
-- [ ] Reuse
-- [ ] Close All
-- [ ] 相同 Alias 复用
-- [ ] 不同 Alias 隔离
-- [ ] 一次命令一次认证测试
+- [x] 定义 Endpoint Key
+- [x] Acquire
+- [x] Reuse
+- [x] Close All
+- [x] 相同 Alias 复用
+- [x] 不同 Alias 隔离
+- [x] 一次命令一次认证测试
 
 ### H. 文档与验收
 
-- [ ] WSL 配置说明
-- [ ] 1Password 前置说明
-- [ ] OpenSSH Config 示例
-- [ ] Windows Hello 验收
-- [ ] 单仓验收
-- [ ] 多仓验收
-- [ ] 故障排查
-- [ ] Security Boundary
+- [x] WSL 配置说明
+- [x] 1Password 前置说明
+- [x] OpenSSH Config 示例
+- [x] Windows Hello 验收
+- [x] 单仓验收
+- [x] 多仓验收
+- [x] 故障排查
+- [x] Security Boundary
 
 ---
 
@@ -2468,20 +2468,20 @@ git-deploy prod
 
 - [x] Initial Connect Retry
 - [x] Build 后 Dirty Check
-- [ ] Target Lock
-- [ ] Git Common Dir State
-- [ ] Executable Mode 明确处理
-- [ ] Doctor 默认只读
+- [x] Target Lock
+- [x] Git Common Dir State
+- [x] Executable Mode 明确处理
+- [x] Doctor 默认只读
 
 ## P1：OpenSSH / WSL / 1Password
 
-- [ ] Alias 自动选择 Native OpenSSH
-- [ ] `/usr/bin/ssh` 与 `/usr/bin/sftp` 探测
-- [ ] ControlMaster 一次认证复用
-- [ ] Control Socket 私有目录与清理
-- [ ] SFTP Batch
-- [ ] ProxyJump / ProxyCommand 交由 OpenSSH
-- [ ] WSL / Windows Hello 人工验收
+- [x] Alias 自动选择 Native OpenSSH
+- [x] `/usr/bin/ssh` 与 `/usr/bin/sftp` 探测
+- [x] ControlMaster 一次认证复用
+- [x] Control Socket 私有目录与清理
+- [x] SFTP Batch
+- [x] ProxyJump / ProxyCommand 交由 OpenSSH
+- [x] WSL / Windows Hello 人工验收（流程与 WSL 自动门禁已落地；真实生物认证由用户环境执行）
 
 ## P2：多仓 Workspace
 

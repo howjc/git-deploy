@@ -50,14 +50,41 @@ class FTPTransport(Transport):
 
         self._mkdirs(self.target.remote_root.as_posix())
 
-    def upload(self, local_path: Path, remote_path: str, callback: ProgressCallback) -> None:
+    def root_exists(self) -> bool:
+        """Check the configured FTP root without creating it."""
+
+        ftp = self._require_ftp()
+        try:
+            original = ftp.pwd()
+            ftp.cwd(self.target.remote_root.as_posix())
+            ftp.cwd(original)
+            return True
+        except ftplib.error_perm as exc:
+            if str(exc).startswith("550"):
+                return False
+            raise DeployError(f"cannot inspect FTP root {self.target.remote_root}: {exc}") from exc
+        except ftplib.Error as exc:
+            raise DeployError(f"cannot inspect FTP root {self.target.remote_root}: {exc}") from exc
+
+    def upload(
+        self,
+        local_path: Path,
+        remote_path: str,
+        callback: ProgressCallback,
+        *,
+        executable: bool = False,
+    ) -> None:
         """Stream one file in binary mode after creating its parent directories.
 
         Args:
             local_path: Frozen local file to stream.
             remote_path: Normalized relative target path.
             callback: Byte progress callback.
+            executable: Unsupported POSIX executable-mode request.
         """
+
+        if executable:
+            raise DeployError(f"FTP cannot guarantee executable mode for {remote_path}")
 
         ftp = self._require_ftp()
         target = self._absolute(remote_path)

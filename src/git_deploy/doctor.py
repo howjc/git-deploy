@@ -5,11 +5,12 @@ from __future__ import annotations
 import shlex
 import shutil
 from dataclasses import dataclass
-from git_deploy.config import Config, TargetConfig
+from git_deploy.config import Config, TargetConfig, resolve_target_for_plan
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from git_deploy.transports import create_transport
 from git_deploy.transports.base import Transport
+from git_deploy.transports.openssh_sftp import OpenSSHSFTPTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ def run_doctor(
     repository: GitRepository,
     state_store: StateStore,
     *,
+    create_root: bool = False,
     transport_factory=create_transport,  # noqa: ANN001
 ) -> tuple[DoctorResult, ...]:
     """Run local checks then connect once to validate the selected remote root.
@@ -43,6 +45,11 @@ def run_doctor(
     """
 
     results: list[DoctorResult] = [DoctorResult("config", True, str(config.path))]
+    resolved_target = target
+    try:
+        resolved_target = resolve_target_for_plan(target, runtime_dir=state_store.base)
+    except Exception as exc:
+        results.append(DoctorResult("target config", False, str(exc)))
     try:
         repository.validate()
         results.append(DoctorResult("git", True, repository.head()))
@@ -71,15 +78,57 @@ def run_doctor(
         )
     except Exception as exc:
         results.append(DoctorResult("state", False, str(exc)))
-    transport: Transport = transport_factory(target)
     try:
+        transport: Transport = transport_factory(resolved_target)
+        if isinstance(transport, OpenSSHSFTPTransport):
+            results.append(DoctorResult("SSH backend", True, "Native OpenSSH"))
+            results.append(
+                DoctorResult(
+                    "SSH alias",
+                    True,
+                    resolved_target.ssh_host_alias or "<missing>",
+                )
+            )
+            results.append(
+                DoctorResult(
+                    "authentication",
+                    True,
+                    "connection may request authorization from your configured SSH Agent",
+                )
+            )
+        else:
+            results.append(DoctorResult("SSH backend", True, target.protocol.upper()))
         transport.connect()
-        transport.ensure_root()
-        results.append(DoctorResult("target", True, f"connected; root ready: {target.remote_root}"))
+        if isinstance(transport, OpenSSHSFTPTransport) and transport.master is not None:
+            results.append(DoctorResult("SSH executable", True, transport.master.ssh))
+            results.append(DoctorResult("SFTP executable", True, transport.master.sftp))
+            results.append(
+                DoctorResult(
+                    "SSH endpoint",
+                    True,
+                    f"{resolved_target.username}@{resolved_target.host}:{resolved_target.port}",
+                )
+            )
+        exists = transport.root_exists()
+        if not exists and create_root:
+            transport.ensure_root()
+            exists = True
+        results.append(
+            DoctorResult(
+                "target",
+                exists,
+                (
+                    f"connected; root ready: {resolved_target.remote_root}"
+                    if exists
+                    else f"connected; root missing: {resolved_target.remote_root}"
+                ),
+            )
+        )
     except Exception as exc:
         results.append(DoctorResult("target", False, str(exc)))
     finally:
-        transport.close()
+        if "transport" in locals():
+            transport.close()
     return tuple(results)
 
 

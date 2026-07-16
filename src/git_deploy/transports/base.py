@@ -21,13 +21,25 @@ class Transport(ABC):
         """Ensure the configured remote root exists and is writable."""
 
     @abstractmethod
-    def upload(self, local_path: Path, remote_path: str, callback: ProgressCallback) -> None:
+    def root_exists(self) -> bool:
+        """Return whether the configured remote root currently exists."""
+
+    @abstractmethod
+    def upload(
+        self,
+        local_path: Path,
+        remote_path: str,
+        callback: ProgressCallback,
+        *,
+        executable: bool = False,
+    ) -> None:
         """Upload one local file to a safe relative remote path.
 
         Args:
             local_path: Frozen local file to stream.
             remote_path: Normalized relative path below the configured root.
             callback: Progress callback receiving transferred and total bytes.
+            executable: Whether SFTP should publish the file with mode ``0755``.
         """
 
     @abstractmethod

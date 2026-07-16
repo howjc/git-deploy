@@ -199,3 +199,15 @@ remote_root = "/srv/app"
 """,
     )
     assert cli.main(["--config", str(strict_config), "--dry-run"]) == 4
+
+
+def test_init_creates_scaffold_without_existing_config(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The init command runs before config loading and never connects remotely."""
+
+    monkeypatch.chdir(git_project)
+    assert cli.main(["init"]) == 0
+    assert (git_project / "deploy.toml").is_file()
+    assert cli.main(["init"]) == 2
