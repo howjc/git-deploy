@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.2.1/git_deploy-1.2.1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.2.2/git_deploy-1.2.2-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -154,10 +154,13 @@ path = "web"
 git-deploy prod --dry-run
 git-deploy prod --yes
 git-deploy doctor prod
-git-deploy build prod
+git-deploy build
+git-deploy build prod  # 可选：只校验每仓都存在 prod 这个名称
 ```
 
 部署前会先完成所有仓库的 Target 校验、Build、Plan 和上传字节冻结；任一 Prepare 失败时不会建立远端连接。全部成功后显示 Combined Plan，只确认一次，并按配置顺序部署。相同 Native OpenSSH Endpoint 会共用当前命令生命周期内的一条 ControlMaster。
+
+Workspace 的独立 `build` 命令是纯本地操作：只加载各仓配置并顺序执行 Build，不解析 SSH Alias、不要求 `ssh`/`sftp`、不检查 Git 或远端 Root 所有权。显式附带 Target 时只检查该名称是否在每仓配置中存在。
 
 所有仓库的物理 Endpoint 和 Remote Root 会在首个 Build 前解析；同一 Endpoint 上相同或父子嵌套的 Root 会直接拒绝，避免两个独立 State 相互覆盖。Combined Plan 会展示每仓冻结后的 Host/User/Port、Remote Root、模式、Commit 边界和冻结字节总量。
 
@@ -203,7 +206,7 @@ outputs 在构建后扫描并计算 SHA256。只有上次 state 已记录、当�
 - output 在连接前复制并复核 hash，避免计划与上传字节不一致。
 - SFTP 先上传临时文件再替换；兼容回退先备份旧目标，替换失败会恢复旧文件。
 - Git `100755` 文件通过 SFTP 发布为 `0755`；FTP 无法保证可执行位，因此会在连接前拒绝。
-- FTP 只承诺二进制上传、目录创建和幂等文件操作，不声称原子替换或 POSIX 权限语义。
+- FTP 只承诺二进制上传、目录创建和幂等文件操作，不声称原子替换或 POSIX 权限语义；同一连接会缓存完整父目录列表，批量删除不会为每个文件重复 `NLST`。
 - 本工具只同步文件；数据库、消息队列、缓存刷新、进程重启和服务器备份不在职责内。
 
 ## 故障恢复
@@ -223,6 +226,8 @@ git-deploy prod --yes
 
 state 丢失或目标需要覆盖时使用 `--full`。不要让多个发布器同时管理同一远端路径。
 
+Native OpenSSH 若在临时文件上传完成后、正式 rename 前发生连接中断，当前进程会尝试删除已知的 `.git-deploy-<uuid>.tmp`；连接已死亡时该清理可能失败。工具不会扫描或删除未知历史临时文件，以免越过文件所有权边界。跨独立仓库命令的本机物理目标锁取舍见 [ADR](docs/adr-physical-target-lock.md)。
+
 ## 开发、测试与发布
 
 ```bash
@@ -235,7 +240,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.2.1-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.2.2-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

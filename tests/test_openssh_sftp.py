@@ -17,6 +17,7 @@ from git_deploy.planner import UploadOperation
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
 from git_deploy.transports.openssh_sftp import (
+    OpenSSHMaster,
     OpenSSHSFTPTransport,
     PathProbeResult,
     SSHConnectionPool,
@@ -151,6 +152,39 @@ def test_master_once_batch_reuse_permissions_and_cleanup(
     assert any(payload and "file one.sh" in payload for payload in batches)
     assert progress == [(0, local.stat().st_size), (local.stat().st_size, local.stat().st_size)]
     assert not directory.exists()
+
+
+def test_ctrl_c_during_master_start_removes_private_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during interactive authentication leaves no random socket directory."""
+
+    monkeypatch.setattr(
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(
+        "git_deploy.config.subprocess.run",
+        lambda command, **kwargs: _success(list(command)),
+    )
+
+    def interrupt(command, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        """Interrupt only the ControlMaster startup call."""
+
+        if "-MNf" in command:
+            raise KeyboardInterrupt
+        return _success(list(command))
+
+    monkeypatch.setattr("git_deploy.transports.openssh_sftp.subprocess.run", interrupt)
+    target = native_target(tmp_path)
+    socket_root = _control_socket_root(target.runtime_dir, target.name)  # type: ignore[arg-type]
+    master = OpenSSHMaster(target)
+
+    with pytest.raises(KeyboardInterrupt):
+        master.connect()
+
+    assert socket_root.is_dir()
+    assert list(socket_root.iterdir()) == []
 
 
 def test_connection_pool_reuses_endpoint_across_remote_roots(

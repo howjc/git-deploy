@@ -138,7 +138,7 @@ def prepare_workspace(
 ) -> tuple[str, tuple[PreparedDeployment, ...]]:
     """Prepare every repository before any remote connection can occur."""
 
-    target, preflight = preflight_workspace(workspace, requested_target, require_git=True)
+    target, preflight = preflight_workspace(workspace, requested_target)
     prepared: list[PreparedDeployment] = []
     locks: list[TargetLock | None] = []
     try:
@@ -259,20 +259,27 @@ def execute_workspace(
 
 
 def run_workspace_build(workspace: WorkspaceConfig, requested_target: str | None) -> None:
-    """Validate all repository targets, then run every build sequentially.
+    """Load every repository locally, validate an explicit target, and build.
 
     Args:
         workspace: Validated workspace and repository order.
-        requested_target: Shared explicit/default target name.
+        requested_target: Optional explicit target name to validate locally.
 
     Returns:
         ``None`` after all builds succeed.
     """
 
-    _, preflight = preflight_workspace(workspace, requested_target, require_git=False)
-    for item in preflight:
-        print(f"Building {item.repository.name}...")
-        run_build(item.config.build, item.config.project_root)
+    loaded: list[tuple[WorkspaceRepository, Config]] = []
+    for item in workspace.repositories:
+        config = load_config(item.config_path)
+        # Build configuration is not target-specific. Preserve the optional
+        # positional target only as a typo check without resolving a remote.
+        if requested_target is not None:
+            config.target(requested_target)
+        loaded.append((item, config))
+    for item, config in loaded:
+        print(f"Building {item.name}...")
+        run_build(config.build, config.project_root)
 
 
 def run_workspace_doctor(
@@ -359,16 +366,12 @@ def run_workspace_doctor(
 def preflight_workspace(
     workspace: WorkspaceConfig,
     requested_target: str | None,
-    *,
-    require_git: bool,
 ) -> tuple[str, tuple[WorkspacePreflight, ...]]:
     """Resolve every physical target and ownership boundary before any build.
 
     Args:
         workspace: Parsed thin-workspace configuration.
         requested_target: Unified explicit/default target name.
-        require_git: Whether deployment preflight must validate Git/common-dir.
-
     Returns:
         Shared target name and repository contexts in deployment order.
     """
@@ -378,11 +381,9 @@ def preflight_workspace(
     for item in workspace.repositories:
         config = load_config(item.config_path)
         target = config.target(target_name)
-        runtime_dir = None
-        if require_git:
-            repository = GitRepository(config.project_root)
-            repository.validate()
-            runtime_dir = StateStore(repository.common_dir()).base
+        repository = GitRepository(config.project_root)
+        repository.validate()
+        runtime_dir = StateStore(repository.common_dir()).base
         resolved = resolve_target_for_plan(target, runtime_dir=runtime_dir)
         _validate_native_tools(resolved)
         contexts.append(WorkspacePreflight(item, config, resolved))

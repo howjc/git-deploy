@@ -122,6 +122,11 @@ class OpenSSHMaster:
             raise DeployError(
                 f"OpenSSH authentication failed for target {self.target.name}: {exc}"
             ) from exc
+        except BaseException:
+            # Ctrl-C and other cancellation paths bypass ordinary Exception
+            # handlers; remove the private directory before preserving them.
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
         if result.returncode != 0:
             shutil.rmtree(directory, ignore_errors=True)
             raise DeployError(

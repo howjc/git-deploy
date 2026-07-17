@@ -195,6 +195,49 @@ def test_all_targets_are_validated_before_first_workspace_build(tmp_path: Path) 
     assert not (first / "build-marker").exists()
 
 
+def test_workspace_build_is_local_without_target_ssh_tools_or_remote_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build-only ignores remote aliases, native tools, Git, and overlapping roots."""
+
+    first = _create_repository(
+        tmp_path,
+        "api",
+        remote_root="/srv/app",
+        alias="invalid-api",
+        build_steps=('printf built > build-marker',),
+    )
+    second = _create_repository(
+        tmp_path,
+        "web",
+        remote_root="/srv/app/public",
+        alias="invalid-web",
+        build_steps=('printf built > build-marker',),
+    )
+    workspace_path = _write_workspace(tmp_path, (("api", first), ("web", second)))
+    workspace_path.write_text(
+        workspace_path.read_text(encoding="utf-8").replace('default_target = "dev"\n', ""),
+        encoding="utf-8",
+    )
+    workspace = load_workspace(workspace_path)
+
+    def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Reject any accidental remote or Git deployment preflight."""
+
+        raise AssertionError("workspace build must remain local")
+
+    monkeypatch.setattr(workspace_module, "resolve_target_for_plan", forbidden)
+    monkeypatch.setattr(workspace_module, "_validate_native_tools", forbidden)
+    monkeypatch.setattr(workspace_module, "_validate_remote_ownership", forbidden)
+    monkeypatch.setattr(workspace_module.GitRepository, "validate", forbidden)
+
+    run_workspace_build(workspace, None)
+
+    assert (first / "build-marker").read_text(encoding="utf-8") == "built"
+    assert (second / "build-marker").read_text(encoding="utf-8") == "built"
+
+
 def test_prepare_failure_releases_earlier_locks_before_any_execution(tmp_path: Path) -> None:
     """A later missing output aborts Prepare All and releases prior target locks."""
 

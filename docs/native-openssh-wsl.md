@@ -87,7 +87,8 @@ Workspace 会在首个 Build 前解析全部物理 Endpoint，并拒绝同一 En
 - `requires a POSIX ssh executable`：PATH 命中了 Windows `ssh.exe`；调整 WSL PATH 使用 `/usr/bin/ssh`。
 - `cannot resolve SSH alias`：先运行 `ssh -G ALIAS` 检查 Config/Include。
 - `OpenSSH authentication failed`：直接运行 `ssh ALIAS` 查看 Host Key、Agent、Proxy 或网络错误。
-- ControlPath 太长时，工具自动回退到当前 UID 专属、权限为 `0700` 的短临时目录，并在命令结束时清理随机子目录。
+- ControlPath 太长时，工具自动回退到当前 UID 专属、权限为 `0700` 的短临时目录，并在命令结束或认证阶段 Ctrl-C 时清理随机子目录。
+- 上传会先写入同目录的随机 `.git-deploy-<uuid>.tmp`。若连接恰好在上传后、rename 前死亡，当次清理也可能失败并留下该临时文件；工具不会扫描删除未知历史文件，确认无活跃部署且核对文件名后可由服务器管理员人工处理。
 - `target ... already being deployed`：另一个进程持有 common-dir Target Lock；等待它完成，不要删除锁文件绕过。
 
 ## 安全边界

@@ -4,11 +4,30 @@ from __future__ import annotations
 
 import ftplib
 import os
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 
 from git_deploy.config import TargetConfig
 from git_deploy.errors import DeployError
 from git_deploy.transports.base import ProgressCallback, Transport
+
+
+class FTPPathProbeResult(Enum):
+    """Classify an FTP directory probe without collapsing access errors."""
+
+    EXISTS = "exists"
+    MISSING = "missing"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class FTPDirectoryProbe:
+    """Carry one directory probe result, cached names, and optional error detail."""
+
+    result: FTPPathProbeResult
+    entries: frozenset[str] = frozenset()
+    error: str | None = None
 
 
 class FTPTransport(Transport):
@@ -23,10 +42,12 @@ class FTPTransport(Transport):
 
         self.target = target
         self.ftp: ftplib.FTP | None = None
+        self._directory_entries: dict[str, set[str]] = {}
 
     def connect(self) -> None:
         """Connect and authenticate with a password from the environment."""
 
+        self._directory_entries.clear()
         if not self.target.password_env:
             raise DeployError("FTP target is missing password_env")
         password = os.environ.get(self.target.password_env)
@@ -104,6 +125,7 @@ class FTPTransport(Transport):
                 ftp.storbinary(f"STOR {target}", handle, blocksize=64 * 1024, callback=block_callback)
             if total == 0:
                 callback(0, 0)
+            self._cache_add(PurePosixPath(target).parent.as_posix(), PurePosixPath(target).name)
         except (OSError, ftplib.Error) as exc:
             raise DeployError(f"FTP upload failed for {remote_path}: {exc}") from exc
 
@@ -121,11 +143,14 @@ class FTPTransport(Transport):
         target = self._absolute(remote_path)
         parent = PurePosixPath(target).parent.as_posix()
         name = PurePosixPath(target).name
-        try:
-            entries = ftp.nlst(parent)
-        except ftplib.Error as exc:
-            raise DeployError(f"FTP existence probe failed for {remote_path}: {exc}") from exc
-        if not any(PurePosixPath(entry.rstrip("/")).name == name for entry in entries):
+        probe = self._probe_directory(parent)
+        if probe.result is FTPPathProbeResult.MISSING:
+            return
+        if probe.result is FTPPathProbeResult.ERROR:
+            raise DeployError(
+                f"FTP existence probe failed for {remote_path}: {probe.error or 'unknown error'}"
+            )
+        if name not in probe.entries:
             return
         try:
             ftp.delete(target)
@@ -133,10 +158,12 @@ class FTPTransport(Transport):
             raise DeployError(f"FTP delete failed for {remote_path}: {exc}") from exc
         except ftplib.Error as exc:
             raise DeployError(f"FTP delete failed for {remote_path}: {exc}") from exc
+        self._cache_discard(parent, name)
 
     def close(self) -> None:
         """Quit cleanly when possible, otherwise close the socket."""
 
+        self._directory_entries.clear()
         if self.ftp is None:
             return
         try:
@@ -158,6 +185,9 @@ class FTPTransport(Transport):
             current = (PurePosixPath(current) / component).as_posix()
             try:
                 ftp.mkd(current)
+                parent = PurePosixPath(current).parent.as_posix()
+                self._cache_add(parent, PurePosixPath(current).name)
+                self._directory_entries[current] = set()
             except ftplib.error_perm as exc:
                 if not str(exc).startswith("550"):
                     raise DeployError(f"cannot create FTP directory {current}: {exc}") from exc
@@ -167,6 +197,90 @@ class FTPTransport(Transport):
                     ftp.cwd(original)
                 except ftplib.Error as inspect_exc:
                     raise DeployError(f"FTP directory is unavailable {current}: {inspect_exc}") from inspect_exc
+
+    def _probe_directory(self, absolute: str) -> FTPDirectoryProbe:
+        """List one directory once and distinguish missing parents from access errors.
+
+        Args:
+            absolute: Absolute POSIX directory path below or containing the target root.
+
+        Returns:
+            Explicit probe state with normalized child names when the directory exists.
+        """
+
+        cached = self._directory_entries.get(absolute)
+        if cached is not None:
+            return FTPDirectoryProbe(FTPPathProbeResult.EXISTS, frozenset(cached))
+        ftp = self._require_ftp()
+        try:
+            entries = {
+                PurePosixPath(entry.rstrip("/")).name
+                for entry in ftp.nlst(absolute)
+                if entry.rstrip("/")
+            }
+        except ftplib.error_perm as exc:
+            return self._recover_failed_listing(absolute, exc)
+        except ftplib.Error as exc:
+            return FTPDirectoryProbe(FTPPathProbeResult.ERROR, error=str(exc))
+        self._directory_entries[absolute] = entries
+        return FTPDirectoryProbe(FTPPathProbeResult.EXISTS, frozenset(entries))
+
+    def _recover_failed_listing(
+        self,
+        absolute: str,
+        error: ftplib.error_perm,
+    ) -> FTPDirectoryProbe:
+        """Resolve a failed NLST through CWD and the nearest listable ancestor.
+
+        Args:
+            absolute: Directory whose listing failed.
+            error: Permanent FTP response returned by NLST.
+
+        Returns:
+            Missing for an absent parent, Exists for an empty accessible directory,
+            or Error when permissions and absence cannot be separated safely.
+        """
+
+        detail = str(error)
+        if _looks_like_access_denied(detail):
+            return FTPDirectoryProbe(FTPPathProbeResult.ERROR, error=detail)
+        ftp = self._require_ftp()
+        try:
+            original = ftp.pwd()
+            ftp.cwd(absolute)
+            ftp.cwd(original)
+        except ftplib.error_perm as cwd_error:
+            cwd_detail = str(cwd_error)
+            if _looks_like_access_denied(cwd_detail) or absolute == "/":
+                return FTPDirectoryProbe(FTPPathProbeResult.ERROR, error=cwd_detail)
+            parent = PurePosixPath(absolute).parent.as_posix()
+            ancestor = self._probe_directory(parent)
+            if ancestor.result is not FTPPathProbeResult.EXISTS:
+                return ancestor
+            name = PurePosixPath(absolute).name
+            if name not in ancestor.entries:
+                return FTPDirectoryProbe(FTPPathProbeResult.MISSING)
+            return FTPDirectoryProbe(FTPPathProbeResult.ERROR, error=cwd_detail)
+        except ftplib.Error as cwd_error:
+            return FTPDirectoryProbe(FTPPathProbeResult.ERROR, error=str(cwd_error))
+        # Several servers report 550 for NLST on an empty directory. Successful
+        # CWD proves the parent exists, so the requested child is already absent.
+        self._directory_entries[absolute] = set()
+        return FTPDirectoryProbe(FTPPathProbeResult.EXISTS)
+
+    def _cache_add(self, parent: str, name: str) -> None:
+        """Add a known child only when its parent already has a complete listing."""
+
+        entries = self._directory_entries.get(parent)
+        if entries is not None:
+            entries.add(name)
+
+    def _cache_discard(self, parent: str, name: str) -> None:
+        """Remove a successfully deleted child from a cached complete listing."""
+
+        entries = self._directory_entries.get(parent)
+        if entries is not None:
+            entries.discard(name)
 
     def _absolute(self, relative: str) -> str:
         """Join a normalized relative path below the configured root."""
@@ -182,3 +296,16 @@ class FTPTransport(Transport):
         if self.ftp is None:
             raise DeployError("FTP transport is not connected")
         return self.ftp
+
+
+def _looks_like_access_denied(detail: str) -> bool:
+    """Recognize explicit access failures while keeping generic 550 replies ambiguous."""
+
+    normalized = detail.casefold()
+    return any(
+        marker in normalized
+        for marker in ("permission", "access denied", "not allowed", "not permitted", "forbidden")
+    )
+
+
+__all__ = ["FTPDirectoryProbe", "FTPPathProbeResult", "FTPTransport"]
