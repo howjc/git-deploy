@@ -35,6 +35,12 @@ delete_removed = true
 protocol = "sftp"
 ssh_host_alias = "project-dev"
 remote_root = "/srv/project-dev"
+after_deploy = [
+  "php artisan optimize:clear",
+  "sudo -n /usr/bin/systemctl restart application.service",
+  "sudo -n /usr/bin/systemctl is-active --quiet application.service",
+]
+command_timeout = 120
 
 [targets.prod]
 protocol = "ftp"

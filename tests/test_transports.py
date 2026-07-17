@@ -163,6 +163,95 @@ class FakeSSHClient:
         self.closed = True
 
 
+class FakeCommandChannel:
+    """Provide pollable Paramiko stdout, stderr, timeout, and exit status."""
+
+    def __init__(
+        self,
+        *,
+        stdout: tuple[bytes, ...] = (),
+        stderr: tuple[bytes, ...] = (),
+        status: int = 0,
+        finishes: bool = True,
+    ) -> None:
+        """Configure output chunks and terminal status behavior."""
+
+        self.stdout = list(stdout)
+        self.stderr = list(stderr)
+        self.status = status
+        self.finishes = finishes
+        self.closed = False
+
+    def recv_ready(self) -> bool:
+        """Return whether stdout has a buffered chunk."""
+
+        return bool(self.stdout)
+
+    def recv(self, size: int) -> bytes:
+        """Return the next stdout chunk."""
+
+        return self.stdout.pop(0)
+
+    def recv_stderr_ready(self) -> bool:
+        """Return whether stderr has a buffered chunk."""
+
+        return bool(self.stderr)
+
+    def recv_stderr(self, size: int) -> bytes:
+        """Return the next stderr chunk."""
+
+        return self.stderr.pop(0)
+
+    def exit_status_ready(self) -> bool:
+        """Return whether the synthetic process has exited."""
+
+        return self.finishes
+
+    def recv_exit_status(self) -> int:
+        """Return the configured remote exit status."""
+
+        return self.status
+
+    def close(self) -> None:
+        """Record timeout-driven channel cleanup."""
+
+        self.closed = True
+
+
+class FakeCommandFile:
+    """Represent one closeable Paramiko command stream."""
+
+    def __init__(self, channel: FakeCommandChannel) -> None:
+        """Bind the shared exec channel."""
+
+        self.channel = channel
+        self.closed = False
+
+    def close(self) -> None:
+        """Record stream cleanup."""
+
+        self.closed = True
+
+
+class FakeCommandClient:
+    """Record Paramiko exec options and expose one configured channel."""
+
+    def __init__(self, channel: FakeCommandChannel) -> None:
+        """Create stdin/stdout/stderr stream objects over one channel."""
+
+        self.channel = channel
+        self.stdin = FakeCommandFile(channel)
+        self.stdout = FakeCommandFile(channel)
+        self.stderr = FakeCommandFile(channel)
+        self.calls: list[tuple[str, float | None, bool]] = []
+
+    def exec_command(self, command: str, *, timeout: float | None, get_pty: bool):
+        """Return streams while recording non-interactive execution policy."""
+
+        self.calls.append((command, timeout, get_pty))
+        return self.stdin, self.stdout, self.stderr
+
+
 def sftp_target() -> TargetConfig:
     """Return a compact SFTP target for unit adapters."""
 
@@ -307,6 +396,48 @@ def test_ftp_upload_and_delete_keep_cached_listing_coherent(tmp_path: Path) -> N
     assert transport._directory_entries == {}
 
 
+def test_ftp_missing_parent_probe_is_cached_and_root_probe_is_three_state() -> None:
+    """Repeated missing-parent deletes avoid network probes and Doctor fails closed."""
+
+    fake = CachingFTP({"/": {"root"}, "/root": set()})
+    transport = FTPTransport(ftp_target())
+    transport.ftp = fake  # type: ignore[assignment]
+
+    transport.delete("gone/one.js")
+    transport.delete("gone/two.js")
+
+    assert fake.nlst_calls == ["/root/gone", "/root"]
+    assert transport._missing_directories == {"/root/gone"}
+    assert transport.root_exists()
+
+    class DeniedFTP(CachingFTP):
+        """Reject root inspection explicitly."""
+
+        def nlst(self, path: str) -> list[str]:
+            """Return one access failure."""
+
+            raise ftplib.error_perm("550 Permission denied")
+
+    denied = FTPTransport(ftp_target())
+    denied.ftp = DeniedFTP({"/root": set()})  # type: ignore[assignment]
+    with pytest.raises(DeployError, match="Permission denied"):
+        denied.root_exists()
+
+
+def test_ftp_created_directory_invalidates_missing_cache() -> None:
+    """Creating a formerly missing directory makes later probes authoritative."""
+
+    fake = CachingFTP({"/": {"root"}, "/root": set()})
+    transport = FTPTransport(ftp_target())
+    transport.ftp = fake  # type: ignore[assignment]
+    transport._missing_directories.add("/root/new")
+
+    transport._mkdirs("/root/new")
+
+    assert "/root/new" not in transport._missing_directories
+    assert transport._directory_entries["/root/new"] == set()
+
+
 def test_ssh_alias_uses_openssh_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """SSH alias resolution delegates Include/Match semantics to ``ssh -G``."""
 
@@ -366,3 +497,52 @@ def test_sftp_connect_enables_only_explicit_agent_discovery(monkeypatch: pytest.
     assert client.connect_options["timeout"] == 7
     transport.close()
     assert client.closed
+
+
+def test_paramiko_command_uses_cwd_no_pty_timeout_and_streams_output(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Direct-host SFTP reuses SSHClient and drains stdout/stderr before exit."""
+
+    channel = FakeCommandChannel(stdout=(b"ready\n",), stderr=(b"warning\n",))
+    client = FakeCommandClient(channel)
+    transport = SFTPTransport(sftp_target())
+    transport.client = client  # type: ignore[assignment]
+
+    transport.run_command(
+        "printf ready",
+        cwd=PurePosixPath("/root/app with spaces"),
+        timeout=12,
+    )
+
+    captured = capfd.readouterr()
+    assert captured.out == "ready\n"
+    assert captured.err == "warning\n"
+    assert client.calls == [("cd -- '/root/app with spaces' && printf ready", 12, False)]
+    assert client.stdin.closed
+    assert client.stdout.closed
+    assert client.stderr.closed
+    assert channel.closed
+
+
+def test_paramiko_command_nonzero_and_timeout_fail_closed() -> None:
+    """Remote exit failure and whole-command timeout both raise without retry."""
+
+    failed_client = FakeCommandClient(FakeCommandChannel(status=17))
+    failed = SFTPTransport(sftp_target())
+    failed.client = failed_client  # type: ignore[assignment]
+
+    with pytest.raises(DeployError, match="exit=17"):
+        failed.run_command("false", cwd=PurePosixPath("/root"), timeout=5)
+
+    timeout_channel = FakeCommandChannel(finishes=False)
+    timeout_client = FakeCommandClient(timeout_channel)
+    timed = SFTPTransport(sftp_target())
+    timed.client = timeout_client  # type: ignore[assignment]
+
+    with pytest.raises(DeployError, match="timed out"):
+        timed.run_command("sleep 10", cwd=PurePosixPath("/root"), timeout=0.001)
+    assert timeout_channel.closed
+    assert timeout_client.stdin.closed
+    assert timeout_client.stdout.closed
+    assert timeout_client.stderr.closed

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -216,6 +217,56 @@ class OpenSSHMaster:
             )
         return result
 
+    def run_command(
+        self,
+        command: str,
+        cwd: PurePosixPath,
+        timeout: float | None,
+    ) -> None:
+        """Run one non-interactive command through the existing master.
+
+        Args:
+            command: Validated one-line shell command.
+            cwd: Absolute remote working directory.
+            timeout: Optional whole-command timeout in seconds.
+
+        Returns:
+            ``None`` after a zero remote exit status.
+        """
+
+        if not self.connected or self.control_path is None:
+            raise DeployError("OpenSSH master is not connected")
+        wrapped = f"cd -- {shlex.quote(cwd.as_posix())} && {command}"
+        invocation = [
+            self.ssh,
+            *self._config_arguments(),
+            "-o",
+            f"ControlPath={self.control_path}",
+            *self._pinned_endpoint_arguments(),
+            "-T",
+            self.alias,
+            wrapped,
+        ]
+        try:
+            result = subprocess.run(
+                invocation,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DeployError(
+                f"remote command timed out after {timeout} second(s): {command}"
+            ) from exc
+        except OSError as exc:
+            raise DeployError(f"cannot execute remote command: {exc}") from exc
+        if result.returncode != 0:
+            raise DeployError(
+                f"remote command failed with exit={result.returncode}: {command}"
+            )
+
     def close(self) -> None:
         """Close the master and delete its private directory idempotently."""
 
@@ -420,6 +471,26 @@ class OpenSSHSFTPTransport(Transport):
             (f"rm {_quote_sftp(target)}",),
             operation=f"delete {remote_path}",
         )
+
+    def run_command(
+        self,
+        command: str,
+        *,
+        cwd: PurePosixPath,
+        timeout: float | None,
+    ) -> None:
+        """Execute one command through the already authenticated ControlMaster.
+
+        Args:
+            command: Validated one-line shell command.
+            cwd: Absolute remote working directory.
+            timeout: Optional whole-command timeout in seconds.
+
+        Returns:
+            ``None`` after a zero remote exit status.
+        """
+
+        self._require_master().run_command(command, cwd, timeout)
 
     def close(self) -> None:
         """Release an owned master; pooled masters live until pool close_all()."""

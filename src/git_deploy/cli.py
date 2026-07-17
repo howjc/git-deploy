@@ -246,8 +246,11 @@ def _deploy_workspace(
             print("Workspace dry-run complete: no remote connection and no state change.")
             return 0
         operation_count = sum(len(item.plan.operations) for item in prepared)
+        command_count = sum(
+            len(item.plan.target.after_deploy) for item in prepared if item.plan.operations
+        )
         if operation_count and not args.yes:
-            _confirm_workspace(target, operation_count, len(prepared))
+            _confirm_workspace(target, operation_count, command_count, len(prepared))
         completed = execute_workspace(prepared, verbose=args.verbose)
         uploads = sum(item.plan.upload_count for item in prepared)
         deletes = sum(item.plan.delete_count for item in prepared)
@@ -309,18 +312,28 @@ def _confirm(plan: DeploymentPlan) -> None:
 
     if not sys.stdin.isatty():
         raise ConfigError("deployment requires --yes when stdin is not interactive")
-    answer = input(f"Deploy {len(plan.operations)} operation(s) to {plan.target.name}? [y/N] ")
+    commands = len(plan.target.after_deploy) if plan.operations else 0
+    answer = input(
+        f"Deploy {len(plan.operations)} file operation(s) and {commands} after-deploy "
+        f"command(s) to {plan.target.name}? [y/N] "
+    )
     if answer.strip().lower() not in {"y", "yes"}:
         raise ConfigError("deployment cancelled")
 
 
-def _confirm_workspace(target: str, operations: int, repositories: int) -> None:
+def _confirm_workspace(
+    target: str,
+    operations: int,
+    commands: int,
+    repositories: int,
+) -> None:
     """Require exactly one confirmation for all prepared workspace writes."""
 
     if not sys.stdin.isatty():
         raise ConfigError("deployment requires --yes when stdin is not interactive")
     answer = input(
-        f"Deploy {operations} operation(s) across {repositories} repositories to {target}? [y/N] "
+        f"Deploy {operations} file operation(s) and {commands} after-deploy command(s) "
+        f"across {repositories} repositories to {target}? [y/N] "
     )
     if answer.strip().lower() not in {"y", "yes"}:
         raise ConfigError("deployment cancelled")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -29,12 +29,21 @@ from git_deploy.workspace import (
 class WorkspaceTransport(Transport):
     """Persist fake remote files and optionally fail one repository."""
 
-    def __init__(self, files: dict[str, bytes], *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        *,
+        fail: bool = False,
+        command_fail: bool = False,
+        command_log: list[str] | None = None,
+    ) -> None:
         """Bind a repository's remote file map and failure switch."""
 
         self.files = files
         self.fail = fail
         self.connects = 0
+        self.command_fail = command_fail
+        self.command_log = command_log if command_log is not None else []
 
     def connect(self) -> None:
         """Record a fake connection."""
@@ -69,6 +78,19 @@ class WorkspaceTransport(Transport):
         """Delete one fake remote file idempotently."""
 
         self.files.pop(remote_path, None)
+
+    def run_command(
+        self,
+        command: str,
+        *,
+        cwd: PurePosixPath,
+        timeout: float | None,
+    ) -> None:
+        """Record per-repository commands and optionally fail this repository."""
+
+        self.command_log.append(command)
+        if self.command_fail:
+            raise DeployError("workspace remote command failed")
 
     def close(self) -> None:
         """Release no resources in the in-memory adapter."""
@@ -321,6 +343,73 @@ def test_sequential_failure_then_workspace_rerun_converges(tmp_path: Path) -> No
     )
     assert all(store.load("dev") is not None for store in states)
     assert remotes["/srv/api"]["app.py"] == b"print('api')\n"
+
+
+def test_workspace_command_failure_commits_a_stops_c_and_rerun_converges(
+    tmp_path: Path,
+) -> None:
+    """Each repository runs files, commands, and State before the next repository."""
+
+    repositories = tuple(
+        _create_repository(tmp_path, name, after_deploy=(f"restart-{name}",))
+        for name in ("api", "web", "admin")
+    )
+    workspace = load_workspace(
+        _write_workspace(
+            tmp_path,
+            tuple(zip(("api", "web", "admin"), repositories, strict=True)),
+        )
+    )
+    remotes = {f"/srv/{name}": {} for name in ("api", "web", "admin")}
+    commands = {f"/srv/{name}": [] for name in ("api", "web", "admin")}
+
+    def failed_factory(target):  # noqa: ANN001, ANN202
+        """Fail only web's reviewed command after its file upload."""
+
+        root = target.remote_root.as_posix()
+        return WorkspaceTransport(
+            remotes[root],
+            command_fail=root == "/srv/web",
+            command_log=commands[root],
+        )
+
+    _, first = prepare_workspace(workspace, None, full=False, skip_build=True)
+    rendered = render_workspace_plan("dev", first)
+    assert "AFTER  restart-api" in rendered
+    assert "3 after-deploy command(s)" in rendered
+    with pytest.raises(DeployError, match="workspace remote command failed"):
+        execute_workspace(first, transport_factory=failed_factory)
+
+    stores = tuple(StateStore(GitRepository(path).common_dir()) for path in repositories)
+    assert stores[0].load("dev") is not None
+    assert stores[1].load("dev") is None
+    assert stores[2].load("dev") is None
+    assert commands == {
+        "/srv/api": ["restart-api"],
+        "/srv/web": ["restart-web"],
+        "/srv/admin": [],
+    }
+
+    _, rerun = prepare_workspace(workspace, None, full=False, skip_build=True)
+    assert rerun[0].plan.operations == ()
+
+    def successful_factory(target):  # noqa: ANN001, ANN202
+        """Complete only repositories that remain pending on rerun."""
+
+        root = target.remote_root.as_posix()
+        return WorkspaceTransport(remotes[root], command_log=commands[root])
+
+    assert execute_workspace(rerun, transport_factory=successful_factory) == (
+        "api",
+        "web",
+        "admin",
+    )
+    assert all(store.load("dev") is not None for store in stores)
+    assert commands == {
+        "/srv/api": ["restart-api"],
+        "/srv/web": ["restart-web", "restart-web"],
+        "/srv/admin": ["restart-admin"],
+    }
 
 
 def test_combined_plan_and_frozen_bytes_survive_later_worktree_change(tmp_path: Path) -> None:
@@ -644,6 +733,7 @@ def _create_repository(
     host: str = "example.invalid",
     remote_root: str | None = None,
     alias: str | None = None,
+    after_deploy: tuple[str, ...] = (),
 ) -> Path:
     """Create one independent Git project and minimal deploy configuration."""
 
@@ -657,6 +747,8 @@ def _create_repository(
     _git(root, "add", "app.py")
     _git(root, "commit", "-qm", "initial")
     steps = ", ".join(f'"{step}"' for step in build_steps)
+    remote_commands = ", ".join(f'"{command}"' for command in after_deploy)
+    command_config = f"after_deploy = [{remote_commands}]\n" if after_deploy else ""
     output = ""
     if missing_output:
         output = '\n[[outputs]]\nlocal = "dist"\nremote = "public/dist"\n'
@@ -683,7 +775,8 @@ def _create_repository(
             f"[build]\nsteps = [{steps}]\n\n"
             f"[targets.{target}]\n"
             f"{connection}"
-            f'remote_root = "{selected_root}"\n\n'
+            f'remote_root = "{selected_root}"\n'
+            f"{command_config}\n"
             '[deploy]\nretries = 1\nretry_delay = 0\n'
             f"{output}"
         ),

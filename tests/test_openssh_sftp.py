@@ -226,6 +226,90 @@ def test_connection_pool_reuses_endpoint_across_remote_roots(
     assert len([command for command in calls if "exit" in command]) == 2
 
 
+def test_native_remote_commands_share_master_pin_endpoint_and_disable_interaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace commands reuse one reviewed ControlMaster without PTY or stdin."""
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setattr(
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+
+    def run(command, **kwargs):  # noqa: ANN001, ANN202
+        """Record master and command invocations while returning success."""
+
+        calls.append((list(command), dict(kwargs)))
+        return _success(list(command))
+
+    monkeypatch.setattr("git_deploy.config.subprocess.run", run)
+    monkeypatch.setattr("git_deploy.transports.openssh_sftp.subprocess.run", run)
+    pool = SSHConnectionPool()
+    first = OpenSSHSFTPTransport(native_target(tmp_path, root="/srv/api app"), pool)
+    second = OpenSSHSFTPTransport(native_target(tmp_path, root="/srv/web"), pool)
+
+    first.connect()
+    first.run_command("restart-api", cwd=PurePosixPath("/srv/api app"), timeout=20)
+    second.connect()
+    second.run_command("restart-web", cwd=PurePosixPath("/srv/web"), timeout=None)
+
+    assert first.master is second.master
+    assert len([command for command, _ in calls if "-MNf" in command]) == 1
+    remote = [(command, options) for command, options in calls if "-T" in command]
+    assert len(remote) == 2
+    for command, options in remote:
+        assert "HostName=192.0.2.10" in command
+        assert "User=deploy" in command
+        assert "Port=22" in command
+        assert options["stdin"] is subprocess.DEVNULL
+        assert options["stdout"] is None
+        assert options["stderr"] is None
+        assert "BatchMode=yes" not in command
+    assert remote[0][0][-1] == "cd -- '/srv/api app' && restart-api"
+    assert remote[0][1]["timeout"] == 20
+    assert remote[1][1]["timeout"] is None
+    pool.close_all()
+
+
+def test_native_remote_command_exit_and_timeout_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native command failures preserve exit/timeout diagnostics without retry."""
+
+    monkeypatch.setattr(
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+
+    def run(command, **kwargs):  # noqa: ANN001, ANN202
+        """Fail command execution after allowing master setup and checks."""
+
+        if "-T" in command:
+            return subprocess.CompletedProcess(command, 23, "", "")
+        return _success(list(command))
+
+    monkeypatch.setattr("git_deploy.config.subprocess.run", run)
+    monkeypatch.setattr("git_deploy.transports.openssh_sftp.subprocess.run", run)
+    transport = OpenSSHSFTPTransport(native_target(tmp_path))
+    transport.connect()
+
+    with pytest.raises(DeployError, match="exit=23"):
+        transport.run_command("false", cwd=PurePosixPath("/srv/app"), timeout=5)
+
+    def timeout(command, **kwargs):  # noqa: ANN001, ANN202
+        """Raise a subprocess timeout only for remote command execution."""
+
+        if "-T" in command:
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+        return _success(list(command))
+
+    monkeypatch.setattr("git_deploy.transports.openssh_sftp.subprocess.run", timeout)
+    with pytest.raises(DeployError, match="timed out"):
+        transport.run_command("sleep 10", cwd=PurePosixPath("/srv/app"), timeout=0.1)
+    transport.close()
+
+
 def test_pool_sharing_is_independent_of_repository_timeout_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

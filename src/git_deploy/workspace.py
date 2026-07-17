@@ -189,6 +189,7 @@ def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...])
     lines = [f"Workspace Target: {target}"]
     uploads = 0
     deletes = 0
+    commands = 0
     frozen_bytes = 0
     for item in prepared:
         lines.append("")
@@ -215,17 +216,21 @@ def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...])
             for operation in item.plan.operations:
                 action = "UPLOAD" if isinstance(operation, UploadOperation) else "DELETE"
                 lines.append(f"  {action:6} [{operation.origin}] {operation.remote_path}")
+            lines.extend(f"  AFTER  {command}" for command in item.plan.target.after_deploy)
+        command_count = len(item.plan.target.after_deploy) if item.plan.operations else 0
         lines.append(
-            f"  Summary: {item.plan.upload_count} upload(s), {item.plan.delete_count} delete(s)"
+            f"  Summary: {item.plan.upload_count} upload(s), {item.plan.delete_count} delete(s), "
+            f"{command_count} after-deploy command(s)"
         )
         uploads += item.plan.upload_count
         deletes += item.plan.delete_count
+        commands += command_count
         frozen_bytes += item.frozen_bytes
     lines.extend(
         (
             "",
             f"Total: {uploads} upload(s), {deletes} delete(s), "
-            f"{frozen_bytes} frozen byte(s)",
+            f"{commands} after-deploy command(s), {frozen_bytes} frozen byte(s)",
         )
     )
     return "\n".join(lines)
