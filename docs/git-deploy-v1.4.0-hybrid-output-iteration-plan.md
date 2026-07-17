@@ -2,7 +2,7 @@
 
 > 项目：`howjc/git-deploy`
 > 建议版本：`v1.4.0`
-> 方案状态：实现完成 / 发布门禁进行中
+> 方案状态：实现完成 / 发布就绪
 > 核心能力：Local Aggregation + Single Hybrid Output + Remote Ownership Manifest
 > 产品定位：个人使用、极简、稳定、失败后可重跑
 > 更新时间：2026-07-17
@@ -1584,8 +1584,8 @@ examples/aggregate_frontend_builds.py
 - [x] Lock Check；
 - [x] Wheel/sdist；
 - [x] Isolated Install；
-- [ ] PR CI；
-- [ ] Main/Tag Blob Verify。
+- [x] PR CI；
+- [x] Main/Tag Blob Verify。
 
 ---
 
