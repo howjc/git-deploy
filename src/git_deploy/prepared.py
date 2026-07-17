@@ -19,7 +19,9 @@ from git_deploy.errors import PlanError, StateError
 from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
-from git_deploy.planner import DeploymentPlan, create_plan
+from git_deploy.planner import DeploymentPlan, complete_remote_plan, create_plan
+from git_deploy.transports import create_transport
+from git_deploy.transports.base import Transport
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
 
 
@@ -36,6 +38,7 @@ class PreparedDeployment:
     frozen_bytes: int
     _temporary: tempfile.TemporaryDirectory[str]
     _lock: TargetLock
+    transport: Transport | None = None
     _closed: bool = False
 
     def close(self) -> None:
@@ -45,6 +48,9 @@ class PreparedDeployment:
             return
         self._closed = True
         try:
+            if self.transport is not None:
+                self.transport.close()
+                self.transport = None
             self._temporary.cleanup()
         finally:
             self._lock.release()
@@ -90,6 +96,7 @@ def prepare_project(
         legacy_store = StateStore(repository.git_dir())
         if state_store.migrate_from(legacy_store, target.name):
             print(f"[{name}] Migrated target state to Git common dir.")
+        _check_hybrid_ignore(config, repository, name)
         before_build_status = repository.status_porcelain()
         if before_build_status and config.source.require_clean_worktree:
             raise PlanError(
@@ -168,6 +175,74 @@ def prepare_project(
         raise
 
 
+def prepare_remote_plan(
+    prepared: PreparedDeployment,
+    *,
+    allow_recovery: bool,
+    transport_factory: TransportFactory | None = None,
+    connection_pool: SSHConnectionPool | None = None,
+) -> None:
+    """Connect read-only and complete Hybrid ownership planning before writes.
+
+    Args:
+        prepared: Locally frozen project plan.
+        allow_recovery: Whether normal deployment may reconcile prior recovery.
+        transport_factory: Optional fake adapter factory.
+        connection_pool: Optional command-scoped Native OpenSSH pool.
+
+    Returns:
+        ``None`` after storing a connected transport and remote-complete plan.
+    """
+
+    if prepared.transport is not None:
+        raise PlanError("remote plan has already been prepared")
+    transport = (
+        transport_factory(prepared.plan.target)
+        if transport_factory is not None
+        else create_transport(prepared.plan.target, connection_pool)
+    )
+    try:
+        transport.connect()
+        if prepared.plan.hybrid is not None:
+            prepared.plan = complete_remote_plan(
+                prepared.plan,
+                prepared.config,
+                transport,
+                allow_recovery=allow_recovery,
+            )
+        else:
+            transport.root_exists()
+        prepared.transport = transport
+    except BaseException:
+        transport.close()
+        raise
+
+
+def _check_hybrid_ignore(config: Config, repository: GitRepository, name: str) -> None:
+    """Warn or fail when a Local Aggregation Root is not ignored by Git.
+
+    Args:
+        config: Loaded project and clean-worktree policy.
+        repository: Validated Git reader.
+        name: Human-readable repository label.
+
+    Returns:
+        ``None`` after every Hybrid local root is proven ignored or warned.
+    """
+
+    for output in config.outputs:
+        if output.mode != "hybrid" or repository.is_ignored(output.local):
+            continue
+        relative = output.local.relative_to(config.project_root).as_posix()
+        detail = (
+            f"hybrid output directory {relative!r} is not ignored by Git; "
+            "add '.deploy/' to .gitignore"
+        )
+        if config.source.require_clean_worktree:
+            raise PlanError(f"[{name}] {detail}")
+        print(f"[{name}] WARNING: {detail}")
+
+
 def execute_prepared(
     prepared: PreparedDeployment,
     *,
@@ -186,6 +261,8 @@ def execute_prepared(
             verbose=verbose,
             transport_factory=transport_factory,
             connection_pool=connection_pool,
+            prepared_transport=prepared.transport,
         )
+        prepared.transport = None
     finally:
         prepared.close()

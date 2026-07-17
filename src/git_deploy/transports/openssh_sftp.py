@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 
 from git_deploy.config import TargetConfig, resolve_current_ssh_alias
 from git_deploy.errors import DeployError
-from git_deploy.transports.base import ProgressCallback, Transport
+from git_deploy.transports.base import ProgressCallback, RemotePathType, Transport
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +267,46 @@ class OpenSSHMaster:
                 f"remote command failed with exit={result.returncode}: {command}"
             )
 
+    def run_capture(self, command: str) -> str:
+        """Run one non-interactive read-only probe and return text stdout.
+
+        Args:
+            command: Fully quoted POSIX shell probe.
+
+        Returns:
+            Exact stdout after a zero remote exit status.
+        """
+
+        if not self.connected or self.control_path is None:
+            raise DeployError("OpenSSH master is not connected")
+        invocation = [
+            self.ssh,
+            *self._config_arguments(),
+            "-o",
+            f"ControlPath={self.control_path}",
+            *self._pinned_endpoint_arguments(),
+            "-T",
+            self.alias,
+            command,
+        ]
+        try:
+            result = subprocess.run(
+                invocation,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=self.target.timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DeployError(f"cannot execute remote path probe: {exc}") from exc
+        if result.returncode != 0:
+            raise DeployError(
+                f"remote path probe failed with exit={result.returncode}: {result.stderr.strip()}"
+            )
+        return result.stdout
+
     def close(self) -> None:
         """Close the master and delete its private directory idempotently."""
 
@@ -492,6 +532,140 @@ class OpenSSHSFTPTransport(Transport):
 
         self._require_master().run_command(command, cwd, timeout)
 
+    def lstat(self, remote_path: str) -> RemotePathType:
+        """Classify one relative path through the existing pinned SSH master.
+
+        Args:
+            remote_path: Safe relative path below ``remote_root``.
+
+        Returns:
+            Confirmed path type without following a symlink.
+        """
+
+        absolute = self._absolute(remote_path)
+        quoted = shlex.quote(absolute)
+        output = self._require_master().run_capture(
+            f"p={quoted}; if [ -L \"$p\" ]; then printf symlink; "
+            "elif [ -f \"$p\" ]; then printf file; "
+            "elif [ -d \"$p\" ]; then printf directory; "
+            "elif [ -e \"$p\" ]; then printf other; else printf missing; fi"
+        ).strip()
+        try:
+            return RemotePathType(output)
+        except ValueError as exc:
+            raise DeployError(f"remote path probe returned an invalid type: {output!r}") from exc
+
+    def read_file(self, remote_path: str, *, max_bytes: int) -> bytes:
+        """Download one bounded regular metadata file through the active master."""
+
+        if self.lstat(remote_path) is not RemotePathType.FILE:
+            raise DeployError(f"remote metadata path is not a regular file: {remote_path}")
+        local: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="git-deploy-read-", delete=False) as handle:
+                local = Path(handle.name)
+            self._require_master().run_batch(
+                (f"get {_quote_sftp(self._absolute(remote_path))} {_quote_sftp(str(local))}",),
+                operation=f"read metadata {remote_path}",
+            )
+            if local.stat().st_size > max_bytes:
+                raise DeployError(f"remote metadata file exceeds {max_bytes} bytes: {remote_path}")
+            return local.read_bytes()
+        except DeployError:
+            raise
+        except OSError as exc:
+            raise DeployError(f"cannot read remote metadata {remote_path}: {exc}") from exc
+        finally:
+            if local is not None:
+                local.unlink(missing_ok=True)
+
+    def write_file_atomic(self, remote_path: str, data: bytes) -> None:
+        """Publish metadata via the existing safe Native upload path."""
+
+        local: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="git-deploy-write-", delete=False) as handle:
+                handle.write(data)
+                local = Path(handle.name)
+            self.upload(local, remote_path, lambda done, total: None)
+        except DeployError:
+            raise
+        except OSError as exc:
+            raise DeployError(f"cannot stage remote metadata {remote_path}: {exc}") from exc
+        finally:
+            if local is not None:
+                local.unlink(missing_ok=True)
+
+    def list_directory(self, remote_path: str) -> tuple[str, ...]:
+        """List stable direct names for one Native SFTP directory."""
+
+        kind = self.lstat(remote_path)
+        if kind is RemotePathType.MISSING:
+            return ()
+        if kind is not RemotePathType.DIRECTORY:
+            raise DeployError(f"remote path is not a directory: {remote_path}")
+        absolute = self._absolute(remote_path).rstrip("/")
+        result = self._require_master().run_batch(
+            (f"ls -1 {_quote_sftp(absolute)}",),
+            operation=f"list directory {remote_path}",
+        )
+        names_list: list[str] = []
+        prefix = absolute + "/"
+        for raw in result.stdout.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("sftp>"):
+                continue
+            names_list.append(line[len(prefix) :] if line.startswith(prefix) else line)
+        names = tuple(sorted(names_list))
+        if any(name in {".", ".."} or "/" in name or "\\" in name for name in names):
+            raise DeployError(f"remote directory contains an unsafe name: {remote_path}")
+        return names
+
+    def make_directory(self, remote_path: str, *, mode: int = 0o755) -> None:
+        """Create a safe relative remote directory recursively."""
+
+        absolute = self._absolute(remote_path)
+        self._mkdirs(absolute, mode=mode)
+        self._require_master().run_batch(
+            (f"chmod {mode:04o} {_quote_sftp(absolute)}",),
+            operation=f"chmod directory {remote_path}",
+        )
+
+    def rename_path(self, source: str, destination: str) -> None:
+        """Rename one Native SFTP path without overwriting a destination."""
+
+        if self.lstat(destination) is not RemotePathType.MISSING:
+            raise DeployError(f"remote rename destination already exists: {destination}")
+        self._require_master().run_batch(
+            (
+                f"rename {_quote_sftp(self._absolute(source))} "
+                f"{_quote_sftp(self._absolute(destination))}",
+            ),
+            operation=f"rename {source} to {destination}",
+        )
+
+    def remove_tree(self, remote_path: str) -> None:
+        """Recursively remove one Native SFTP tree without following symlinks."""
+
+        kind = self.lstat(remote_path)
+        if kind is RemotePathType.MISSING:
+            return
+        absolute = self._absolute(remote_path)
+        if kind is RemotePathType.DIRECTORY:
+            for name in self.list_directory(remote_path):
+                self.remove_tree((PurePosixPath(remote_path) / name).as_posix())
+            self._require_master().run_batch(
+                (f"rmdir {_quote_sftp(absolute)}",),
+                operation=f"remove directory {remote_path}",
+            )
+        elif kind in {RemotePathType.FILE, RemotePathType.SYMLINK}:
+            self._require_master().run_batch(
+                (f"rm {_quote_sftp(absolute)}",),
+                operation=f"remove path {remote_path}",
+            )
+        else:
+            raise DeployError(f"refusing to remove unsupported remote type: {remote_path}")
+
     def close(self) -> None:
         """Release an owned master; pooled masters live until pool close_all()."""
 
@@ -559,7 +733,7 @@ class OpenSSHSFTPTransport(Transport):
             check=False,
         )
 
-    def _mkdirs(self, absolute: str) -> None:
+    def _mkdirs(self, absolute: str, *, mode: int = 0o755) -> None:
         """Create missing absolute directory components one at a time."""
 
         current = PurePosixPath("/")
@@ -568,7 +742,10 @@ class OpenSSHSFTPTransport(Transport):
             value = current.as_posix()
             if self._probe(value) is PathProbeResult.MISSING:
                 self._require_master().run_batch(
-                    (f"mkdir {_quote_sftp(value)}",),
+                    (
+                        f"mkdir {_quote_sftp(value)}",
+                        f"chmod {mode:04o} {_quote_sftp(value)}",
+                    ),
                     operation=f"create directory {value}",
                 )
 

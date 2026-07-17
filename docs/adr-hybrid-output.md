@@ -1,0 +1,43 @@
+# ADR：单 Hybrid Output 与远端所有权
+
+状态：Accepted for v1.4.0
+
+日期：2026-07-17
+
+## 问题
+
+前端构建产物通常不进入 Git，并会直接铺到同时包含 `index.php`、`.env`、后端目录和运行时数据的远端项目根目录。本地 State 丢失或换机器后，单靠本地 output manifest 无法安全判断哪些旧前端文件可以删除；清空根目录、普通 Root Mirror 或递归扫描删除都会越过所有权边界。
+
+## 决策
+
+v1.4.0 只增加一个受控模型：项目 Build 先把明确来源聚合到一个 Local Aggregation Root，再由一个 SFTP `mode = "hybrid"` Output 映射到 `remote = "."`。
+
+- 聚合根的直接文件是 Root File：按 Hash 增量上传，删除只来自 Remote Ownership Manifest。
+- 聚合根的直接目录是 Mirror Directory：每次部署完整 Stage/Swap，目录内容等于本地视图。
+- Remote Ownership Manifest 只记录该 Hybrid 明确拥有的直接文件和目录；未记录的远端内容永不扫描、接管或删除。
+- 无 Manifest 时，已存在的同名路径必须通过显式 `--full` Adoption；只接管当前本地存在的同名路径。
+- Local State 记录最后完整成功的部署和 Root File Hash；Remote Ownership 记录可删除的远端直接子项。两者职责不可互换。
+- 同一配置最多一个 Hybrid；Workspace 继续拒绝同一物理 Endpoint 上相同或嵌套的 Remote Root。
+- Hybrid 仅支持 SFTP。FTP 缺少本版本所需的可靠递归 Stage/Swap 与路径类型契约。
+
+## 为何不做 Root Mirror / Full Root Reconcile
+
+远端根目录包含不属于部署器的后端、环境和运行时内容。对根目录做 Mirror 或递归 Reconcile 需要推断未知路径的所有权，无法满足“未知内容永不删除”的安全不变量。因此 v1.4.0 只 Mirror 聚合根中明确出现的直接目录，并只根据远端 Manifest 删除历史拥有项。
+
+## Recovery 与原子性边界
+
+Mirror Directory 先完整上传到 `.git-deploy/stage/<id>`，现有路径移动到 `.git-deploy/backup/<id>` 后再发布。`.git-deploy/recovery/<id>.json` 记录 Deployment ID、Mapping、Target Fingerprint、Stage/Backup、阶段和新旧 Ownership Hash。
+
+中断发生在 Ownership Commit 前时，下次普通部署恢复 Backup；Commit 后则保留新所有权并完成清理。无法证明新旧所有权 Hash 时 Fail Closed。它只恢复当前 Hybrid Swap，不是历史、回滚或发布事务系统。
+
+SFTP 没有标准目录交换操作，Rename 之间存在短暂切换窗口；本方案不宣称严格零停机或跨多个目录的全局事务。
+
+## Dry-run 与 Remote-plan 契约
+
+- `--dry-run`：执行 Build、扫描并冻结本地视图；远端连接、远端读写、命令和 State 写入均为零。
+- `--remote-plan`：在冻结后建立只读连接，读取 Ownership/Recovery 和路径类型，显示 Adoption/Delete/Stage 计划；上传、删除、Recovery 修复、Manifest/State 写入和 `after_deploy` 均为零。
+- 普通部署：远端 Preflight 后显示完整计划并确认，才创建 Root、Stage、Backup 与 Recovery。
+
+## 明确不做
+
+Root Mirror、完整远端扫描、多 Hybrid 同根协调、Hybrid 所有权自动转移、FTP Hybrid、自动回滚、Workspace 全局 Hook、发布事务和通用远端运维框架均不属于 v1.4.0。

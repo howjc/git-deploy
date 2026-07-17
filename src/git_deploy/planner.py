@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -16,7 +16,17 @@ from git_deploy.config import (
 )
 from git_deploy.errors import PlanError
 from git_deploy.git import GitEntry, GitRepository
+from git_deploy.hybrid import (
+    HybridLocalManifest,
+    HybridOwnership,
+    read_ownership,
+    read_recovery_records,
+    reconcile_recovery,
+    scan_hybrid_output,
+    validate_internal_paths,
+)
 from git_deploy.manifest import ManifestEntry, ScannedOutput, TargetState, scan_outputs
+from git_deploy.transports.base import RemotePathType, Transport
 
 Origin = Literal["source", "output"]
 
@@ -45,6 +55,75 @@ Operation = UploadOperation | DeleteOperation
 
 
 @dataclass(frozen=True, slots=True)
+class HybridRootFileUpload:
+    """Upload one current Hybrid direct file through safe temporary publish."""
+
+    path: str
+    local_path: Path
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class HybridRootFileDelete:
+    """Remove one historically owned Hybrid direct file through Backup."""
+
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class HybridDirectoryMirror:
+    """Stage and swap one complete current Hybrid Mirror Directory."""
+
+    name: str
+    file_count: int
+    total_size: int
+    adopt: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class HybridDirectoryDelete:
+    """Move one historically owned removed directory into Backup."""
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class HybridAdoption:
+    """Display explicit ownership adoption for one existing direct child."""
+
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class HybridOwnershipUpdate:
+    """Commit the reviewed next Remote Ownership Manifest atomically."""
+
+    mapping: str
+
+
+HybridOperation = (
+    HybridRootFileUpload
+    | HybridRootFileDelete
+    | HybridDirectoryMirror
+    | HybridDirectoryDelete
+    | HybridAdoption
+    | HybridOwnershipUpdate
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HybridPlan:
+    """Bind the local aggregation view to optional remote ownership facts."""
+
+    local: HybridLocalManifest
+    previous_outputs: dict[str, ManifestEntry]
+    ownership: HybridOwnership | None = None
+    operations: tuple[HybridOperation, ...] = ()
+    remote_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class DeploymentPlan:
     """Contain deterministic operations and the next complete local state inputs."""
 
@@ -55,18 +134,82 @@ class DeploymentPlan:
     operations: tuple[Operation, ...]
     output_manifest: dict[str, ManifestEntry]
     full: bool
+    allow_adoption: bool = False
+    hybrid: HybridPlan | None = None
+    non_hybrid_owned: tuple[str, ...] = ()
 
     @property
     def upload_count(self) -> int:
         """Return the number of uploads in the operation queue."""
 
-        return sum(isinstance(item, UploadOperation) for item in self.operations)
+        regular = sum(isinstance(item, UploadOperation) for item in self.operations)
+        if self.hybrid is None:
+            return regular
+        hybrid_files = sum(
+            isinstance(item, HybridRootFileUpload) for item in self.hybrid.operations
+        )
+        mirrored_files = sum(
+            item.file_count
+            for item in self.hybrid.operations
+            if isinstance(item, HybridDirectoryMirror)
+        )
+        return regular + hybrid_files + mirrored_files
 
     @property
     def delete_count(self) -> int:
         """Return the number of deletes in the operation queue."""
 
-        return sum(isinstance(item, DeleteOperation) for item in self.operations)
+        regular = sum(isinstance(item, DeleteOperation) for item in self.operations)
+        if self.hybrid is None:
+            return regular
+        return regular + sum(
+            isinstance(item, (HybridRootFileDelete, HybridDirectoryDelete))
+            for item in self.hybrid.operations
+        )
+
+    @property
+    def adoption_count(self) -> int:
+        """Return the number of existing paths explicitly adopted by ``--full``."""
+
+        if self.hybrid is None:
+            return 0
+        return sum(isinstance(item, HybridAdoption) for item in self.hybrid.operations)
+
+    @property
+    def operation_count(self) -> int:
+        """Return reviewed remote mutations excluding display-only Adoption rows."""
+
+        hybrid_count = 0
+        if self.hybrid is not None:
+            hybrid_count = sum(
+                not isinstance(item, HybridAdoption) for item in self.hybrid.operations
+            )
+        return len(self.operations) + hybrid_count
+
+    @property
+    def has_remote_work(self) -> bool:
+        """Return whether deployment must connect, mutate, or run commands."""
+
+        local_hybrid_work = bool(
+            self.hybrid
+            and not self.hybrid.remote_complete
+            and (
+                self.hybrid.local.directories
+                or any(
+                    self.full
+                    or self.hybrid.previous_outputs.get(item.name) != item.entry
+                    for item in self.hybrid.local.root_files
+                )
+            )
+        )
+        return bool(
+            self.operations
+            or local_hybrid_work
+            or (
+                self.hybrid
+                and self.hybrid.operations
+            )
+        )
 
 
 def create_plan(
@@ -98,7 +241,10 @@ def create_plan(
     effective_full = full or state is None
     if state is not None and state.target_fingerprint != target_fingerprint and not full:
         raise PlanError("target identity changed since the last success; review it and rerun with --full")
-    current_outputs = scan_outputs(config.outputs)
+    incremental_outputs = tuple(output for output in config.outputs if output.mode == "incremental")
+    hybrid_output = next((output for output in config.outputs if output.mode == "hybrid"), None)
+    current_outputs = scan_outputs(incremental_outputs)
+    hybrid_local = scan_hybrid_output(hybrid_output) if hybrid_output is not None else None
     entries = {entry.path: entry for entry in repository.list_head_entries()}
     source_owned = {path for path in entries if is_source_managed(path, config.source)}
     overlap = sorted(source_owned.intersection(current_outputs))
@@ -106,6 +252,18 @@ def create_plan(
         preview = ", ".join(overlap[:5])
         suffix = " ..." if len(overlap) > 5 else ""
         raise PlanError(f"source/output ownership conflict: {preview}{suffix}")
+    if hybrid_local is not None:
+        previous_incremental = {
+            path
+            for path in (state.outputs if state is not None else {})
+            if _delete_removed_for(path, incremental_outputs)
+        }
+        _validate_hybrid_conflicts(
+            config,
+            hybrid_local,
+            source_owned,
+            set(current_outputs) | previous_incremental,
+        )
     source_operations = _plan_source(repository, config, state, head, effective_full, entries)
     if resolved_target.protocol == "ftp":
         executable_paths = [
@@ -118,9 +276,11 @@ def create_plan(
                 "FTP cannot guarantee executable mode for source path(s): "
                 + ", ".join(executable_paths[:5])
             )
-    output_operations = _plan_outputs(config.outputs, current_outputs, state, effective_full)
+    output_operations = _plan_outputs(incremental_outputs, current_outputs, state, effective_full)
     operations = _merge_operations((*source_operations, *output_operations), config)
     manifest = {path: item.entry for path, item in current_outputs.items()}
+    if hybrid_local is not None:
+        manifest.update({item.name: item.entry for item in hybrid_local.root_files})
     return DeploymentPlan(
         target=resolved_target,
         target_fingerprint=target_fingerprint,
@@ -129,7 +289,126 @@ def create_plan(
         operations=operations,
         output_manifest=manifest,
         full=effective_full,
+        allow_adoption=full,
+        hybrid=(
+            HybridPlan(hybrid_local, dict(state.outputs) if state is not None else {})
+            if hybrid_local is not None
+            else None
+        ),
+        non_hybrid_owned=tuple(sorted((*source_owned, *current_outputs.keys()))),
     )
+
+
+def complete_remote_plan(
+    plan: DeploymentPlan,
+    config: Config,
+    transport: Transport,
+    *,
+    allow_recovery: bool,
+) -> DeploymentPlan:
+    """Merge remote ownership/adoption facts into one frozen local plan.
+
+    Args:
+        plan: Local plan whose upload bytes are already frozen.
+        config: Project identity and safety configuration.
+        transport: Connected SFTP transport used only for preflight reads, except
+            normal deployment may reconcile a prior durable Recovery Record.
+        allow_recovery: Whether interrupted recovery-owned paths may be repaired.
+
+    Returns:
+        Immutable full plan ready for confirmation or read-only display.
+    """
+
+    hybrid = plan.hybrid
+    if hybrid is None:
+        return plan
+    if config.project_id is None:
+        raise PlanError("hybrid output lacks a resolved project_id")
+    validate_internal_paths(transport)
+    records = read_recovery_records(
+        transport,
+        mapping=hybrid.local.mapping,
+        target_fingerprint=plan.target_fingerprint,
+    )
+    if len(records) > 1:
+        raise PlanError("multiple remote hybrid recovery records require manual inspection")
+    if records and not allow_recovery:
+        raise PlanError(
+            "remote hybrid recovery is pending; run a normal deployment to reconcile it"
+        )
+    for record in records:
+        reconcile_recovery(transport, record)
+    ownership = read_ownership(
+        transport,
+        project_id=config.project_id,
+        mapping=hybrid.local.mapping,
+        remote=hybrid.local.remote,
+    )
+    current_files = set(hybrid.local.root_file_names)
+    current_directories = set(hybrid.local.directory_names)
+    current = current_files | current_directories
+    old_files = set(ownership.root_files) if ownership is not None else set()
+    old_directories = set(ownership.directories) if ownership is not None else set()
+    old = old_files | old_directories
+    _reject_historical_transfer(plan, old - current)
+    types: dict[str, RemotePathType] = {}
+    adoptions: set[str] = set()
+    for name in sorted(current | old):
+        kind = transport.lstat(name)
+        if kind in {RemotePathType.SYMLINK, RemotePathType.OTHER}:
+            raise PlanError(f"hybrid-owned remote path has unsupported type {kind.value}: {name}")
+        types[name] = kind
+        if name in current and name not in old and kind is not RemotePathType.MISSING:
+            if not plan.allow_adoption:
+                raise PlanError(
+                    f"remote path {name!r} exists but is not owned by hybrid output "
+                    f"{hybrid.local.mapping!r}; review it and rerun with --full to adopt it"
+                )
+            adoptions.add(name)
+    operations: list[HybridOperation] = []
+    for item in hybrid.local.root_files:
+        previous = hybrid.previous_outputs.get(item.name)
+        if (
+            plan.full
+            or previous != item.entry
+            or types[item.name] is not RemotePathType.FILE
+            or item.name in adoptions
+        ):
+            operations.append(
+                HybridRootFileUpload(
+                    item.name,
+                    item.local_path,
+                    item.entry.sha256,
+                    item.entry.size,
+                )
+            )
+    for item in hybrid.local.directories:
+        operations.append(
+            HybridDirectoryMirror(
+                item.name,
+                item.file_count,
+                item.total_size,
+                item.name in adoptions,
+            )
+        )
+    operations.extend(HybridRootFileDelete(name) for name in sorted(old_files - current))
+    operations.extend(
+        HybridDirectoryDelete(name) for name in sorted(old_directories - current)
+    )
+    operations.extend(HybridAdoption(name) for name in sorted(adoptions))
+    ownership_changed = ownership is None or (
+        ownership.directories != hybrid.local.directory_names
+        or ownership.root_files != hybrid.local.root_file_names
+    )
+    if operations or plan.operations or ownership_changed:
+        operations.append(HybridOwnershipUpdate(hybrid.local.mapping))
+    completed = replace(
+        hybrid,
+        ownership=ownership,
+        operations=tuple(operations),
+        remote_complete=True,
+    )
+    return replace(plan, hybrid=completed)
 
 
 def render_plan(plan: DeploymentPlan) -> str:
@@ -151,14 +430,50 @@ def render_plan(plan: DeploymentPlan) -> str:
     for operation in plan.operations:
         action = "UPLOAD" if isinstance(operation, UploadOperation) else "DELETE"
         lines.append(f"{action:6} [{operation.origin}] {operation.remote_path}")
-    if plan.operations:
+    if plan.hybrid is not None:
+        lines.extend(render_hybrid_plan(plan.hybrid))
+    if plan.has_remote_work:
         lines.extend(f"AFTER  {command}" for command in plan.target.after_deploy)
-    command_count = len(plan.target.after_deploy) if plan.operations else 0
+    command_count = len(plan.target.after_deploy) if plan.has_remote_work else 0
     lines.append(
         f"Summary: {plan.upload_count} upload(s), {plan.delete_count} delete(s), "
-        f"{command_count} after-deploy command(s)"
+        f"{plan.adoption_count} adoption(s), {command_count} after-deploy command(s)"
     )
     return "\n".join(lines)
+
+
+def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
+    """Render local Hybrid facts or the completed remote ownership plan."""
+
+    lines = [f"HYBRID Mapping: {hybrid.local.mapping} -> {hybrid.local.remote}"]
+    if not hybrid.remote_complete:
+        for item in hybrid.local.root_files:
+            lines.append(f"LOCAL   [hybrid-file] {item.name} ({item.entry.size} byte(s))")
+        for item in hybrid.local.directories:
+            lines.append(
+                f"LOCAL   [hybrid-mirror] {item.name}/ "
+                f"({item.file_count} file(s), {item.total_size} byte(s))"
+            )
+        lines.append("REMOTE  [hybrid-owner] not read; use --remote-plan for full ownership plan")
+        return tuple(lines)
+    for operation in hybrid.operations:
+        if isinstance(operation, HybridRootFileUpload):
+            lines.append(f"UPLOAD [hybrid-file] {operation.path}")
+        elif isinstance(operation, HybridRootFileDelete):
+            lines.append(f"DELETE [hybrid-owner] {operation.path}")
+        elif isinstance(operation, HybridDirectoryMirror):
+            suffix = " ADOPT" if operation.adopt else ""
+            lines.append(
+                f"MIRROR [hybrid-directory] {operation.name}/ "
+                f"({operation.file_count} file(s), {operation.total_size} byte(s)){suffix}"
+            )
+        elif isinstance(operation, HybridDirectoryDelete):
+            lines.append(f"DELETE [hybrid-owner] {operation.name}/")
+        elif isinstance(operation, HybridAdoption):
+            lines.append(f"ADOPT  [hybrid-owner] {operation.path}")
+        else:
+            lines.append(f"OWNERSHIP UPDATE [hybrid-owner] {operation.mapping}")
+    return tuple(lines)
 
 
 def _plan_source(
@@ -280,6 +595,69 @@ def _merge_operations(operations: tuple[Operation, ...], config: Config) -> tupl
             key=lambda item: (0 if isinstance(item, UploadOperation) else 1, item.remote_path),
         )
     )
+
+
+def _validate_hybrid_conflicts(
+    config: Config,
+    local: HybridLocalManifest,
+    source_owned: set[str],
+    incremental_paths: set[str],
+) -> None:
+    """Reject every local ownership overlap before a remote connection.
+
+    Args:
+        config: Source protection policy and output mappings.
+        local: Current Hybrid direct-child ownership proposal.
+        source_owned: Current committed Source paths.
+        incremental_paths: Current Incremental Output paths.
+
+    Returns:
+        ``None`` only when Hybrid ownership is disjoint and unprotected.
+    """
+
+    owned = set(local.names)
+    protected = sorted(name for name in owned if is_protected(name, config.source))
+    if protected:
+        raise PlanError(
+            "hybrid output cannot own protected direct path(s): " + ", ".join(protected)
+        )
+    source_conflicts = sorted(
+        path for path in source_owned if PurePosixPath(path).parts[0] in owned
+    )
+    if source_conflicts:
+        raise PlanError(
+            "source/hybrid ownership conflict: " + ", ".join(source_conflicts[:5])
+        )
+    output_conflicts = sorted(
+        path for path in incremental_paths if PurePosixPath(path).parts[0] in owned
+    )
+    if output_conflicts:
+        raise PlanError(
+            "incremental/hybrid ownership conflict: " + ", ".join(output_conflicts[:5])
+        )
+
+
+def _reject_historical_transfer(plan: DeploymentPlan, historical: set[str]) -> None:
+    """Reject implicit ownership transfer from Hybrid to Source/Incremental.
+
+    Args:
+        plan: Local plan retaining every current non-Hybrid owned path.
+        historical: Remotely owned names absent from current Hybrid local output.
+
+    Returns:
+        ``None`` only when no other local owner has claimed the historical prefix.
+    """
+
+    conflicts = sorted(
+        path
+        for path in plan.non_hybrid_owned
+        if PurePosixPath(path).parts and PurePosixPath(path).parts[0] in historical
+    )
+    if conflicts:
+        raise PlanError(
+            "hybrid ownership cannot transfer automatically to another mapping: "
+            + ", ".join(conflicts[:5])
+        )
 
 
 def _require_regular_git_entry(entry: GitEntry) -> None:

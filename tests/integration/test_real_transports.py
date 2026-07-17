@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import shutil
 import socket
 import subprocess
 import threading
@@ -16,9 +17,11 @@ from pyftpdlib.servers import FTPServer
 
 from git_deploy.config import TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.deployer import execute_plan
+from git_deploy.errors import DeployError, PlanError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from git_deploy.planner import create_plan
+from git_deploy.prepared import execute_prepared, prepare_project, prepare_remote_plan
 from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.sftp import SFTPTransport
 from tests.conftest import commit_all, write_config
@@ -377,3 +380,269 @@ retry_delay = 0
     assert _docker(
         "exec", container, "wc", "-l", "/srv/application/native-e2e/command.log"
     ) == "1 /srv/application/native-e2e/command.log"
+
+
+def _create_hybrid_local_view(root: Path) -> None:
+    """Create one ignored aggregation root with files, mirrors, and an empty directory."""
+
+    info_exclude = root / ".git/info/exclude"
+    info_exclude.write_text(
+        info_exclude.read_text(encoding="utf-8") + ".deploy/\n",
+        encoding="utf-8",
+    )
+    hybrid = root / ".deploy/frontend-root"
+    (hybrid / "assets").mkdir(parents=True)
+    (hybrid / "old-assets").mkdir()
+    (hybrid / "fonts").mkdir()
+    (hybrid / "index.html").write_text("hybrid index\n", encoding="utf-8")
+    (hybrid / "assets/app.js").write_text("hybrid app\n", encoding="utf-8")
+    (hybrid / "old-assets/old.js").write_text("old bundle\n", encoding="utf-8")
+
+
+def _deploy_hybrid(root: Path, *, full: bool = False) -> None:
+    """Run the complete local-freeze, remote-plan, Hybrid execution pipeline."""
+
+    prepared = prepare_project("hybrid", root / "deploy.toml", None, full=full, skip_build=True)
+    try:
+        prepare_remote_plan(prepared, allow_recovery=True)
+        execute_prepared(prepared)
+    finally:
+        prepared.close()
+
+
+def test_real_paramiko_hybrid_preserves_unknown_and_recovers_ownership_without_state(
+    git_project: Path,
+    sftp_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paramiko Hybrid mirrors directories and deletes only remotely owned direct children."""
+
+    container, port, known_hosts = sftp_server
+    monkeypatch.setenv("TEST_SFTP_PASSWORD", "test-only-password")
+    _create_hybrid_local_view(git_project)
+    write_config(
+        git_project,
+        f'''
+project_id = "github.com/acme/paramiko-hybrid"
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "sftp"
+host = "127.0.0.1"
+port = {port}
+username = "deploy"
+password_env = "TEST_SFTP_PASSWORD"
+known_hosts_file = "{known_hosts}"
+use_ssh_agent = false
+remote_root = "/srv/application/hybrid-paramiko"
+''',
+    )
+    _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "mkdir -p /srv/application/hybrid-paramiko/manual-backup && "
+        "mkdir -p /srv/application/hybrid-paramiko/assets && "
+        "printf legacy > /srv/application/hybrid-paramiko/assets/legacy.js && "
+        "printf backend > /srv/application/hybrid-paramiko/index.php && "
+        "printf secret > /srv/application/hybrid-paramiko/.env && "
+        "printf unknown > /srv/application/hybrid-paramiko/manual-backup/item && "
+        "chown -R deploy:deploy /srv/application/hybrid-paramiko",
+    )
+
+    blocked = prepare_project(
+        "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
+    )
+    try:
+        with pytest.raises(PlanError, match="--full to adopt"):
+            prepare_remote_plan(blocked, allow_recovery=True)
+    finally:
+        blocked.close()
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-paramiko/assets/legacy.js"
+    ) == "legacy"
+
+    _deploy_hybrid(git_project, full=True)
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-paramiko/assets/app.js"
+    ) == "hybrid app"
+    assert _docker(
+        "exec",
+        container,
+        "test",
+        "!",
+        "-e",
+        "/srv/application/hybrid-paramiko/assets/legacy.js",
+    ) == ""
+    assert _docker(
+        "exec", container, "test", "-d", "/srv/application/hybrid-paramiko/fonts"
+    ) == ""
+    assert _docker(
+        "exec",
+        container,
+        "stat",
+        "-c",
+        "%a",
+        "/srv/application/hybrid-paramiko/.git-deploy",
+    ) == "700"
+
+    store = StateStore(GitRepository(git_project).common_dir())
+    store.path_for("dev").unlink()
+    _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "printf orphan > /srv/application/hybrid-paramiko/assets/orphan.js",
+    )
+    hybrid = git_project / ".deploy/frontend-root"
+    shutil.rmtree(hybrid / "old-assets")
+    (hybrid / "index.html").unlink()
+    (hybrid / "index10.css").write_text("new css\n", encoding="utf-8")
+    interrupted = prepare_project(
+        "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
+    )
+    try:
+        prepare_remote_plan(interrupted, allow_recovery=True)
+        assert interrupted.transport is not None
+        original_rename = interrupted.transport.rename_path
+        failed = False
+
+        def fail_first_stage_publish(source: str, destination: str) -> None:
+            """Interrupt the first real Stage publish after Backup is durable."""
+
+            nonlocal failed
+            if not failed and ".git-deploy/stage/" in source and destination == "assets":
+                failed = True
+                raise DeployError("synthetic real-transport swap interruption")
+            original_rename(source, destination)
+
+        monkeypatch.setattr(interrupted.transport, "rename_path", fail_first_stage_publish)
+        with pytest.raises(DeployError, match="swap interruption"):
+            execute_prepared(interrupted)
+    finally:
+        interrupted.close()
+    assert _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "test -n \"$(find /srv/application/hybrid-paramiko/.git-deploy/recovery "
+        "-type f -print -quit)\"",
+    ) == ""
+
+    _deploy_hybrid(git_project)
+
+    for unknown, content in (("index.php", "backend"), (".env", "secret"), ("manual-backup/item", "unknown")):
+        assert _docker(
+            "exec", container, "cat", f"/srv/application/hybrid-paramiko/{unknown}"
+        ) == content
+    assert _docker(
+        "exec", container, "test", "!", "-e", "/srv/application/hybrid-paramiko/assets/orphan.js"
+    ) == ""
+    assert _docker(
+        "exec", container, "test", "!", "-e", "/srv/application/hybrid-paramiko/old-assets"
+    ) == ""
+    assert _docker(
+        "exec", container, "test", "!", "-e", "/srv/application/hybrid-paramiko/index.html"
+    ) == ""
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-paramiko/index10.css"
+    ) == "new css"
+    assert _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "test -z \"$(find /srv/application/hybrid-paramiko/.git-deploy/stage "
+        "/srv/application/hybrid-paramiko/.git-deploy/backup "
+        "/srv/application/hybrid-paramiko/.git-deploy/recovery "
+        "-mindepth 1 -print -quit)\"",
+    ) == ""
+
+
+def test_real_native_openssh_hybrid_stage_swap_and_manifest_read(
+    git_project: Path,
+    sftp_server,
+    tmp_path: Path,
+) -> None:
+    """Native OpenSSH performs Hybrid Stage/Swap and rereads ownership through one master."""
+
+    container, port, known_hosts = sftp_server
+    key = _install_native_test_key(container, tmp_path)
+    ssh_config = tmp_path / "hybrid_ssh_config"
+    ssh_config.write_text(
+        f'''
+Host fixture-hybrid
+    HostName 127.0.0.1
+    Port {port}
+    User deploy
+    IdentityFile {key}
+    IdentitiesOnly yes
+    UserKnownHostsFile {known_hosts}
+    StrictHostKeyChecking yes
+'''.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    _create_hybrid_local_view(git_project)
+    write_config(
+        git_project,
+        f'''
+project_id = "github.com/acme/native-hybrid"
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "sftp"
+ssh_host_alias = "fixture-hybrid"
+ssh_config_file = "{ssh_config}"
+remote_root = "/srv/application/hybrid-native"
+''',
+    )
+
+    _deploy_hybrid(git_project)
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-native/assets/app.js"
+    ) == "hybrid app"
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-native/.git-deploy/hybrid/frontend-root.json",
+    ).startswith("{")
+    assert _docker(
+        "exec",
+        container,
+        "stat",
+        "-c",
+        "%a",
+        "/srv/application/hybrid-native/.git-deploy",
+    ) == "700"
+    (git_project / ".deploy/frontend-root/assets/app.js").write_text(
+        "native next\n", encoding="utf-8"
+    )
+    _deploy_hybrid(git_project)
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-native/assets/app.js"
+    ) == "native next"
+    assert _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "test -z \"$(find /srv/application/hybrid-native/.git-deploy/stage "
+        "/srv/application/hybrid-native/.git-deploy/backup "
+        "/srv/application/hybrid-native/.git-deploy/recovery "
+        "-mindepth 1 -print -quit)\"",
+    ) == ""

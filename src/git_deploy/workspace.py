@@ -16,7 +16,7 @@ from git_deploy.errors import ConfigError, PlanError
 from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
-from git_deploy.planner import UploadOperation
+from git_deploy.planner import UploadOperation, render_hybrid_plan
 from git_deploy.prepared import PreparedDeployment, execute_prepared, prepare_project
 from git_deploy.transports import create_transport
 from git_deploy.transports.openssh_sftp import OpenSSHMaster, SSHConnectionPool
@@ -210,16 +210,22 @@ def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...])
             f"  Commit: {item.plan.previous_commit or '<first deployment>'} -> "
             f"{item.plan.head}"
         )
-        if not item.plan.operations:
+        if not item.plan.operations and item.plan.hybrid is None:
             lines.append("  No changes")
         else:
             for operation in item.plan.operations:
                 action = "UPLOAD" if isinstance(operation, UploadOperation) else "DELETE"
                 lines.append(f"  {action:6} [{operation.origin}] {operation.remote_path}")
+        if item.plan.hybrid is not None:
+            lines.extend(f"  {line}" for line in render_hybrid_plan(item.plan.hybrid))
+        if item.plan.has_remote_work:
             lines.extend(f"  AFTER  {command}" for command in item.plan.target.after_deploy)
-        command_count = len(item.plan.target.after_deploy) if item.plan.operations else 0
+        command_count = (
+            len(item.plan.target.after_deploy) if item.plan.has_remote_work else 0
+        )
         lines.append(
             f"  Summary: {item.plan.upload_count} upload(s), {item.plan.delete_count} delete(s), "
+            f"{item.plan.adoption_count} adoption(s), "
             f"{command_count} after-deploy command(s)"
         )
         uploads += item.plan.upload_count
@@ -241,10 +247,12 @@ def execute_workspace(
     *,
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
+    connection_pool: SSHConnectionPool | None = None,
 ) -> tuple[str, ...]:
     """Deploy repositories sequentially, sharing Native OpenSSH connections."""
 
-    pool = SSHConnectionPool()
+    pool = connection_pool or SSHConnectionPool()
+    owns_pool = connection_pool is None
     completed: list[str] = []
     try:
         for item in prepared:
@@ -260,7 +268,8 @@ def execute_workspace(
     finally:
         for item in prepared:
             item.close()
-        pool.close_all()
+        if owns_pool:
+            pool.close_all()
 
 
 def run_workspace_build(workspace: WorkspaceConfig, requested_target: str | None) -> None:

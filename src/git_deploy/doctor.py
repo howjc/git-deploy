@@ -7,9 +7,15 @@ import shutil
 from dataclasses import dataclass
 from git_deploy.config import Config, TargetConfig, resolve_target_for_plan
 from git_deploy.git import GitRepository
+from git_deploy.hybrid import (
+    HybridLocalManifest,
+    read_ownership,
+    read_recovery_records,
+    scan_hybrid_output,
+)
 from git_deploy.manifest import StateStore
 from git_deploy.transports import create_transport
-from git_deploy.transports.base import Transport
+from git_deploy.transports.base import RemotePathType, Transport
 from git_deploy.transports.openssh_sftp import OpenSSHSFTPTransport
 
 
@@ -82,6 +88,41 @@ def run_doctor(
             "paths valid" if not missing_outputs else "not built yet: " + ", ".join(missing_outputs),
         )
     )
+    hybrid_output = next((item for item in config.outputs if item.mode == "hybrid"), None)
+    if hybrid_output is not None:
+        results.append(
+            DoctorResult(
+                "hybrid project id",
+                config.project_id is not None,
+                config.project_id or "missing",
+            )
+        )
+        try:
+            ignored = repository.is_ignored(hybrid_output.local)
+            ignore_detail = "ignored" if ignored else "add '.deploy/' to .gitignore"
+        except Exception as exc:
+            ignored = False
+            ignore_detail = str(exc)
+        results.append(
+            DoctorResult(
+                "hybrid git ignore",
+                ignored,
+                ignore_detail,
+            )
+        )
+        try:
+            local_hybrid = scan_hybrid_output(hybrid_output)
+            results.append(
+                DoctorResult(
+                    "hybrid local root",
+                    True,
+                    f"{len(local_hybrid.root_files)} root file(s), "
+                    f"{len(local_hybrid.directories)} mirror directory(s)",
+                )
+            )
+        except Exception as exc:
+            local_hybrid = None
+            results.append(DoctorResult("hybrid local root", False, str(exc)))
     try:
         state = state_store.load(target.name)
         results.append(
@@ -146,12 +187,115 @@ def run_doctor(
                 ),
             )
         )
+        if exists and hybrid_output is not None and config.project_id is not None:
+            _append_hybrid_remote_results(
+                results,
+                transport,
+                resolved_target,
+                config.project_id,
+                hybrid_output.name or "<missing>",
+                local_hybrid,
+            )
     except Exception as exc:
         results.append(DoctorResult("target", False, str(exc)))
     finally:
         if "transport" in locals():
             transport.close()
     return tuple(results)
+
+
+def _append_hybrid_remote_results(
+    results: list[DoctorResult],
+    transport: Transport,
+    target: TargetConfig,
+    project_id: str,
+    mapping: str,
+    local_hybrid: HybridLocalManifest | None,
+) -> None:
+    """Append read-only Ownership, Recovery, and owned-path diagnostics.
+
+    Args:
+        results: Mutable ordered doctor result list.
+        transport: Connected SFTP adapter.
+        target: Frozen physical target.
+        project_id: Expected credential-free project identity.
+        mapping: Hybrid mapping name.
+        local_hybrid: Optional successfully scanned local Hybrid manifest.
+
+    Returns:
+        ``None`` after diagnostics; callers own connection cleanup.
+    """
+
+    try:
+        internal_type = transport.lstat(".git-deploy")
+        internal_ok = internal_type in {RemotePathType.MISSING, RemotePathType.DIRECTORY}
+        if internal_type is RemotePathType.DIRECTORY:
+            transport.list_directory(".git-deploy")
+        results.append(
+            DoctorResult(
+                "hybrid internal directory",
+                internal_ok,
+                "absent (created on first deploy)"
+                if internal_type is RemotePathType.MISSING
+                else f"{internal_type.value}; readable",
+            )
+        )
+        if not internal_ok:
+            return
+        records = read_recovery_records(
+            transport,
+            mapping=mapping,
+            target_fingerprint=target.fingerprint,
+        )
+        results.append(
+            DoctorResult(
+                "hybrid recovery",
+                not records,
+                "none" if not records else f"pending: {len(records)} record(s)",
+            )
+        )
+        ownership = read_ownership(
+            transport,
+            project_id=project_id,
+            mapping=mapping,
+            remote=".",
+        )
+        results.append(
+            DoctorResult(
+                "hybrid ownership",
+                True,
+                "first deployment" if ownership is None else ownership.last_commit,
+            )
+        )
+        if local_hybrid is None:
+            return
+        owned = set(ownership.directories if ownership else ()) | set(
+            ownership.root_files if ownership else ()
+        )
+        unsafe: list[str] = []
+        adoption: list[str] = []
+        for name in sorted(owned | set(local_hybrid.names)):
+            kind = transport.lstat(name)
+            if kind in {RemotePathType.SYMLINK, RemotePathType.OTHER}:
+                unsafe.append(f"{name} ({kind.value})")
+            if name in local_hybrid.names and name not in owned and kind is not RemotePathType.MISSING:
+                adoption.append(name)
+        results.append(
+            DoctorResult(
+                "hybrid owned path types",
+                not unsafe,
+                "safe" if not unsafe else ", ".join(unsafe),
+            )
+        )
+        results.append(
+            DoctorResult(
+                "hybrid adoption",
+                not adoption,
+                "not required" if not adoption else "--full required: " + ", ".join(adoption),
+            )
+        )
+    except Exception as exc:
+        results.append(DoctorResult("hybrid remote", False, str(exc)))
 
 
 def _missing_build_commands(config: Config) -> tuple[str, ...]:

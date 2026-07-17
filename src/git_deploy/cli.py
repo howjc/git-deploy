@@ -16,7 +16,8 @@ from git_deploy.git import GitRepository
 from git_deploy.initializer import initialize_project
 from git_deploy.manifest import StateStore
 from git_deploy.planner import DeploymentPlan, render_plan
-from git_deploy.prepared import execute_prepared, prepare_project
+from git_deploy.prepared import execute_prepared, prepare_project, prepare_remote_plan
+from git_deploy.transports.openssh_sftp import SSHConnectionPool
 from git_deploy.workspace import (
     WorkspaceConfig,
     execute_workspace,
@@ -39,9 +40,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("action", nargs="?", help="target name, 'build', 'doctor', or 'init'")
     parser.add_argument("doctor_target", nargs="?", help="optional target for doctor/workspace build")
-    parser.add_argument("--dry-run", action="store_true", help="build and print the plan without connecting")
+    planning = parser.add_mutually_exclusive_group()
+    planning.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="build and print the local plan without connecting",
+    )
+    planning.add_argument(
+        "--remote-plan",
+        action="store_true",
+        help="read remote ownership and print the full plan without writing",
+    )
     parser.add_argument("--skip-build", action="store_true", help="skip configured build steps")
-    parser.add_argument("--full", action="store_true", help="upload all managed local content and rebuild state")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="upload all managed content, rebuild state, and allow reviewed Hybrid adoption",
+    )
     parser.add_argument("--yes", action="store_true", help="deploy without interactive confirmation")
     parser.add_argument("--config", type=Path, help="path to one project's deploy.toml")
     parser.add_argument("--workspace", type=Path, help="path to deploy.workspace.toml")
@@ -199,11 +214,19 @@ def _deploy_project(
         skip_build=args.skip_build,
     )
     try:
+        if not args.dry_run and (args.remote_plan or prepared.plan.hybrid is not None):
+            prepare_remote_plan(prepared, allow_recovery=not args.remote_plan)
         print(render_plan(prepared.plan))
         if args.dry_run:
             print("Dry-run complete: no remote connection and no state change.")
             return 0
-        if prepared.plan.operations and not args.yes:
+        if args.remote_plan:
+            print(
+                "Remote plan complete: no upload, delete, command, remote manifest, "
+                "or local state write."
+            )
+            return 0
+        if prepared.plan.has_remote_work and not args.yes:
             _confirm(prepared.plan)
         execute_prepared(prepared, verbose=args.verbose)
         print(
@@ -240,18 +263,45 @@ def _deploy_workspace(
         full=args.full,
         skip_build=args.skip_build,
     )
+    pool = SSHConnectionPool()
     try:
+        if not args.dry_run and (
+            args.remote_plan or any(item.plan.hybrid is not None for item in prepared)
+        ):
+            for item in prepared:
+                if args.remote_plan or item.plan.hybrid is not None:
+                    prepare_remote_plan(
+                        item,
+                        allow_recovery=not args.remote_plan,
+                        connection_pool=pool,
+                    )
         print(render_workspace_plan(target, prepared))
         if args.dry_run:
             print("Workspace dry-run complete: no remote connection and no state change.")
             return 0
-        operation_count = sum(len(item.plan.operations) for item in prepared)
+        if args.remote_plan:
+            print(
+                "Workspace remote plan complete: no remote or local state mutation."
+            )
+            return 0
+        operation_count = sum(item.plan.operation_count for item in prepared)
+        adoption_count = sum(item.plan.adoption_count for item in prepared)
         command_count = sum(
-            len(item.plan.target.after_deploy) for item in prepared if item.plan.operations
+            len(item.plan.target.after_deploy) for item in prepared if item.plan.has_remote_work
         )
         if operation_count and not args.yes:
-            _confirm_workspace(target, operation_count, command_count, len(prepared))
-        completed = execute_workspace(prepared, verbose=args.verbose)
+            _confirm_workspace(
+                target,
+                operation_count,
+                adoption_count,
+                command_count,
+                len(prepared),
+            )
+        completed = execute_workspace(
+            prepared,
+            verbose=args.verbose,
+            connection_pool=pool,
+        )
         uploads = sum(item.plan.upload_count for item in prepared)
         deletes = sum(item.plan.delete_count for item in prepared)
         print(
@@ -262,6 +312,7 @@ def _deploy_workspace(
     finally:
         for item in prepared:
             item.close()
+        pool.close_all()
 
 
 def _doctor(
@@ -312,10 +363,10 @@ def _confirm(plan: DeploymentPlan) -> None:
 
     if not sys.stdin.isatty():
         raise ConfigError("deployment requires --yes when stdin is not interactive")
-    commands = len(plan.target.after_deploy) if plan.operations else 0
+    commands = len(plan.target.after_deploy) if plan.has_remote_work else 0
     answer = input(
-        f"Deploy {len(plan.operations)} file operation(s) and {commands} after-deploy "
-        f"command(s) to {plan.target.name}? [y/N] "
+        f"Deploy {plan.operation_count} operation(s), {plan.adoption_count} adoption(s), "
+        f"and {commands} after-deploy command(s) to {plan.target.name}? [y/N] "
     )
     if answer.strip().lower() not in {"y", "yes"}:
         raise ConfigError("deployment cancelled")
@@ -324,6 +375,7 @@ def _confirm(plan: DeploymentPlan) -> None:
 def _confirm_workspace(
     target: str,
     operations: int,
+    adoptions: int,
     commands: int,
     repositories: int,
 ) -> None:
@@ -332,7 +384,8 @@ def _confirm_workspace(
     if not sys.stdin.isatty():
         raise ConfigError("deployment requires --yes when stdin is not interactive")
     answer = input(
-        f"Deploy {operations} file operation(s) and {commands} after-deploy command(s) "
+        f"Deploy {operations} operation(s), {adoptions} adoption(s), and "
+        f"{commands} after-deploy command(s) "
         f"across {repositories} repositories to {target}? [y/N] "
     )
     if answer.strip().lower() not in {"y", "yes"}:
@@ -344,14 +397,21 @@ def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> Non
 
     if args.doctor_target is not None and not allow_target:
         raise ConfigError("build does not accept a target")
-    if args.dry_run or args.skip_build or args.full or args.yes or args.create_root:
+    if (
+        args.dry_run
+        or args.remote_plan
+        or args.skip_build
+        or args.full
+        or args.yes
+        or args.create_root
+    ):
         raise ConfigError("build does not accept deploy-only flags")
 
 
 def _validate_doctor_args(args: argparse.Namespace) -> None:
     """Reject deploy-only options accidentally passed to doctor."""
 
-    if args.dry_run or args.skip_build or args.full or args.yes:
+    if args.dry_run or args.remote_plan or args.skip_build or args.full or args.yes:
         raise ConfigError("doctor does not accept deploy-only flags")
 
 
@@ -360,7 +420,15 @@ def _validate_init_args(args: argparse.Namespace) -> None:
 
     if args.doctor_target is not None:
         raise ConfigError("init does not accept a target")
-    if args.dry_run or args.skip_build or args.full or args.yes or args.verbose or args.create_root:
+    if (
+        args.dry_run
+        or args.remote_plan
+        or args.skip_build
+        or args.full
+        or args.yes
+        or args.verbose
+        or args.create_root
+    ):
         raise ConfigError("init does not accept deploy or doctor flags")
 
 

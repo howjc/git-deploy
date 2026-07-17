@@ -6,6 +6,7 @@ import errno
 import os
 import posixpath
 import shlex
+import stat
 import sys
 import time
 import uuid
@@ -16,7 +17,7 @@ import paramiko
 
 from git_deploy.config import TargetConfig, resolve_ssh_target
 from git_deploy.errors import ConfigError, DeployError
-from git_deploy.transports.base import ProgressCallback, Transport
+from git_deploy.transports.base import ProgressCallback, RemotePathType, Transport
 
 
 class SFTPTransport(Transport):
@@ -179,6 +180,136 @@ class SFTPTransport(Transport):
         if status != 0:
             raise DeployError(f"remote command failed with exit={status}: {command}")
 
+    def lstat(self, remote_path: str) -> RemotePathType:
+        """Classify one relative path without following a remote symlink.
+
+        Args:
+            remote_path: Safe relative path below ``remote_root``.
+
+        Returns:
+            Confirmed remote path type or absence.
+        """
+
+        try:
+            mode = self._require_sftp().lstat(self._absolute(remote_path)).st_mode
+        except OSError as exc:
+            if getattr(exc, "errno", None) in {errno.ENOENT, 2}:
+                return RemotePathType.MISSING
+            raise DeployError(f"cannot inspect remote path {remote_path}: {exc}") from exc
+        if mode is None:
+            return RemotePathType.OTHER
+        if stat.S_ISLNK(mode):
+            return RemotePathType.SYMLINK
+        if stat.S_ISREG(mode):
+            return RemotePathType.FILE
+        if stat.S_ISDIR(mode):
+            return RemotePathType.DIRECTORY
+        return RemotePathType.OTHER
+
+    def read_file(self, remote_path: str, *, max_bytes: int) -> bytes:
+        """Read one bounded regular remote file without following symlinks.
+
+        Args:
+            remote_path: Safe relative metadata path.
+            max_bytes: Maximum accepted byte count.
+
+        Returns:
+            Exact remote bytes.
+        """
+
+        if self.lstat(remote_path) is not RemotePathType.FILE:
+            raise DeployError(f"remote metadata path is not a regular file: {remote_path}")
+        absolute = self._absolute(remote_path)
+        try:
+            attributes = self._require_sftp().lstat(absolute)
+            if attributes.st_size is None or attributes.st_size > max_bytes:
+                raise DeployError(f"remote metadata file exceeds {max_bytes} bytes: {remote_path}")
+            with self._require_sftp().open(absolute, "rb") as handle:
+                data = handle.read(max_bytes + 1)
+        except DeployError:
+            raise
+        except OSError as exc:
+            raise DeployError(f"cannot read remote metadata {remote_path}: {exc}") from exc
+        if len(data) > max_bytes:
+            raise DeployError(f"remote metadata file exceeds {max_bytes} bytes: {remote_path}")
+        return bytes(data)
+
+    def write_file_atomic(self, remote_path: str, data: bytes) -> None:
+        """Publish small metadata bytes through a chmodded temporary file."""
+
+        sftp = self._require_sftp()
+        target = self._absolute(remote_path)
+        self._mkdirs(posixpath.dirname(target))
+        temporary = f"{target}.git-deploy-{uuid.uuid4().hex}.tmp"
+        try:
+            with sftp.open(temporary, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+            sftp.chmod(temporary, 0o644)
+            self._publish_temporary(temporary, target)
+        except Exception as exc:
+            try:
+                sftp.remove(temporary)
+            except Exception:
+                pass
+            if isinstance(exc, DeployError):
+                raise
+            raise DeployError(f"cannot publish remote metadata {remote_path}: {exc}") from exc
+
+    def list_directory(self, remote_path: str) -> tuple[str, ...]:
+        """List direct child names for one verified remote directory."""
+
+        path_type = self.lstat(remote_path)
+        if path_type is RemotePathType.MISSING:
+            return ()
+        if path_type is not RemotePathType.DIRECTORY:
+            raise DeployError(f"remote path is not a directory: {remote_path}")
+        try:
+            return tuple(sorted(self._require_sftp().listdir(self._absolute(remote_path))))
+        except OSError as exc:
+            raise DeployError(f"cannot list remote directory {remote_path}: {exc}") from exc
+
+    def make_directory(self, remote_path: str, *, mode: int = 0o755) -> None:
+        """Create a safe relative remote directory recursively."""
+
+        absolute = self._absolute(remote_path)
+        self._mkdirs(absolute, mode=mode)
+        try:
+            self._require_sftp().chmod(absolute, mode)
+        except OSError as exc:
+            raise DeployError(f"cannot chmod remote directory {remote_path}: {exc}") from exc
+
+    def rename_path(self, source: str, destination: str) -> None:
+        """Rename one remote path while refusing implicit destination overwrite."""
+
+        if self.lstat(destination) is not RemotePathType.MISSING:
+            raise DeployError(f"remote rename destination already exists: {destination}")
+        try:
+            self._require_sftp().rename(self._absolute(source), self._absolute(destination))
+        except OSError as exc:
+            raise DeployError(f"cannot rename remote path {source} to {destination}: {exc}") from exc
+
+    def remove_tree(self, remote_path: str) -> None:
+        """Remove one remote tree recursively without following symlinks."""
+
+        kind = self.lstat(remote_path)
+        if kind is RemotePathType.MISSING:
+            return
+        absolute = self._absolute(remote_path)
+        try:
+            if kind is RemotePathType.DIRECTORY:
+                for name in self.list_directory(remote_path):
+                    self.remove_tree((PurePosixPath(remote_path) / name).as_posix())
+                self._require_sftp().rmdir(absolute)
+            elif kind in {RemotePathType.FILE, RemotePathType.SYMLINK}:
+                self._require_sftp().remove(absolute)
+            else:
+                raise DeployError(f"refusing to remove unsupported remote type: {remote_path}")
+        except DeployError:
+            raise
+        except OSError as exc:
+            raise DeployError(f"cannot remove remote tree {remote_path}: {exc}") from exc
+
     def close(self) -> None:
         """Close SFTP then SSH resources, tolerating partial connection."""
 
@@ -225,7 +356,7 @@ class SFTPTransport(Transport):
             except OSError:
                 pass
 
-    def _mkdirs(self, absolute: str) -> None:
+    def _mkdirs(self, absolute: str, *, mode: int = 0o755) -> None:
         """Create every missing directory component without changing existing ones."""
 
         sftp = self._require_sftp()
@@ -238,7 +369,7 @@ class SFTPTransport(Transport):
                 if getattr(exc, "errno", None) not in {errno.ENOENT, 2}:
                     raise DeployError(f"cannot inspect SFTP directory {current}: {exc}") from exc
                 try:
-                    sftp.mkdir(current)
+                    sftp.mkdir(current, mode=mode)
                 except OSError as mkdir_exc:
                     raise DeployError(f"cannot create SFTP directory {current}: {mkdir_exc}") from mkdir_exc
 
