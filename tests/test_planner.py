@@ -11,7 +11,7 @@ from git_deploy.config import load_config
 from git_deploy.errors import PlanError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import ManifestEntry, TargetState
-from git_deploy.planner import DeleteOperation, UploadOperation, create_plan
+from git_deploy.planner import DeleteOperation, UploadOperation, create_plan, render_plan
 from tests.conftest import commit_all, write_config
 
 
@@ -31,6 +31,32 @@ def test_first_plan_uploads_all_managed_source_and_outputs(git_project: Path) ->
         (UploadOperation, "app.py"),
         (UploadOperation, "public/dist/asset.js"),
     ]
+
+
+def test_plan_freezes_and_renders_reviewed_after_deploy_commands(git_project: Path) -> None:
+    """The confirmation surface includes commands frozen into the resolved target."""
+
+    config = load_config(
+        write_config(
+            git_project,
+            """
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+after_deploy = ["restart-app", "check-app"]
+""",
+        )
+    )
+
+    plan = create_plan(config, config.target(None), GitRepository(git_project), None, full=False)
+    rendered = render_plan(plan)
+
+    assert plan.target.after_deploy == ("restart-app", "check-app")
+    assert "AFTER  restart-app" in rendered
+    assert "AFTER  check-app" in rendered
+    assert "2 after-deploy command(s)" in rendered
 
 
 def test_incremental_source_and_output_changes(git_project: Path) -> None:

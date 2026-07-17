@@ -151,7 +151,13 @@ def render_plan(plan: DeploymentPlan) -> str:
     for operation in plan.operations:
         action = "UPLOAD" if isinstance(operation, UploadOperation) else "DELETE"
         lines.append(f"{action:6} [{operation.origin}] {operation.remote_path}")
-    lines.append(f"Summary: {plan.upload_count} upload(s), {plan.delete_count} delete(s)")
+    if plan.operations:
+        lines.extend(f"AFTER  {command}" for command in plan.target.after_deploy)
+    command_count = len(plan.target.after_deploy) if plan.operations else 0
+    lines.append(
+        f"Summary: {plan.upload_count} upload(s), {plan.delete_count} delete(s), "
+        f"{command_count} after-deploy command(s)"
+    )
     return "\n".join(lines)
 
 

@@ -53,6 +53,105 @@ remote_root = "/public_html"
         load_config(path)
 
 
+def test_sftp_after_deploy_commands_and_timeout_are_frozen(git_project: Path) -> None:
+    """Validated commands preserve reviewed shell text and bounded timeout policy."""
+
+    path = write_config(
+        git_project,
+        """
+[targets.prod]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app with spaces"
+after_deploy = ["printf ' ready '", "sudo -n systemctl restart app.service"]
+command_timeout = 45
+""",
+    )
+
+    target = load_config(path).target("prod")
+
+    assert target.after_deploy == (
+        "printf ' ready '",
+        "sudo -n systemctl restart app.service",
+    )
+    assert target.command_timeout == 45.0
+
+
+@pytest.mark.parametrize("field", ["after_deploy = []", "command_timeout = 30"])
+def test_ftp_rejects_remote_command_settings(git_project: Path, field: str) -> None:
+    """FTP cannot accept SSH execution settings, even when a command list is empty."""
+
+    path = write_config(
+        git_project,
+        f"""
+[targets.prod]
+protocol = "ftp"
+host = "host"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public"
+{field}
+""",
+    )
+
+    with pytest.raises(ConfigError, match="SFTP-only"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ('[""]', "non-empty"),
+        ('["bad\\ncommand"]', "newline"),
+        ('["bad\\u0000command"]', "NUL"),
+        ("[" + ",".join('"true"' for _ in range(17)) + "]", "at most 16"),
+        ('["' + "x" * 4097 + '"]', "at most 4096"),
+    ],
+)
+def test_after_deploy_rejects_unsafe_or_unbounded_commands(
+    git_project: Path,
+    value: str,
+    message: str,
+) -> None:
+    """Remote command configuration remains one-line, bounded, and reviewable."""
+
+    path = write_config(
+        git_project,
+        f"""
+[targets.prod]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+after_deploy = {value}
+""",
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "false", '"slow"'])
+def test_command_timeout_must_be_positive(git_project: Path, value: str) -> None:
+    """Invalid command deadlines fail during local configuration loading."""
+
+    path = write_config(
+        git_project,
+        f"""
+[targets.prod]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+command_timeout = {value}
+""",
+    )
+
+    with pytest.raises(ConfigError, match="command_timeout"):
+        load_config(path)
+
+
 def test_rejects_output_path_escape(git_project: Path) -> None:
     """Output scanning cannot be configured outside the project root."""
 

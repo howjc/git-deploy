@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from git_deploy.errors import DeployError
 
 ProgressCallback = Callable[[int, int | None], None]
 
@@ -62,6 +64,26 @@ class Transport(ABC):
         """
 
         self.close()
+
+    def run_command(
+        self,
+        command: str,
+        *,
+        cwd: PurePosixPath,
+        timeout: float | None,
+    ) -> None:
+        """Run one non-interactive remote command when the backend supports it.
+
+        Args:
+            command: Trusted, validated one-line shell command.
+            cwd: Absolute remote working directory.
+            timeout: Optional whole-command timeout in seconds.
+
+        Returns:
+            ``None`` after a zero exit status.
+        """
+
+        raise DeployError("remote commands are not supported by this transport")
 
     def __enter__(self) -> Transport:
         """Connect and return this transport as a context manager."""

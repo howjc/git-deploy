@@ -47,6 +47,36 @@ def test_dry_run_never_calls_deployer(
     assert not (git_project / ".git/git-deploy/dev.json").exists()
 
 
+def test_dry_run_reviews_after_deploy_without_remote_execution(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Dry-run prints the command but never reaches the stateful executor."""
+
+    path = write_config(
+        git_project,
+        """
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+after_deploy = ["sudo -n systemctl restart app.service"]
+""",
+    )
+
+    def forbidden(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        """Reject any dry-run remote execution."""
+
+        raise AssertionError("dry-run executed remote commands")
+
+    monkeypatch.setattr(cli, "execute_prepared", forbidden)
+
+    assert cli.main(["--config", str(path), "--dry-run", "--skip-build"]) == 0
+    assert "AFTER  sudo -n systemctl restart app.service" in capsys.readouterr().out
+
+
 def test_build_failure_prevents_deployer_call(
     git_project: Path,
     monkeypatch: pytest.MonkeyPatch,

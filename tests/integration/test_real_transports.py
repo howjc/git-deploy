@@ -133,12 +133,20 @@ def test_real_sftp_upload_replace_and_idempotent_delete(
             lambda done, total: None,
             executable=True,
         )
+        transport.run_command(
+            "printf command-ok > command.txt",
+            cwd=PurePosixPath("/srv/application"),
+            timeout=5,
+        )
         assert _docker(
             "exec", container, "cat", "/srv/application/nested/app.txt"
         ) == "two"
         assert _docker(
             "exec", container, "stat", "-c", "%a", "/srv/application/nested/script.sh"
         ) == "755"
+        assert _docker(
+            "exec", container, "cat", "/srv/application/command.txt"
+        ) == "command-ok"
         transport.delete("nested/app.txt")
         transport.delete("nested/app.txt")
     finally:
@@ -227,6 +235,8 @@ password_env = "TEST_SFTP_PASSWORD"
 known_hosts_file = "{known_hosts}"
 use_ssh_agent = false
 remote_root = "/srv/application/e2e"
+after_deploy = ["echo paramiko-command-ok >> command.log"]
+command_timeout = 5
 
 [deploy]
 retries = 2
@@ -236,11 +246,13 @@ retry_delay = 0
 
     assert _deploy_project(git_project) == 1
     assert _docker("exec", container, "cat", "/srv/application/e2e/app.py") == "print('v1')"
+    assert _docker("exec", container, "wc", "-l", "/srv/application/e2e/command.log") == "1 /srv/application/e2e/command.log"
 
     (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
     commit_all(git_project, "SFTP daily change")
     assert _deploy_project(git_project) == 1
     assert _docker("exec", container, "cat", "/srv/application/e2e/app.py") == "print('v2')"
+    assert _docker("exec", container, "wc", "-l", "/srv/application/e2e/command.log") == "2 /srv/application/e2e/command.log"
 
 
 def test_complete_planner_deployer_state_cycle_over_real_ftp(
@@ -345,6 +357,8 @@ protocol = "sftp"
 ssh_host_alias = "fixture-proxy-target"
 ssh_config_file = "{ssh_config}"
 remote_root = "/srv/application/native-e2e"
+after_deploy = ["echo native-command-ok >> command.log"]
+command_timeout = 5
 
 [deploy]
 retries = 2
@@ -356,4 +370,10 @@ retry_delay = 0
     assert _docker(
         "exec", container, "cat", "/srv/application/native-e2e/app.py"
     ) == "print('v1')"
+    assert _docker(
+        "exec", container, "wc", "-l", "/srv/application/native-e2e/command.log"
+    ) == "1 /srv/application/native-e2e/command.log"
     assert _deploy_project(git_project) == 0
+    assert _docker(
+        "exec", container, "wc", "-l", "/srv/application/native-e2e/command.log"
+    ) == "1 /srv/application/native-e2e/command.log"

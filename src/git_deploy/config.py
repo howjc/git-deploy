@@ -13,6 +13,8 @@ from git_deploy.errors import ConfigError
 
 Protocol = Literal["sftp", "ftp"]
 RESERVED_TARGET_NAMES = frozenset({"build", "doctor", "init"})
+MAX_AFTER_DEPLOY_COMMANDS = 16
+MAX_AFTER_DEPLOY_COMMAND_LENGTH = 4096
 
 DEFAULT_EXCLUDE = (
     ".git/**",
@@ -82,6 +84,8 @@ class TargetConfig:
     strict_host_key_checking: bool = True
     passive: bool = True
     timeout: float = 15.0
+    after_deploy: tuple[str, ...] = ()
+    command_timeout: float | None = 120.0
     ssh_resolved: bool = False
     resolved_key_files: tuple[str, ...] = ()
     runtime_dir: Path | None = None
@@ -559,6 +563,8 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
                 "strict_host_key_checking",
                 "passive",
                 "timeout",
+                "after_deploy",
+                "command_timeout",
             },
             f"targets.{name}",
         )
@@ -581,6 +587,23 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
         timeout = item.get("timeout", 15)
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
             raise ConfigError(f"targets.{name}.timeout must be positive")
+        after_deploy = _command_tuple(
+            item.get("after_deploy", []),
+            f"targets.{name}.after_deploy",
+        )
+        command_timeout_raw = item.get("command_timeout", 120)
+        if command_timeout_raw is None:
+            command_timeout = None
+        elif (
+            isinstance(command_timeout_raw, (int, float))
+            and not isinstance(command_timeout_raw, bool)
+            and command_timeout_raw > 0
+        ):
+            command_timeout = float(command_timeout_raw)
+        else:
+            raise ConfigError(
+                f"targets.{name}.command_timeout must be a positive number or null"
+            )
         password_env = _optional_string(item.get("password_env"), f"targets.{name}.password_env")
         if protocol == "ftp" and not password_env:
             raise ConfigError(f"targets.{name}.password_env is required for FTP")
@@ -631,6 +654,8 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
                 "key_file",
                 "use_ssh_agent",
                 "strict_host_key_checking",
+                "after_deploy",
+                "command_timeout",
             )
         ):
             raise ConfigError(f"targets.{name} contains SFTP-only settings for an FTP target")
@@ -652,6 +677,8 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
             strict_host_key_checking=strict,
             passive=passive,
             timeout=float(timeout),
+            after_deploy=after_deploy,
+            command_timeout=command_timeout,
         )
     return targets
 
@@ -695,6 +722,36 @@ def _string_tuple(value: Any, name: str, *, allow_empty: bool = True) -> tuple[s
     if not allow_empty and not result:
         raise ConfigError(f"{name} must not be empty")
     return result
+
+
+def _command_tuple(value: Any, name: str) -> tuple[str, ...]:
+    """Validate bounded one-line remote commands without changing their bytes.
+
+    Args:
+        value: Raw TOML array configured for one SFTP target.
+        name: Fully qualified field name used in diagnostics.
+
+    Returns:
+        Immutable commands preserving intentional spaces and shell syntax.
+    """
+
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ConfigError(f"{name} must be an array of strings")
+    if len(value) > MAX_AFTER_DEPLOY_COMMANDS:
+        raise ConfigError(f"{name} supports at most {MAX_AFTER_DEPLOY_COMMANDS} commands")
+    commands: list[str] = []
+    for index, command in enumerate(cast(list[str], value)):
+        field = f"{name}[{index}]"
+        if not command.strip():
+            raise ConfigError(f"{field} must be a non-empty string")
+        if any(character in command for character in ("\x00", "\r", "\n")):
+            raise ConfigError(f"{field} must not contain NUL or newline characters")
+        if len(command) > MAX_AFTER_DEPLOY_COMMAND_LENGTH:
+            raise ConfigError(
+                f"{field} must be at most {MAX_AFTER_DEPLOY_COMMAND_LENGTH} characters"
+            )
+        commands.append(command)
+    return tuple(commands)
 
 
 def _required_string(value: Any, name: str) -> str:

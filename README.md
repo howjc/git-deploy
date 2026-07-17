@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.2.2/git_deploy-1.2.2-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.3.0/git_deploy-1.3.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -62,6 +62,12 @@ delete_removed = true
 protocol = "sftp"
 ssh_host_alias = "project-dev"
 remote_root = "/srv/project-dev"
+after_deploy = [
+  "php artisan optimize:clear",
+  "sudo -n /usr/bin/systemctl restart application.service",
+  "sudo -n /usr/bin/systemctl is-active --quiet application.service"
+]
+command_timeout = 120
 
 [targets.prod]
 protocol = "ftp"
@@ -76,7 +82,7 @@ retries = 3
 retry_delay = 2
 ```
 
-相对路径以 `deploy.toml` 所在目录（即项目根目录）解析。`build.steps` 是可信配置，会直接在当前 Shell 环境中执行，不是沙箱。
+相对路径以 `deploy.toml` 所在目录（即项目根目录）解析。`build.steps` 和 `after_deploy` 都是可信配置，会分别在本地与远端 Shell 中执行，不是沙箱；不要把密码、Token 或私钥写进命令。
 
 以下保护规则始终生效，不能被配置移除：`.env`、`.env.*`、`uploads/**`、`runtime/**`、`storage/cert/**`、`**/*.key`、`**/*.pem`。默认也排除 `.git/**`、`node_modules/**` 和 `storage/logs/**`。
 
@@ -87,12 +93,28 @@ retry_delay = 2
 - 使用临时 ControlMaster，多文件只建立一次认证连接；
 - 连接前复核 Alias，并将已审阅的 HostName、User、Port 固定到实际 OpenSSH 命令；
 - `timeout` 只生成 OpenSSH `ConnectTimeout`，不会中断 1Password 授权或完整文件传输；
+- 文件同步和 `after_deploy` 复用同一条 ControlMaster，不会再次触发生物认证；
 - 不读取私钥、不管理 Agent Socket、不启用 Agent Forwarding；
 - 只调用当前环境的 POSIX `ssh`/`sftp`，不会回退 Windows `ssh.exe`。
 
 Alias Target 只配置 `ssh_host_alias`、可选 `ssh_config_file` 和 `remote_root`；不要混入 `host`、`username`、`port`、`key_file` 或 `password_env`。只配置 `host`/`username` 的 SFTP Target 继续使用 Paramiko，支持 `key_file`、`password_env`、`known_hosts_file` 和 SSH Agent。
 
-FTP 必须通过 `password_env` 读取密码，不接受 TOML 明文密码。v1-lite 不支持 FTPS、远端命令、owner/group 或远端健康检查。
+FTP 必须通过 `password_env` 读取密码，不接受 TOML 明文密码，也不支持 `after_deploy`。v1-lite 不支持 FTPS、owner/group 或远端健康检查。
+
+## After-deploy 命令
+
+SFTP Target 可配置最多 16 条单行 `after_deploy` 命令。它们在文件上传/删除全部成功后，按声明顺序在 `remote_root` 下执行，全部成功后才提交 State。Single Plan 与 Workspace Combined Plan 都会显示完整命令，`--dry-run` 只供审阅，不会连接远端。
+
+命令默认 `command_timeout = 120` 秒、无 PTY、无 stdin，也不会自动重试；应使用非交互命令并尽量保持幂等。任一命令非零退出或超时会停止后续命令并保留旧 State，重新运行部署会再次同步文件和执行命令。没有文件变化时不会连接，也不会执行 `after_deploy`。
+
+需要 sudo 时使用 `sudo -n`，并在服务器上配置精确的 `NOPASSWD` allowlist，例如：
+
+```sudoers
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart application.service
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl is-active application.service
+```
+
+不要配置 `NOPASSWD: ALL`。本功能不提供 before/on-failure hook、自动回滚、命令重试、交互 Shell、Secret 插值、Workspace 全局命令或通用远程任务系统。
 
 ## 使用
 
@@ -158,7 +180,7 @@ git-deploy build
 git-deploy build prod  # 可选：只校验每仓都存在 prod 这个名称
 ```
 
-部署前会先完成所有仓库的 Target 校验、Build、Plan 和上传字节冻结；任一 Prepare 失败时不会建立远端连接。全部成功后显示 Combined Plan，只确认一次，并按配置顺序部署。相同 Native OpenSSH Endpoint 会共用当前命令生命周期内的一条 ControlMaster。
+部署前会先完成所有仓库的 Target 校验、Build、Plan 和上传字节冻结；任一 Prepare 失败时不会建立远端连接。全部成功后显示包含文件操作与各仓 `after_deploy` 的 Combined Plan，只确认一次，并按“仓库文件 → 仓库命令 → 仓库 State”的顺序部署。相同 Native OpenSSH Endpoint 会共用当前命令生命周期内的一条 ControlMaster。
 
 Workspace 的独立 `build` 命令是纯本地操作：只加载各仓配置并顺序执行 Build，不解析 SSH Alias、不要求 `ssh`/`sftp`、不检查 Git 或远端 Root 所有权。显式附带 Target 时只检查该名称是否在每仓配置中存在。
 
@@ -197,7 +219,7 @@ outputs 在构建后扫描并计算 SHA256。只有上次 state 已记录、当�
 .git/git-deploy/<target>.lock
 ```
 
-只有所有上传和删除成功后才原子更新 state。中途失败会保留旧 state；重新执行同一条 `git-deploy` 即可覆盖已完成文件并继续收敛。
+只有所有上传、删除和 `after_deploy` 命令成功后才原子更新 state。中途失败会保留旧 state；重新执行同一条 `git-deploy` 即可覆盖已完成文件并继续收敛。
 
 ## 安全边界
 
@@ -207,7 +229,7 @@ outputs 在构建后扫描并计算 SHA256。只有上次 state 已记录、当�
 - SFTP 先上传临时文件再替换；兼容回退先备份旧目标，替换失败会恢复旧文件。
 - Git `100755` 文件通过 SFTP 发布为 `0755`；FTP 无法保证可执行位，因此会在连接前拒绝。
 - FTP 只承诺二进制上传、目录创建和幂等文件操作，不声称原子替换或 POSIX 权限语义；同一连接会缓存完整父目录列表，批量删除不会为每个文件重复 `NLST`。
-- 本工具只同步文件；数据库、消息队列、缓存刷新、进程重启和服务器备份不在职责内。
+- `after_deploy` 只执行用户审阅的 SFTP Target 命令；工具不识别数据库 Migration、不抽象服务管理器，也不提供服务器备份或通用运维编排。
 
 ## 故障恢复
 
@@ -240,7 +262,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.2.2-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.3.0-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

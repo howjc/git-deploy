@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -114,6 +115,7 @@ def execute_frozen_plan(
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
+        _execute_after_deploy(plan, transport, verbose=verbose)
     except DeployError:
         raise
     except Exception as exc:
@@ -123,6 +125,49 @@ def execute_frozen_plan(
     state_store.save(
         new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
     )
+
+
+def _execute_after_deploy(
+    plan: DeploymentPlan,
+    transport: Transport,
+    *,
+    verbose: bool,
+) -> None:
+    """Run reviewed commands once, without retry, before committing State.
+
+    Args:
+        plan: Frozen plan containing validated commands and working directory.
+        transport: Still-connected SFTP transport used for file operations.
+        verbose: Whether to print non-secret execution context.
+
+    Returns:
+        ``None`` only after every configured command exits successfully.
+    """
+
+    commands = plan.target.after_deploy
+    for index, command in enumerate(commands, start=1):
+        marker = f"[{index}/{len(commands)}]"
+        print(f"REMOTE {marker} {command}", flush=True)
+        if verbose:
+            endpoint = (
+                f"{plan.target.username or ''}@{plan.target.host or plan.target.ssh_host_alias}:"
+                f"{plan.target.port}"
+            )
+            print(
+                f"REMOTE CONTEXT {marker} endpoint={endpoint} "
+                f"cwd={plan.target.remote_root} timeout={plan.target.command_timeout}",
+                flush=True,
+            )
+        try:
+            transport.run_command(
+                command,
+                cwd=plan.target.remote_root,
+                timeout=plan.target.command_timeout,
+            )
+        except Exception as exc:
+            print(f"REMOTE FAILED {marker} {exc}", file=sys.stderr, flush=True)
+            raise
+        print(f"REMOTE OK {marker}", flush=True)
 
 
 def _connect_with_retry(transport: Transport, *, attempts: int, delay: float) -> None:

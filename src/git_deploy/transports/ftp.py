@@ -43,11 +43,13 @@ class FTPTransport(Transport):
         self.target = target
         self.ftp: ftplib.FTP | None = None
         self._directory_entries: dict[str, set[str]] = {}
+        self._missing_directories: set[str] = set()
 
     def connect(self) -> None:
         """Connect and authenticate with a password from the environment."""
 
         self._directory_entries.clear()
+        self._missing_directories.clear()
         if not self.target.password_env:
             raise DeployError("FTP target is missing password_env")
         password = os.environ.get(self.target.password_env)
@@ -72,20 +74,16 @@ class FTPTransport(Transport):
         self._mkdirs(self.target.remote_root.as_posix())
 
     def root_exists(self) -> bool:
-        """Check the configured FTP root without creating it."""
+        """Check the configured FTP root using the shared three-state probe."""
 
-        ftp = self._require_ftp()
-        try:
-            original = ftp.pwd()
-            ftp.cwd(self.target.remote_root.as_posix())
-            ftp.cwd(original)
+        probe = self._probe_directory(self.target.remote_root.as_posix())
+        if probe.result is FTPPathProbeResult.EXISTS:
             return True
-        except ftplib.error_perm as exc:
-            if str(exc).startswith("550"):
-                return False
-            raise DeployError(f"cannot inspect FTP root {self.target.remote_root}: {exc}") from exc
-        except ftplib.Error as exc:
-            raise DeployError(f"cannot inspect FTP root {self.target.remote_root}: {exc}") from exc
+        if probe.result is FTPPathProbeResult.MISSING:
+            return False
+        raise DeployError(
+            f"cannot inspect FTP root {self.target.remote_root}: {probe.error or 'unknown error'}"
+        )
 
     def upload(
         self,
@@ -164,6 +162,7 @@ class FTPTransport(Transport):
         """Quit cleanly when possible, otherwise close the socket."""
 
         self._directory_entries.clear()
+        self._missing_directories.clear()
         if self.ftp is None:
             return
         try:
@@ -188,6 +187,7 @@ class FTPTransport(Transport):
                 parent = PurePosixPath(current).parent.as_posix()
                 self._cache_add(parent, PurePosixPath(current).name)
                 self._directory_entries[current] = set()
+                self._missing_directories.discard(current)
             except ftplib.error_perm as exc:
                 if not str(exc).startswith("550"):
                     raise DeployError(f"cannot create FTP directory {current}: {exc}") from exc
@@ -195,6 +195,7 @@ class FTPTransport(Transport):
                     original = ftp.pwd()
                     ftp.cwd(current)
                     ftp.cwd(original)
+                    self._missing_directories.discard(current)
                 except ftplib.Error as inspect_exc:
                     raise DeployError(f"FTP directory is unavailable {current}: {inspect_exc}") from inspect_exc
 
@@ -211,6 +212,8 @@ class FTPTransport(Transport):
         cached = self._directory_entries.get(absolute)
         if cached is not None:
             return FTPDirectoryProbe(FTPPathProbeResult.EXISTS, frozenset(cached))
+        if absolute in self._missing_directories:
+            return FTPDirectoryProbe(FTPPathProbeResult.MISSING)
         ftp = self._require_ftp()
         try:
             entries = {
@@ -219,10 +222,14 @@ class FTPTransport(Transport):
                 if entry.rstrip("/")
             }
         except ftplib.error_perm as exc:
-            return self._recover_failed_listing(absolute, exc)
+            recovered = self._recover_failed_listing(absolute, exc)
+            if recovered.result is FTPPathProbeResult.MISSING:
+                self._missing_directories.add(absolute)
+            return recovered
         except ftplib.Error as exc:
             return FTPDirectoryProbe(FTPPathProbeResult.ERROR, error=str(exc))
         self._directory_entries[absolute] = entries
+        self._missing_directories.discard(absolute)
         return FTPDirectoryProbe(FTPPathProbeResult.EXISTS, frozenset(entries))
 
     def _recover_failed_listing(
@@ -266,6 +273,7 @@ class FTPTransport(Transport):
         # Several servers report 550 for NLST on an empty directory. Successful
         # CWD proves the parent exists, so the requested child is already absent.
         self._directory_entries[absolute] = set()
+        self._missing_directories.discard(absolute)
         return FTPDirectoryProbe(FTPPathProbeResult.EXISTS)
 
     def _cache_add(self, parent: str, name: str) -> None:

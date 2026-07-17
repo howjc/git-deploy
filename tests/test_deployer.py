@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -19,7 +19,12 @@ from tests.conftest import commit_all, write_config
 class FakeTransport(Transport):
     """Record remote mutations and optionally fail uploads."""
 
-    def __init__(self, failures: int = 0, connect_failures: int = 0) -> None:
+    def __init__(
+        self,
+        failures: int = 0,
+        connect_failures: int = 0,
+        command_failure: int | None = None,
+    ) -> None:
         """Create a fake with requested upload and initial-connect failures."""
 
         self.failures = failures
@@ -28,6 +33,8 @@ class FakeTransport(Transport):
         self.closed = 0
         self.files: dict[str, bytes] = {}
         self.deletes: list[str] = []
+        self.commands: list[tuple[str, PurePosixPath, float | None]] = []
+        self.command_failure = command_failure
 
     def connect(self) -> None:
         """Record one connection."""
@@ -67,6 +74,20 @@ class FakeTransport(Transport):
 
         self.files.pop(remote_path, None)
         self.deletes.append(remote_path)
+
+    def run_command(
+        self,
+        command: str,
+        *,
+        cwd: PurePosixPath,
+        timeout: float | None,
+    ) -> None:
+        """Record non-retried remote commands and fail one selected call."""
+
+        assert self.closed == 0
+        self.commands.append((command, cwd, timeout))
+        if self.command_failure == len(self.commands):
+            raise DeployError("remote command failed with exit=7")
 
     def close(self) -> None:
         """Record resource cleanup."""
@@ -226,6 +247,85 @@ def test_empty_plan_advances_commit_without_connecting(git_project: Path) -> Non
     execute_plan(no_change, config, repository, store, transport_factory=lambda target: transport)
 
     assert transport.connects == 0
+
+
+def test_after_deploy_runs_after_files_before_state_and_stops_on_failure(
+    git_project: Path,
+) -> None:
+    """Command failure retains old State, stops the list, and reruns the whole plan."""
+
+    config = load_config(
+        write_config(
+            git_project,
+            """
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+after_deploy = ["first", "second", "third"]
+command_timeout = 9
+
+[deploy]
+retries = 3
+retry_delay = 0
+""",
+        )
+    )
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    target = config.target(None)
+    old = TargetState(1, "dev", target.fingerprint, repository.head(), 1, {})
+    store.save(old)
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    commit_all(git_project, "command deployment change")
+    plan = create_plan(config, target, repository, old, full=False)
+    failed = FakeTransport(command_failure=2)
+
+    with pytest.raises(DeployError, match="exit=7"):
+        execute_plan(plan, config, repository, store, transport_factory=lambda target: failed)
+
+    assert failed.files["app.py"] == b"print('v2')\n"
+    assert [item[0] for item in failed.commands] == ["first", "second"]
+    assert failed.commands[0][1:] == (PurePosixPath("/srv/app"), 9.0)
+    assert failed.closed == 1
+    assert store.load("dev") == old
+
+    resumed = FakeTransport()
+    execute_plan(plan, config, repository, store, transport_factory=lambda target: resumed)
+
+    assert [item[0] for item in resumed.commands] == ["first", "second", "third"]
+    assert resumed.files["app.py"] == b"print('v2')\n"
+    assert store.load("dev") != old
+
+
+def test_noop_does_not_connect_or_run_after_deploy(git_project: Path) -> None:
+    """Command hooks do not turn an unchanged deployment into a service restart."""
+
+    config = load_config(
+        write_config(
+            git_project,
+            """
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+after_deploy = ["restart-app"]
+""",
+        )
+    )
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    first = create_plan(config, config.target(None), repository, None, full=False)
+    execute_plan(first, config, repository, store, transport_factory=lambda target: FakeTransport())
+    noop = create_plan(config, config.target(None), repository, store.load("dev"), full=False)
+    transport = FakeTransport()
+
+    execute_plan(noop, config, repository, store, transport_factory=lambda target: transport)
+
+    assert transport.connects == 0
+    assert transport.commands == []
 
 
 def test_output_change_before_connect_fails_without_remote_or_state(git_project: Path) -> None:

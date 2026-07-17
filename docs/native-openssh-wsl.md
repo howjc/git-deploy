@@ -44,6 +44,11 @@ Host project-prod
 protocol = "sftp"
 ssh_host_alias = "project-prod"
 remote_root = "/www/wwwroot/project"
+after_deploy = [
+  "sudo -n /usr/bin/systemctl restart application.service",
+  "sudo -n /usr/bin/systemctl is-active --quiet application.service"
+]
+command_timeout = 120
 ```
 
 如果使用非默认配置文件，可增加 `ssh_config_file = "~/.ssh/project-config"`。Alias Target 不允许混用 Paramiko 的 `host`、`username`、`port`、`password_env`、`key_file`、`known_hosts_file`、`use_ssh_agent` 或 `strict_host_key_checking`。
@@ -64,10 +69,13 @@ git-deploy prod --yes
 3. 多文件上传不重复认证；
 4. State 只在全部文件成功后提交；
 5. 第二次无变化部署不连接、不触发生物认证。
+6. 文件同步和 `after_deploy` 共用一条 Master，只触发一次 Windows Hello；命令输出直接显示，State 在命令成功后提交。
 
 `--yes` 只跳过 git-deploy 自己的确认，不设置 `BatchMode=yes`，因此不会禁用 Agent 或生物认证交互。
 
 连接前会重新执行 `ssh -G` 比较 HostName、User 和 Port，并在真实命令中固定已审阅的值；确认期间 Alias 发生变化会要求重新规划。Target `timeout` 作为 OpenSSH `ConnectTimeout`，不会作为 1Password/Windows Hello 授权或完整 SFTP Batch 的 Python 进程超时。
+
+`after_deploy` 默认在 `remote_root` 下以无 PTY、无 stdin 的 SSH Exec 执行，超时由 `command_timeout` 控制且失败不自动重试。需要 sudo 时只使用 `sudo -n`，并为部署账号配置精确到可执行文件和参数的 `NOPASSWD` allowlist；不要授予 `NOPASSWD: ALL`，也不要把凭据放进命令文本。
 
 ## 多仓人工验收
 
@@ -77,7 +85,7 @@ Workspace 内多个仓库使用同一 Alias 时执行：
 git-deploy prod --yes
 ```
 
-确认只建立一个 ControlMaster、只授权一次，然后按配置顺序部署。若 api 成功、web 失败，则后续仓库不执行；重跑后 api 为 No-op，web 继续并最终收敛。
+确认只建立一个 ControlMaster、只授权一次，然后按配置顺序执行每仓文件、命令和 State。若 api 成功、web 命令失败，则后续仓库不执行；重跑后 api 为 No-op，web 重新同步并执行命令后继续收敛。
 
 Workspace 会在首个 Build 前解析全部物理 Endpoint，并拒绝同一 Endpoint 上相同或嵌套的 Remote Root。失效的共享 Master 会从命令级 Pool 驱逐，文件重试会建立新 Master。
 
@@ -97,4 +105,5 @@ Workspace 会在首个 Build 前解析全部物理 Endpoint，并拒绝同一 En
 - common-dir 路径可用时 Socket 存放在 `<git-common-dir>/git-deploy/ssh/`；过长时使用 `/tmp/git-deploy-<uid>/<hash>/`，所有目录均为 `0700`；
 - 不输出 Agent Socket、私钥、密码、1Password Item URI 或 Windows 用户信息；
 - 不自动设置 `ForwardAgent yes`；
+- 不提供交互 Shell、Secret 插值或远程命令自动重试；
 - Windows Hello/1Password 属于用户现有 SSH 环境，自动测试使用隔离临时密钥，不触碰真实 Vault。

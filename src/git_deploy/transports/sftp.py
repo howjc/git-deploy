@@ -5,8 +5,12 @@ from __future__ import annotations
 import errno
 import os
 import posixpath
+import shlex
+import sys
+import time
 import uuid
 from pathlib import Path, PurePosixPath
+from typing import TextIO
 
 import paramiko
 
@@ -130,6 +134,51 @@ class SFTPTransport(Transport):
                 return
             raise DeployError(f"SFTP delete failed for {remote_path}: {exc}") from exc
 
+    def run_command(
+        self,
+        command: str,
+        *,
+        cwd: PurePosixPath,
+        timeout: float | None,
+    ) -> None:
+        """Run one non-interactive SSH command and stream both output channels.
+
+        Args:
+            command: Validated one-line shell command.
+            cwd: Absolute remote working directory.
+            timeout: Optional whole-command timeout in seconds.
+
+        Returns:
+            ``None`` after a zero remote exit status.
+        """
+
+        client = self._require_client()
+        wrapped = f"cd -- {shlex.quote(cwd.as_posix())} && {command}"
+        stdin = stdout = stderr = channel = None
+        try:
+            stdin, stdout, stderr = client.exec_command(
+                wrapped,
+                timeout=timeout,
+                get_pty=False,
+            )
+            channel = stdout.channel
+            stdin.close()
+            status = _stream_command_channel(channel, timeout)
+        except DeployError:
+            raise
+        except Exception as exc:
+            raise DeployError(f"remote command execution failed: {exc}") from exc
+        finally:
+            if stdin is not None:
+                stdin.close()
+            for stream in (stdout, stderr):
+                if stream is not None:
+                    stream.close()
+            if channel is not None:
+                channel.close()
+        if status != 0:
+            raise DeployError(f"remote command failed with exit={status}: {command}")
+
     def close(self) -> None:
         """Close SFTP then SSH resources, tolerating partial connection."""
 
@@ -207,6 +256,70 @@ class SFTPTransport(Transport):
         if self.sftp is None:
             raise DeployError("SFTP transport is not connected")
         return self.sftp
+
+    def _require_client(self) -> paramiko.SSHClient:
+        """Return the active SSH client or fail clearly."""
+
+        if self.client is None:
+            raise DeployError("SFTP transport is not connected")
+        return self.client
+
+
+def _stream_command_channel(channel: paramiko.Channel, timeout: float | None) -> int:
+    """Drain Paramiko stdout/stderr live and return the remote exit status.
+
+    Args:
+        channel: Exec channel shared by stdout and stderr file objects.
+        timeout: Optional whole-command timeout in seconds.
+
+    Returns:
+        Remote process exit status after both output streams are drained.
+    """
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        progressed = False
+        if channel.recv_ready():
+            data = channel.recv(64 * 1024)
+            if data:
+                _write_command_output(sys.stdout, data)
+                progressed = True
+        if channel.recv_stderr_ready():
+            data = channel.recv_stderr(64 * 1024)
+            if data:
+                _write_command_output(sys.stderr, data)
+                progressed = True
+        if (
+            channel.exit_status_ready()
+            and not channel.recv_ready()
+            and not channel.recv_stderr_ready()
+        ):
+            return channel.recv_exit_status()
+        if deadline is not None and time.monotonic() >= deadline:
+            channel.close()
+            raise DeployError(f"remote command timed out after {timeout} second(s)")
+        if not progressed:
+            time.sleep(0.01)
+
+
+def _write_command_output(stream: TextIO, data: bytes) -> None:
+    """Write remote bytes immediately without assuming a UTF-8 chunk boundary.
+
+    Args:
+        stream: Current stdout/stderr text stream.
+        data: Raw remote output bytes.
+
+    Returns:
+        ``None`` after flushing the current terminal stream.
+    """
+
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+        return
+    stream.write(data.decode("utf-8", errors="replace"))
+    stream.flush()
 
 
 def _resolve_ssh_settings(target: TargetConfig) -> dict[str, object]:
