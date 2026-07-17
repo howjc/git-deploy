@@ -6,17 +6,38 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from git_deploy.config import Config, TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.git import GitRepository
-from git_deploy.manifest import StateStore, hash_file, new_state
-from git_deploy.planner import DeploymentPlan, Operation, UploadOperation
+from git_deploy.hybrid import (
+    HybridRecoveryRecord,
+    RecoveryPhase,
+    make_ownership,
+    ownership_hash,
+    ownership_path,
+    recovery_path,
+    serialize_ownership,
+    write_recovery,
+)
+from git_deploy.manifest import ManifestEntry, StateStore, hash_file, new_state
+from git_deploy.planner import (
+    DeploymentPlan,
+    HybridDirectoryDelete,
+    HybridDirectoryMirror,
+    HybridOwnershipUpdate,
+    HybridRootFileDelete,
+    HybridRootFileUpload,
+    Operation,
+    UploadOperation,
+    complete_remote_plan,
+)
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
-from git_deploy.transports.base import Transport
+from git_deploy.transports.base import RemotePathType, Transport
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
 
 TransportFactory = Callable[[TargetConfig], Transport]
@@ -45,7 +66,7 @@ def execute_plan(
         ``None`` only after remote operations and state commit succeed.
     """
 
-    if not plan.operations:
+    if not plan.operations and plan.hybrid is None:
         state_store.save(
             new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
         )
@@ -72,6 +93,7 @@ def execute_frozen_plan(
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
+    prepared_transport: Transport | None = None,
 ) -> None:
     """Execute already frozen bytes and commit only this project's successful state.
 
@@ -88,24 +110,48 @@ def execute_frozen_plan(
         ``None`` after this project's remote operations and state commit succeed.
     """
 
-    if not plan.operations:
+    if not plan.operations and plan.hybrid is None:
         state_store.save(
             new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
         )
         print("No file changes; deployment state advanced to HEAD.")
         return
     progress = ProgressReporter(verbose)
-    transport = (
+    transport = prepared_transport or (
         transport_factory(plan.target)
         if transport_factory is not None
         else create_transport(plan.target, connection_pool)
     )
     try:
-        _connect_with_retry(
-            transport,
-            attempts=config.deploy.retries,
-            delay=config.deploy.retry_delay,
-        )
+        if prepared_transport is None:
+            _connect_with_retry(
+                transport,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+        else:
+            # Remote planning is read-only; root creation remains a confirmed
+            # execution mutation and therefore happens only at this point.
+            transport.ensure_root()
+        if plan.hybrid is not None and not plan.hybrid.remote_complete:
+            plan = complete_remote_plan(plan, config, transport, allow_recovery=True)
+        if plan.hybrid is not None:
+            _execute_hybrid_plan(
+                plan,
+                config,
+                state_store,
+                frozen,
+                transport,
+                progress,
+                verbose=verbose,
+            )
+            return
+        if not plan.operations:
+            state_store.save(
+                new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
+            )
+            print("No file changes; deployment state advanced to HEAD.")
+            return
         for operation in plan.operations:
             _execute_with_retry(
                 operation,
@@ -125,6 +171,226 @@ def execute_frozen_plan(
     state_store.save(
         new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
     )
+
+
+def _execute_hybrid_plan(
+    plan: DeploymentPlan,
+    config: Config,
+    state_store: StateStore,
+    frozen: dict[str, Path],
+    transport: Transport,
+    progress: ProgressReporter,
+    *,
+    verbose: bool,
+) -> None:
+    """Execute one remote-complete Hybrid Plan with durable recovery phases.
+
+    Args:
+        plan: Frozen plan containing validated remote ownership facts.
+        config: Project identity and retry policy.
+        state_store: Local State committed only after commands succeed.
+        frozen: Verified Source, Incremental, and Hybrid bytes.
+        transport: Connected SFTP adapter reused for preflight and mutation.
+        progress: Shared upload progress reporter.
+        verbose: Whether to print command execution context.
+
+    Returns:
+        ``None`` after State commit and best-effort recovery cleanup.
+    """
+
+    hybrid = plan.hybrid
+    if hybrid is None or not hybrid.remote_complete or config.project_id is None:
+        raise PlanError("hybrid deployment requires a complete remote ownership plan")
+    if not plan.has_remote_work:
+        state_store.save(
+            new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
+        )
+        print("No file changes; deployment state advanced to HEAD.")
+        return
+    for operation in plan.operations:
+        _execute_with_retry(
+            operation,
+            frozen,
+            transport,
+            progress,
+            attempts=config.deploy.retries,
+            delay=config.deploy.retry_delay,
+        )
+    previous_updated_at = hybrid.ownership.updated_at if hybrid.ownership is not None else -1
+    next_ownership = make_ownership(
+        hybrid.local,
+        config.project_id,
+        plan.head,
+        now=max(int(time.time()), previous_updated_at + 1),
+    )
+    deployment_id = uuid.uuid4().hex
+    stage_root = f".git-deploy/stage/{deployment_id}"
+    backup_root = f".git-deploy/backup/{deployment_id}"
+    mutation_names = tuple(
+        sorted(
+            {
+                (
+                    operation.path
+                    if isinstance(operation, (HybridRootFileUpload, HybridRootFileDelete))
+                    else operation.name
+                )
+                for operation in hybrid.operations
+                if isinstance(
+                    operation,
+                    (
+                        HybridRootFileUpload,
+                        HybridRootFileDelete,
+                        HybridDirectoryMirror,
+                        HybridDirectoryDelete,
+                    ),
+                )
+            }
+        )
+    )
+    old_existing_names = tuple(
+        name
+        for name in mutation_names
+        if transport.lstat(name) is not RemotePathType.MISSING
+    )
+    record = HybridRecoveryRecord(
+        1,
+        deployment_id,
+        hybrid.local.mapping,
+        plan.target_fingerprint,
+        stage_root,
+        backup_root,
+        RecoveryPhase.PREPARED,
+        ownership_hash(hybrid.ownership),
+        ownership_hash(next_ownership),
+        mutation_names,
+        old_existing_names,
+    )
+    for internal in (
+        ".git-deploy",
+        ".git-deploy/hybrid",
+        ".git-deploy/stage",
+        ".git-deploy/backup",
+        ".git-deploy/recovery",
+    ):
+        transport.make_directory(internal, mode=0o700)
+    write_recovery(transport, record)
+    for deployment_root in (stage_root, backup_root):
+        transport.make_directory(deployment_root, mode=0o700)
+    directories = {item.name: item for item in hybrid.local.directories}
+    for operation in hybrid.operations:
+        if not isinstance(operation, HybridDirectoryMirror):
+            continue
+        directory = directories[operation.name]
+        staged_directory = f"{stage_root}/{operation.name}"
+        transport.make_directory(staged_directory)
+        for relative in directory.files:
+            final_path = f"{operation.name}/{relative}"
+            staged_path = f"{staged_directory}/{relative}"
+            _upload_with_retry(
+                frozen[final_path],
+                staged_path,
+                transport,
+                progress,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+    record = record.with_phase(RecoveryPhase.STAGED)
+    write_recovery(transport, record)
+    record = record.with_phase(RecoveryPhase.SWAPPING)
+    write_recovery(transport, record)
+    for operation in hybrid.operations:
+        if isinstance(operation, HybridRootFileUpload):
+            _backup_current(transport, operation.path, backup_root)
+            _upload_with_retry(
+                frozen[operation.path],
+                operation.path,
+                transport,
+                progress,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+        elif isinstance(operation, HybridDirectoryMirror):
+            _backup_current(transport, operation.name, backup_root)
+            transport.rename_path(f"{stage_root}/{operation.name}", operation.name)
+        elif isinstance(operation, (HybridRootFileDelete, HybridDirectoryDelete)):
+            name = operation.path if isinstance(operation, HybridRootFileDelete) else operation.name
+            _backup_current(transport, name, backup_root)
+    if any(isinstance(item, HybridOwnershipUpdate) for item in hybrid.operations):
+        transport.write_file_atomic(
+            ownership_path(hybrid.local.mapping),
+            serialize_ownership(next_ownership),
+        )
+    record = record.with_phase(RecoveryPhase.OWNERSHIP_COMMITTED)
+    write_recovery(transport, record)
+    _execute_after_deploy(plan, transport, verbose=verbose)
+    record = record.with_phase(RecoveryPhase.COMMANDS_COMPLETE)
+    write_recovery(transport, record)
+    state_store.save(
+        new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
+    )
+    record = record.with_phase(RecoveryPhase.STATE_COMPLETE)
+    write_recovery(transport, record)
+    try:
+        transport.remove_tree(stage_root)
+        transport.remove_tree(backup_root)
+        record = record.with_phase(RecoveryPhase.CLEANUP_COMPLETE)
+        write_recovery(transport, record)
+        transport.remove_tree(recovery_path(deployment_id))
+    except Exception as exc:
+        print(
+            f"WARNING: hybrid cleanup is pending and will resume next deployment: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _backup_current(transport: Transport, name: str, backup_root: str) -> None:
+    """Move one existing owned direct child into this deployment's Backup."""
+
+    kind = transport.lstat(name)
+    if kind is RemotePathType.MISSING:
+        return
+    if kind in {RemotePathType.SYMLINK, RemotePathType.OTHER}:
+        raise DeployError(f"refusing to replace unsupported remote type {kind.value}: {name}")
+    destination = f"{backup_root}/{name}"
+    if transport.lstat(destination) is not RemotePathType.MISSING:
+        raise DeployError(f"hybrid backup destination already exists: {destination}")
+    transport.rename_path(name, destination)
+
+
+def _upload_with_retry(
+    local_path: Path,
+    remote_path: str,
+    transport: Transport,
+    progress: ProgressReporter,
+    *,
+    attempts: int,
+    delay: float,
+) -> None:
+    """Retry one idempotent Hybrid upload without rebuilding local bytes."""
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if attempt > 1:
+                transport.invalidate_connection()
+                _connect_with_retry(transport, attempts=1, delay=0)
+            transport.upload(
+                local_path,
+                remote_path,
+                progress.callback(remote_path, local_path.stat().st_size),
+            )
+            return
+        except Exception as exc:
+            if attempt >= attempts:
+                raise DeployError(
+                    f"{remote_path} failed after {attempts} attempt(s): {exc}"
+                ) from exc
+            print(
+                f"Retry {attempt}/{attempts - 1} for {remote_path} after error: {exc}",
+                flush=True,
+            )
+            if delay:
+                time.sleep(delay)
 
 
 def _execute_after_deploy(
@@ -223,6 +489,19 @@ def freeze_uploads(
                     f"output changed while the deployment plan was being frozen: {operation.local_path}"
                 )
         frozen[operation.remote_path] = destination
+    if plan.hybrid is not None:
+        for item in plan.hybrid.local.root_files:
+            _freeze_hybrid_file(item.name, item.local_path, item.entry, staging, frozen)
+        for directory in plan.hybrid.local.directories:
+            for relative, scanned in directory.files.items():
+                remote = (Path(directory.name) / Path(relative)).as_posix()
+                _freeze_hybrid_file(
+                    remote,
+                    scanned.local_path,
+                    scanned.entry,
+                    staging,
+                    frozen,
+                )
     return frozen
 
 
@@ -249,7 +528,41 @@ def estimate_frozen_bytes(plan: DeploymentPlan, repository: GitRepository) -> in
             total += operation.size
         elif operation.local_path is not None:
             total += operation.local_path.stat().st_size
+    if plan.hybrid is not None:
+        total += sum(item.entry.size for item in plan.hybrid.local.root_files)
+        total += sum(item.total_size for item in plan.hybrid.local.directories)
     return total
+
+
+def _freeze_hybrid_file(
+    remote_path: str,
+    local_path: Path,
+    expected: ManifestEntry,
+    staging: Path,
+    frozen: dict[str, Path],
+) -> None:
+    """Copy and hash-verify one Hybrid byte source before remote preflight.
+
+    Args:
+        remote_path: Final relative path used as the frozen lookup key.
+        local_path: Scanned aggregation file.
+        expected: Immutable ``ManifestEntry`` captured during local planning.
+        staging: Private local freeze root.
+        frozen: Mutable frozen-path result map.
+
+    Returns:
+        ``None`` after verified bytes are bound to ``remote_path``.
+    """
+
+    destination = staging / remote_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copyfile(local_path, destination)
+    except OSError as exc:
+        raise PlanError(f"cannot freeze hybrid output {local_path}: {exc}") from exc
+    if hash_file(destination) != expected:
+        raise PlanError(f"hybrid output changed while being frozen: {local_path}")
+    frozen[remote_path] = destination
 
 
 def _execute_with_retry(

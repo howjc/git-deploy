@@ -74,6 +74,32 @@ class GitRepository:
 
         return self._run("status", "--porcelain", "--untracked-files=normal")
 
+    def is_ignored(self, path: Path) -> bool:
+        """Return whether Git ignore rules cover one project-local path.
+
+        Args:
+            path: Absolute or project-relative local path.
+
+        Returns:
+            ``True`` only when ``git check-ignore`` confirms the path is ignored.
+        """
+
+        candidate = path.resolve() if path.is_absolute() else (self.root / path).resolve()
+        if not candidate.is_relative_to(self.root):
+            raise PlanError(f"cannot inspect ignore rules outside the project: {path}")
+        relative = candidate.relative_to(self.root).as_posix()
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "--", relative],
+            cwd=self.root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode not in {0, 1}:
+            detail = result.stderr.decode(errors="replace").strip()
+            raise PlanError(f"Git check-ignore failed for {relative!r}: {detail}")
+        return result.returncode == 0
+
     def commit_exists(self, commit: str) -> bool:
         """Return whether a state commit still resolves to a commit object.
 

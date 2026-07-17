@@ -167,6 +167,8 @@ def scan_outputs(outputs: tuple[OutputConfig, ...]) -> dict[str, ScannedOutput]:
 
     scanned: dict[str, ScannedOutput] = {}
     for output in outputs:
+        if output.mode == "hybrid":
+            continue
         if not output.local.exists():
             # A missing configured root usually means a broken build or typo. It
             # must not be interpreted as deliberate removal of every old output.

@@ -1,0 +1,40 @@
+# SFTP-only Hybrid example. Keep deploy.toml and .deploy/ untracked.
+project_id = "github.com/howjc/example-project"
+default_target = "prod"
+
+[source]
+include = ["**"]
+exclude = [".deploy/**"]
+protect = [".git-deploy/**"]
+require_clean_worktree = false
+
+# One frontend may use `pnpm run build`; multiple frontends can build separately
+# and then call the conflict-detecting reference aggregator.
+[build]
+steps = [
+  "pnpm --dir frontend build",
+  "npm --prefix admin ci",
+  "npm --prefix admin run build",
+  "python examples/aggregate_frontend_builds.py",
+]
+timeout = 900
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.prod]
+protocol = "sftp"
+ssh_host_alias = "project-prod"
+remote_root = "/www/wwwroot/project"
+after_deploy = [
+  "sudo -n /usr/bin/systemctl reload nginx",
+  "sudo -n /usr/bin/systemctl is-active --quiet nginx",
+]
+command_timeout = 120
+
+[deploy]
+retries = 3
+retry_delay = 2

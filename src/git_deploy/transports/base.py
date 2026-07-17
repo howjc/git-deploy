@@ -4,11 +4,22 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path, PurePosixPath
 
 from git_deploy.errors import DeployError
 
 ProgressCallback = Callable[[int, int | None], None]
+
+
+class RemotePathType(str, Enum):
+    """Classify one remote path without following symbolic links."""
+
+    MISSING = "missing"
+    FILE = "file"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+    OTHER = "other"
 
 
 class Transport(ABC):
@@ -84,6 +95,69 @@ class Transport(ABC):
         """
 
         raise DeployError("remote commands are not supported by this transport")
+
+    def lstat(self, remote_path: str) -> RemotePathType:
+        """Classify one safe relative path without following symlinks.
+
+        Args:
+            remote_path: Relative path below the configured remote root.
+
+        Returns:
+            Explicit path type, including confirmed absence.
+        """
+
+        raise DeployError("remote path inspection is not supported by this transport")
+
+    def read_file(self, remote_path: str, *, max_bytes: int) -> bytes:
+        """Read one bounded regular file without following symlinks.
+
+        Args:
+            remote_path: Relative path below the configured root.
+            max_bytes: Maximum accepted file size.
+
+        Returns:
+            Exact remote bytes.
+        """
+
+        raise DeployError("remote file reads are not supported by this transport")
+
+    def write_file_atomic(self, remote_path: str, data: bytes) -> None:
+        """Atomically publish small internal metadata bytes.
+
+        Args:
+            remote_path: Protected relative metadata path.
+            data: Complete bytes to publish as mode ``0644``.
+
+        Returns:
+            ``None`` after safe temporary replacement.
+        """
+
+        raise DeployError("remote metadata writes are not supported by this transport")
+
+    def list_directory(self, remote_path: str) -> tuple[str, ...]:
+        """Return stable direct child names without recursive traversal."""
+
+        raise DeployError("remote directory listing is not supported by this transport")
+
+    def make_directory(self, remote_path: str, *, mode: int = 0o755) -> None:
+        """Create one relative directory and missing parents idempotently.
+
+        Args:
+            remote_path: Safe relative directory path.
+            mode: POSIX permission requested for created/final directory.
+        """
+
+        raise DeployError("remote directory creation is not supported by this transport")
+
+    def rename_path(self, source: str, destination: str) -> None:
+        """Rename one relative file or directory without overwriting destination."""
+
+        raise DeployError("remote rename is not supported by this transport")
+
+    def remove_tree(self, remote_path: str) -> None:
+        """Remove one file/directory tree without following symlinks."""
+
+        raise DeployError("remote recursive removal is not supported by this transport")
 
     def __enter__(self) -> Transport:
         """Connect and return this transport as a context manager."""

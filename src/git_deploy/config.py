@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tomllib
 from dataclasses import dataclass, field, replace
@@ -12,12 +13,15 @@ from typing import Any, Literal, cast
 from git_deploy.errors import ConfigError
 
 Protocol = Literal["sftp", "ftp"]
+OutputMode = Literal["incremental", "hybrid"]
 RESERVED_TARGET_NAMES = frozenset({"build", "doctor", "init"})
 MAX_AFTER_DEPLOY_COMMANDS = 16
 MAX_AFTER_DEPLOY_COMMAND_LENGTH = 4096
 
 DEFAULT_EXCLUDE = (
     ".git/**",
+    ".deploy/**",
+    ".git-deploy/**",
     ".env",
     ".env.*",
     "node_modules/**",
@@ -31,6 +35,7 @@ DEFAULT_PROTECT = (
     "uploads/**",
     "runtime/**",
     "storage/cert/**",
+    ".git-deploy/**",
     "**/*.key",
     "**/*.pem",
 )
@@ -61,6 +66,8 @@ class OutputConfig:
     local: Path
     remote: PurePosixPath
     delete_removed: bool = True
+    name: str | None = None
+    mode: OutputMode = "incremental"
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +136,7 @@ class Config:
 
     path: Path
     project_root: Path
+    project_id: str | None
     default_target: str | None
     source: SourceConfig
     build: BuildConfig
@@ -366,7 +374,11 @@ def load_config(path: Path) -> Config:
         raise ConfigError(f"cannot read configuration {path}: {exc}") from exc
 
     _reject_legacy_config(raw)
-    _reject_unknown(raw, {"default_target", "source", "build", "outputs", "targets", "deploy"}, "top level")
+    _reject_unknown(
+        raw,
+        {"project_id", "default_target", "source", "build", "outputs", "targets", "deploy"},
+        "top level",
+    )
     root = path.parent.resolve()
     source = _parse_source(raw.get("source", {}))
     build = _parse_build(raw.get("build", {}))
@@ -376,7 +388,11 @@ def load_config(path: Path) -> Config:
     default_target = _optional_string(raw.get("default_target"), "default_target")
     if default_target is not None and default_target not in targets:
         raise ConfigError(f"default_target {default_target!r} is not present in [targets]")
-    return Config(path, root, default_target, source, build, outputs, targets, deploy)
+    hybrid = next((output for output in outputs if output.mode == "hybrid"), None)
+    project_id = _resolve_project_id(raw.get("project_id"), root, required=hybrid is not None)
+    if hybrid is not None and any(target.protocol != "sftp" for target in targets.values()):
+        raise ConfigError("hybrid outputs are SFTP-only; remove FTP targets from this configuration")
+    return Config(path, root, project_id, default_target, source, build, outputs, targets, deploy)
 
 
 def path_matches(path: str, patterns: tuple[str, ...]) -> bool:
@@ -496,7 +512,11 @@ def _parse_outputs(raw: Any, root: Path) -> tuple[OutputConfig, ...]:
     outputs: list[OutputConfig] = []
     for index, value in enumerate(raw):
         table = _table(value, f"outputs[{index}]")
-        _reject_unknown(table, {"local", "remote", "delete_removed"}, f"outputs[{index}]")
+        _reject_unknown(
+            table,
+            {"name", "local", "remote", "mode", "delete_removed"},
+            f"outputs[{index}]",
+        )
         local_text = _required_string(table.get("local"), f"outputs[{index}].local")
         local_rel = Path(local_text)
         if local_rel.is_absolute() or ".." in local_rel.parts:
@@ -505,10 +525,36 @@ def _parse_outputs(raw: Any, root: Path) -> tuple[OutputConfig, ...]:
         if not local.is_relative_to(root):
             raise ConfigError(f"outputs[{index}].local resolves outside the project root")
         remote = _relative_remote(table.get("remote"), f"outputs[{index}].remote")
+        mode_raw = table.get("mode", "incremental")
+        if mode_raw not in {"incremental", "hybrid"}:
+            raise ConfigError(f"outputs[{index}].mode must be 'incremental' or 'hybrid'")
+        mode = cast(OutputMode, mode_raw)
+        name = _optional_string(table.get("name"), f"outputs[{index}].name")
+        if name is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+            raise ConfigError(
+                f"outputs[{index}].name must match [A-Za-z0-9._-]+ and be at most 64 characters"
+            )
+        if name in {".", ".."}:
+            raise ConfigError(f"outputs[{index}].name is unsafe")
+        if mode == "hybrid":
+            if name is None:
+                raise ConfigError(f"outputs[{index}].name is required for hybrid mode")
+            if remote != PurePosixPath("."):
+                raise ConfigError(f"outputs[{index}].remote must be '.' for hybrid mode")
+            if "delete_removed" in table:
+                raise ConfigError(
+                    f"outputs[{index}].delete_removed is implicit and forbidden for hybrid mode"
+                )
         delete_removed = table.get("delete_removed", True)
         if not isinstance(delete_removed, bool):
             raise ConfigError(f"outputs[{index}].delete_removed must be a boolean")
-        outputs.append(OutputConfig(local, remote, delete_removed))
+        outputs.append(OutputConfig(local, remote, delete_removed, name, mode))
+    hybrid_count = sum(output.mode == "hybrid" for output in outputs)
+    if hybrid_count > 1:
+        raise ConfigError("at most one hybrid output is allowed in one configuration")
+    names = [output.name for output in outputs if output.name is not None]
+    if len(names) != len(set(names)):
+        raise ConfigError("output names must be unique")
     _validate_output_roots(outputs)
     return tuple(outputs)
 
@@ -518,6 +564,8 @@ def _validate_output_roots(outputs: list[OutputConfig]) -> None:
 
     for index, left in enumerate(outputs):
         for right in outputs[index + 1 :]:
+            if "hybrid" in {left.mode, right.mode}:
+                continue
             if (
                 left.remote == right.remote
                 or left.remote in right.remote.parents
@@ -527,6 +575,94 @@ def _validate_output_roots(outputs: list[OutputConfig]) -> None:
                     "output remote mappings must not be equal or nested: "
                     f"{left.remote} and {right.remote}"
                 )
+
+
+def _resolve_project_id(value: Any, root: Path, *, required: bool) -> str | None:
+    """Resolve a non-secret stable project identity from config or Git origin.
+
+    Args:
+        value: Optional explicit top-level project identifier.
+        root: Git project root used to query ``remote.origin.url``.
+        required: Whether a Hybrid Output makes identity mandatory.
+
+    Returns:
+        Normalized ``host/path`` identity, or ``None`` for non-Hybrid projects.
+    """
+
+    explicit = _optional_string(value, "project_id")
+    if explicit is not None:
+        normalized = _normalize_project_id(explicit)
+        if normalized is None:
+            raise ConfigError("project_id must be a credential-free host/path identifier or Git URL")
+        return normalized
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        result = None
+    normalized = _normalize_project_id(result.stdout.strip()) if result and result.returncode == 0 else None
+    if required and normalized is None:
+        raise ConfigError(
+            "hybrid output requires project_id because Git remote.origin.url is unavailable"
+        )
+    return normalized
+
+
+def _normalize_project_id(value: str) -> str | None:
+    """Normalize HTTPS, SSH URL, and SCP-like Git origins without retaining credentials.
+
+    Args:
+        value: Explicit identifier or Git origin URL.
+
+    Returns:
+        Credential-free ``lowercase-host/path`` text, or ``None`` when invalid.
+    """
+
+    from urllib.parse import urlsplit
+
+    text = value.strip()
+    if not text or any(character in text for character in ("\x00", "\r", "\n")):
+        return None
+    host: str
+    path: str
+    if "://" in text:
+        parsed = urlsplit(text)
+        if not parsed.hostname:
+            return None
+        host = parsed.hostname.lower()
+        path = parsed.path
+    else:
+        scp = re.fullmatch(r"(?:[^@/:]+@)?([^/:]+):(.+)", text)
+        if scp:
+            if "@" in scp.group(2).split("/", 1)[0]:
+                return None
+            host, path = scp.group(1).lower(), scp.group(2)
+        else:
+            plain = text.strip("/")
+            if "/" not in plain:
+                return None
+            host, path = plain.split("/", 1)
+            host = host.lower()
+    normalized_path = path.strip("/")
+    if normalized_path.endswith(".git"):
+        normalized_path = normalized_path[:-4]
+    parts = PurePosixPath(normalized_path).parts
+    if (
+        not host
+        or not normalized_path
+        or any(character.isspace() or character in "@?#" for character in host)
+        or any(ord(character) < 32 or character == "\x7f" for character in normalized_path)
+        or ".." in parts
+        or any(not part or part == "." for part in parts)
+    ):
+        return None
+    return f"{host}/{PurePosixPath(*parts).as_posix()}"
 
 
 def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
