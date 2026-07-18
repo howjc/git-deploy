@@ -463,6 +463,7 @@ def run_workspace_doctor(
     requested_target: str | None,
     *,
     create_root: bool,
+    probe_ftp_hybrid: bool = False,
 ) -> tuple[tuple[str, tuple[DoctorResult, ...]], ...]:
     """Run per-repository diagnostics with one shared Native OpenSSH pool.
 
@@ -470,6 +471,7 @@ def run_workspace_doctor(
         workspace: Validated workspace and repository order.
         requested_target: Shared explicit/default target name.
         create_root: Whether all-preflight-success may create missing roots.
+        probe_ftp_hybrid: Whether the user confirmed per-project FTP capability probes.
 
     Returns:
         Repository names paired with ordered diagnostic results.
@@ -528,6 +530,7 @@ def run_workspace_doctor(
                 repository,
                 store,
                 create_root=create_root,
+                probe_ftp_hybrid=probe_ftp_hybrid,
                 transport_factory=lambda selected: create_transport(selected, pool),
                 pre_resolved_target=resolved,
                 resolution_error=error or preflight_error,

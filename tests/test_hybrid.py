@@ -18,9 +18,11 @@ from git_deploy.doctor import run_doctor
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
     MAX_REMOTE_RECORD_BYTES,
+    HybridBackend,
     HybridOwnership,
     parse_ownership,
     read_ownership,
+    resolve_hybrid_backend,
     scan_hybrid_output,
     serialize_ownership,
 )
@@ -471,10 +473,10 @@ def test_hybrid_project_id_defaults_to_origin_and_is_required_when_unavailable(
     assert load_config(config_path).project_id == "github.com/acme/from-origin"
 
 
-def test_hybrid_rejects_ftp_multiple_mappings_and_protected_or_overlapping_paths(
+def test_hybrid_allows_ftp_and_rejects_multiple_mappings_or_overlaps(
     git_project: Path,
 ) -> None:
-    """Config and local planning enforce the single SFTP ownership boundary."""
+    """Backend selection allows FTP while common ownership boundaries stay strict."""
 
     config_path = _hybrid_project(git_project)
     ftp_text = config_path.read_text(encoding="utf-8").replace(
@@ -482,8 +484,16 @@ def test_hybrid_rejects_ftp_multiple_mappings_and_protected_or_overlapping_paths
         'protocol = "ftp"\nhost = "example.invalid"\nusername = "deploy"\npassword_env = "FTP_PASS"',
     )
     config_path.write_text(ftp_text, encoding="utf-8")
-    with pytest.raises(ConfigError, match="SFTP-only"):
-        load_config(config_path)
+    ftp_config = load_config(config_path)
+    assert ftp_config.target(None).protocol == "ftp"
+    assert resolve_hybrid_backend(ftp_config.target(None)) is HybridBackend.FTP_IN_PLACE
+
+    sftp_path = _hybrid_project(git_project)
+    sftp_config = load_config(sftp_path)
+    assert resolve_hybrid_backend(sftp_config.target(None)) is HybridBackend.SFTP_STAGED
+    unknown = replace(sftp_config.target(None), protocol="ftps")  # type: ignore[arg-type]
+    with pytest.raises(PlanError, match="unsupported protocol"):
+        resolve_hybrid_backend(unknown)
 
     config_path = _hybrid_project(git_project)
     duplicate = '''

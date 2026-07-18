@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path, PurePosixPath
+from typing import Any, cast
 
 import pytest
 from pyftpdlib.authorizers import DummyAuthorizer
@@ -17,7 +18,11 @@ from pyftpdlib.servers import FTPServer
 
 from git_deploy.config import TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.deployer import execute_plan
-from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
+from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError, StateError
+from git_deploy.ftp_hybrid import (
+    probe_ftp_hybrid_capabilities,
+    save_capability_profile,
+)
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from git_deploy.planner import create_plan
@@ -195,6 +200,439 @@ def test_real_ftp_upload_replace_and_idempotent_delete(
         assert not (root / "public_html/assets/app.bin").exists()
     finally:
         transport.close()
+
+
+def test_real_ftp_hybrid_capability_probe_supports_active_mode(
+    tmp_path: Path,
+    ftp_server,
+) -> None:
+    """The explicit binary/MLSD/rename probe also works with FTP active mode."""
+
+    root, port = ftp_server
+    (root / "active-root").mkdir()
+    target = TargetConfig(
+        "active",
+        "ftp",
+        "127.0.0.1",
+        "deploy",
+        PurePosixPath("/active-root"),
+        port,
+        password_env="TEST_FTP_PASSWORD",
+        passive=False,
+        runtime_dir=tmp_path,
+    )
+    transport = FTPTransport(target)
+    try:
+        transport.connect()
+        profile = probe_ftp_hybrid_capabilities(transport, target, now=50)
+        assert profile.rename_cross_directory
+        assert profile.rename_replace_file
+        assert profile.mlsd
+    finally:
+        transport.close()
+    assert not (root / "active-root/.git-deploy/ftp-probe").exists()
+
+
+def test_real_ftp_hybrid_probe_adoption_mirror_state_loss_and_cleanup(
+    git_project: Path,
+    ftp_server,
+) -> None:
+    """pyftpdlib proves the FTP In-place Hybrid end-to-end safety contract."""
+
+    root, port = ftp_server
+    _create_hybrid_local_view(git_project)
+    config_path = write_config(
+        git_project,
+        f'''
+project_id = "github.com/acme/ftp-hybrid"
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "127.0.0.1"
+port = {port}
+username = "deploy"
+password_env = "TEST_FTP_PASSWORD"
+remote_root = "/public_html/ftp-hybrid"
+''',
+    )
+    remote_root = root / "public_html/ftp-hybrid"
+    (remote_root / "assets").mkdir(parents=True)
+    (remote_root / "assets/legacy.js").write_text("legacy", encoding="utf-8")
+    (remote_root / "index.php").write_text("backend", encoding="utf-8")
+    (remote_root / ".env").write_text("secret", encoding="utf-8")
+    (remote_root / "uploads").mkdir()
+    (remote_root / "uploads/user.dat").write_text("user", encoding="utf-8")
+
+    config = load_config(config_path)
+    repository = GitRepository(git_project)
+    store = StateStore(repository.common_dir())
+    target = resolve_target_for_plan(config.target(None), runtime_dir=store.base)
+    missing_profile = prepare_project(
+        "ftp-hybrid", config_path, None, full=True, skip_build=True
+    )
+    try:
+        with pytest.raises(PlanError, match="Capability Profile is missing"):
+            prepare_remote_plan(missing_profile)
+    finally:
+        missing_profile.close()
+    probe_transport = FTPTransport(target)
+    try:
+        probe_transport.connect()
+        assert probe_transport.root_exists()
+        profile = probe_ftp_hybrid_capabilities(probe_transport, target, now=100)
+        save_capability_profile(store.base, profile)
+    finally:
+        probe_transport.close()
+    assert not (remote_root / ".git-deploy/ftp-probe").exists()
+
+    blocked = prepare_project("ftp-hybrid", config_path, None, full=False, skip_build=True)
+    try:
+        with pytest.raises(PlanError, match="--full to adopt"):
+            prepare_remote_plan(blocked)
+    finally:
+        blocked.close()
+
+    first = prepare_project("ftp-hybrid", config_path, None, full=True, skip_build=True)
+    try:
+        prepare_remote_plan(first)
+        execute_prepared(first)
+    finally:
+        first.close()
+    assert (remote_root / "assets/app.js").read_text(encoding="utf-8") == "hybrid app\n"
+    assert not (remote_root / "assets/legacy.js").exists()
+    assert (remote_root / "assets/empty/nested").is_dir()
+    assert (remote_root / "index.php").read_text(encoding="utf-8") == "backend"
+    assert (remote_root / ".env").read_text(encoding="utf-8") == "secret"
+    assert (remote_root / "uploads/user.dat").read_text(encoding="utf-8") == "user"
+    assert not (remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json").exists()
+
+    local_app = git_project / ".deploy/frontend-root/assets/app.js"
+    local_app.unlink()
+    local_app.mkdir()
+    nested_type_change = prepare_project(
+        "ftp-hybrid", config_path, None, full=True, skip_build=True
+    )
+    try:
+        with pytest.raises(PlanError, match="cannot safely change a Mirror path"):
+            prepare_remote_plan(nested_type_change)
+    finally:
+        nested_type_change.close()
+    local_app.rmdir()
+    local_app.write_text("hybrid app\n", encoding="utf-8")
+
+    (git_project / ".deploy/frontend-root/old-assets/old.js").unlink()
+    (git_project / ".deploy/frontend-root/old-assets").rmdir()
+    (git_project / ".deploy/frontend-root/old-assets").write_text("new type", encoding="utf-8")
+    type_change = prepare_project("ftp-hybrid", config_path, None, full=True, skip_build=True)
+    try:
+        with pytest.raises(PlanError, match="cannot safely change an owned direct path"):
+            prepare_remote_plan(type_change)
+    finally:
+        type_change.close()
+    (git_project / ".deploy/frontend-root/old-assets").unlink()
+    (git_project / ".deploy/frontend-root/assets/app.js").unlink()
+    (git_project / ".deploy/frontend-root/assets/new.js").write_text("new\n", encoding="utf-8")
+    store.path_for("dev").unlink()
+    second = prepare_project("ftp-hybrid", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(second)
+        execute_prepared(second)
+    finally:
+        second.close()
+    assert not (remote_root / "old-assets").exists()
+    assert not (remote_root / "assets/app.js").exists()
+    assert (remote_root / "assets/new.js").read_text(encoding="utf-8") == "new\n"
+    assert (remote_root / "index.php").read_text(encoding="utf-8") == "backend"
+
+
+def test_real_ftp_hybrid_forward_resume_at_publish_prune_state_and_cleanup(
+    git_project: Path,
+    ftp_server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every durable FTP phase naturally resumes without Adoption or current-State drift."""
+
+    root, port = ftp_server
+    _create_hybrid_local_view(git_project)
+    config_path = write_config(
+        git_project,
+        f'''
+project_id = "github.com/acme/ftp-resume"
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "127.0.0.1"
+port = {port}
+username = "deploy"
+password_env = "TEST_FTP_PASSWORD"
+remote_root = "/public_html/ftp-resume"
+
+[deploy]
+retries = 3
+retry_delay = 0
+''',
+    )
+    remote_root = root / "public_html/ftp-resume"
+    remote_root.mkdir(parents=True)
+    config = load_config(config_path)
+    repository = GitRepository(git_project)
+    store = StateStore(repository.common_dir())
+    target = resolve_target_for_plan(config.target(None), runtime_dir=store.base)
+    probe_transport = FTPTransport(target)
+    try:
+        probe_transport.connect()
+        save_capability_profile(
+            store.base,
+            probe_ftp_hybrid_capabilities(probe_transport, target, now=200),
+        )
+    finally:
+        probe_transport.close()
+
+    initial = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(initial)
+        execute_prepared(initial)
+    finally:
+        initial.close()
+
+    assets = git_project / ".deploy/frontend-root/assets"
+    (assets / "reset.js").write_text("reset\n", encoding="utf-8")
+    reset = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(reset)
+    assert isinstance(reset.transport, FTPTransport)
+    original_upload = reset.transport.upload
+    reset_calls = 0
+
+    def reset_once(local_path, remote_path, callback, *, executable=False) -> None:  # noqa: ANN001
+        """Simulate one dropped connection, then allow the retry to converge."""
+
+        nonlocal reset_calls
+        if remote_path.endswith("/files/assets/reset.js"):
+            reset_calls += 1
+            if reset_calls == 1:
+                raise DeployError("injected connection reset")
+        original_upload(local_path, remote_path, callback, executable=executable)
+
+    cast(Any, reset.transport).upload = reset_once
+    execute_prepared(reset)
+    assert reset_calls == 2
+    assert (remote_root / "assets/reset.js").read_text(encoding="utf-8") == "reset\n"
+
+    (assets / "interrupt.js").write_text("interrupt\n", encoding="utf-8")
+    interrupted = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(interrupted)
+    assert isinstance(interrupted.transport, FTPTransport)
+    original_upload = interrupted.transport.upload
+
+    def interrupt_stage(local_path, remote_path, callback, *, executable=False) -> None:  # noqa: ANN001
+        """Interrupt only one business Stage upload after PREPARED is durable."""
+
+        if remote_path.endswith("/files/assets/interrupt.js"):
+            raise KeyboardInterrupt
+        original_upload(local_path, remote_path, callback, executable=executable)
+
+    cast(Any, interrupted.transport).upload = interrupt_stage
+    with pytest.raises(KeyboardInterrupt):
+        execute_prepared(interrupted)
+    pending_file = remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json"
+    assert '"phase":"PREPARED"' in pending_file.read_text(encoding="utf-8")
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+
+    (assets / "verify.js").write_text("verify\n", encoding="utf-8")
+    verify_failure = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(verify_failure)
+    assert isinstance(verify_failure.transport, FTPTransport)
+    original_read = verify_failure.transport.read_file
+
+    def corrupt_stage_read(path: str, *, max_bytes: int) -> bytes:
+        """Return corrupt bytes only for the selected staged business file."""
+
+        if path.endswith("/files/assets/verify.js"):
+            return b"corrupt"
+        return original_read(path, max_bytes=max_bytes)
+
+    cast(Any, verify_failure.transport).read_file = corrupt_stage_read
+    with pytest.raises(DeployError, match="verify.js failed"):
+        execute_prepared(verify_failure)
+    assert '"phase":"PREPARED"' in pending_file.read_text(encoding="utf-8")
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+
+    (assets / "publish.js").write_text("publish\n", encoding="utf-8")
+    publish_failure = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    prepare_remote_plan(publish_failure)
+    assert isinstance(publish_failure.transport, FTPTransport)
+    original_rename = publish_failure.transport.rename_replace
+
+    def fail_business_publish(source: str, destination: str) -> None:
+        """Fail only the final business rename after Pending and Stage writes."""
+
+        if destination == "assets/publish.js":
+            raise DeployError("injected publish failure")
+        original_rename(source, destination)
+
+    cast(Any, publish_failure.transport).rename_replace = fail_business_publish
+    with pytest.raises(DeployError, match="publish.js failed"):
+        execute_prepared(publish_failure)
+    assert '"phase":"PREPARED"' in pending_file.read_text(encoding="utf-8")
+
+    (assets / "changed-during-resume.js").write_text("changed\n", encoding="utf-8")
+    changed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        with pytest.raises(PlanError, match="Pending Manifest"):
+            prepare_remote_plan(changed)
+    finally:
+        changed.close()
+    (assets / "changed-during-resume.js").unlink()
+
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+    assert (remote_root / "assets/publish.js").read_text(encoding="utf-8") == "publish\n"
+
+    (assets / "app.js").unlink()
+    (assets / "prune.js").write_text("prune\n", encoding="utf-8")
+    prune_failure = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(prune_failure)
+    assert isinstance(prune_failure.transport, FTPTransport)
+    original_delete = prune_failure.transport.delete_typed
+
+    def fail_orphan_delete(path: str) -> None:
+        """Fail only one owned orphan after every current file is published."""
+
+        if path == "assets/app.js":
+            raise DeployError("injected prune failure")
+        original_delete(path)
+
+    cast(Any, prune_failure.transport).delete_typed = fail_orphan_delete
+    with pytest.raises(DeployError, match="app.js failed"):
+        execute_prepared(prune_failure)
+    assert '"phase":"FILES_PUBLISHED"' in pending_file.read_text(encoding="utf-8")
+    assert (remote_root / "assets/prune.js").exists()
+
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+    assert not (remote_root / "assets/app.js").exists()
+
+    (assets / "empty/nested").rmdir()
+    rmd_failure = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(rmd_failure)
+    assert isinstance(rmd_failure.transport, FTPTransport)
+    original_rmd = rmd_failure.transport.remove_directory
+
+    def fail_orphan_rmd(path: str) -> None:
+        """Fail one orphan RMD after file publication and deletion complete."""
+
+        if path == "assets/empty/nested":
+            raise DeployError("injected RMD failure")
+        original_rmd(path)
+
+    cast(Any, rmd_failure.transport).remove_directory = fail_orphan_rmd
+    with pytest.raises(DeployError, match="assets/empty/nested failed"):
+        execute_prepared(rmd_failure)
+    assert '"phase":"FILES_PUBLISHED"' in pending_file.read_text(encoding="utf-8")
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+    assert not (remote_root / "assets/empty/nested").exists()
+
+    (assets / "ownership.js").write_text("ownership\n", encoding="utf-8")
+    ownership_failure = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    prepare_remote_plan(ownership_failure)
+    assert isinstance(ownership_failure.transport, FTPTransport)
+    original_rename = ownership_failure.transport.rename_replace
+
+    def fail_ownership_publish(source: str, destination: str) -> None:
+        """Fail the metadata rename only after current files and prune succeed."""
+
+        if destination == ".git-deploy/hybrid/frontend-root.json":
+            raise DeployError("injected Ownership failure")
+        original_rename(source, destination)
+
+    cast(Any, ownership_failure.transport).rename_replace = fail_ownership_publish
+    with pytest.raises(DeployError, match="Ownership failure"):
+        execute_prepared(ownership_failure)
+    assert '"phase":"PRUNED"' in pending_file.read_text(encoding="utf-8")
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+
+    (assets / "state.js").write_text("state\n", encoding="utf-8")
+    state_failure = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(state_failure)
+    def fail_state(state) -> None:  # noqa: ANN001
+        """Inject failure only after Ownership has committed."""
+
+        raise StateError("injected state failure")
+
+    cast(Any, state_failure.state_store).save = fail_state
+    with pytest.raises(DeployError, match="injected state"):
+        execute_prepared(state_failure)
+    assert '"phase":"OWNERSHIP_COMMITTED"' in pending_file.read_text(encoding="utf-8")
+
+    cleanup_failure = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(cleanup_failure)
+    assert isinstance(cleanup_failure.transport, FTPTransport)
+    original_remove_tree = cleanup_failure.transport.remove_tree
+
+    def fail_stage_cleanup(path: str) -> None:
+        """Leave only protected internal remnants after State recovery succeeds."""
+
+        if path.startswith(".git-deploy/ftp-hybrid/stage/"):
+            raise DeployError("injected cleanup failure")
+        original_remove_tree(path)
+
+    cast(Any, cleanup_failure.transport).remove_tree = fail_stage_cleanup
+    execute_prepared(cleanup_failure)
+    assert '"phase":"STATE_COMPLETE"' in pending_file.read_text(encoding="utf-8")
+    assert "cleanup is pending" in capsys.readouterr().err
+
+    cleaned = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(cleaned)
+        execute_prepared(cleaned)
+    finally:
+        cleaned.close()
+    assert not pending_file.exists()
+    assert (remote_root / "assets/state.js").read_text(encoding="utf-8") == "state\n"
 
 
 def _deploy_project(root: Path) -> int:

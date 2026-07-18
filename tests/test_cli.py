@@ -149,6 +149,70 @@ def test_confirmation_rejects_noninteractive_without_yes(
     assert cli.main(["--config", str(path), "--skip-build"]) == 2
 
 
+def test_ftp_hybrid_doctor_probe_requires_confirmation_and_discloses_scope(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only explicit Doctor probe plus confirmation may authorize protected writes."""
+
+    aggregation = git_project / ".deploy/frontend-root"
+    aggregation.mkdir(parents=True)
+    (aggregation / "index.html").write_text("index\n", encoding="utf-8")
+    path = write_config(
+        git_project,
+        """
+project_id = "github.com/acme/ftp-probe"
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+""",
+    )
+    called: list[bool] = []
+
+    def diagnose(*args, probe_ftp_hybrid: bool = False, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Record whether the mutating probe authorization reached Doctor."""
+
+        called.append(probe_ftp_hybrid)
+        return (DoctorResult("FTP Hybrid Capability Probe", True, "supported"),)
+
+    monkeypatch.setattr(cli, "run_doctor", diagnose)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    assert (
+        cli.main(
+            ["--config", str(path), "doctor", "dev", "--probe-ftp-hybrid"]
+        )
+        == 2
+    )
+    assert not called
+
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(path),
+                "doctor",
+                "dev",
+                "--probe-ftp-hybrid",
+                "--yes",
+            ]
+        )
+        == 0
+    )
+    assert called == [True]
+    assert ".git-deploy/ftp-probe" in capsys.readouterr().out
+
+
 def test_doctor_reports_non_git_instead_of_exiting_early(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

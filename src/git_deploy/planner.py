@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+import time
 from typing import Literal
 
 from git_deploy.config import (
@@ -15,22 +16,38 @@ from git_deploy.config import (
     resolve_target_for_plan,
 )
 from git_deploy.errors import PlanError, StaleRemotePlanError
+from git_deploy.ftp_hybrid import (
+    FTPHybridCapabilities,
+    FTPHybridPending,
+    FTPPendingPhase,
+    FTPRemoteTree,
+    load_capability_profile,
+    local_manifest_hash,
+    read_pending,
+    scan_ftp_tree,
+    validate_pending_resume,
+)
 from git_deploy.git import GitEntry, GitRepository
 from git_deploy.hybrid import (
     HybridLocalManifest,
+    HybridBackend,
     HybridOwnership,
     HybridRecoveryOutcome,
     HybridRecoveryRecord,
     RecoveryPhase,
     inspect_recovery,
+    make_ownership,
+    ownership_hash,
     read_ownership_snapshot,
     read_recovery_records,
     recovery_command_hash,
+    resolve_hybrid_backend,
     scan_hybrid_output,
     validate_internal_paths,
 )
 from git_deploy.manifest import ManifestEntry, ScannedOutput, TargetState, scan_outputs
 from git_deploy.transports.base import RemotePathType, Transport
+from git_deploy.transports.ftp import FTPTransport
 
 Origin = Literal["source", "output"]
 
@@ -106,6 +123,33 @@ class HybridOwnershipUpdate:
     mapping: str
 
 
+@dataclass(frozen=True, slots=True)
+class FTPHybridFileUpload:
+    """Publish one current Root or Mirror file through the FTP Stage."""
+
+    path: str
+    local_path: Path
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class FTPHybridPlan:
+    """Contain the exact FTP in-place publish, prune, and resume work."""
+
+    capabilities: FTPHybridCapabilities
+    pending: FTPHybridPending | None
+    next_ownership: HybridOwnership
+    uploads: tuple[FTPHybridFileUpload, ...]
+    create_directories: tuple[str, ...]
+    delete_files: tuple[str, ...]
+    remove_directories: tuple[str, ...]
+    adoptions: tuple[str, ...]
+    remote_trees: tuple[FTPRemoteTree, ...]
+    ownership_update: bool
+    resume_phase: FTPPendingPhase | None = None
+
+
 HybridOperation = (
     HybridRootFileUpload
     | HybridRootFileDelete
@@ -122,6 +166,8 @@ class HybridPlan:
 
     local: HybridLocalManifest
     previous_outputs: dict[str, ManifestEntry]
+    backend: HybridBackend = HybridBackend.SFTP_STAGED
+    ftp: FTPHybridPlan | None = None
     ownership: HybridOwnership | None = None
     operations: tuple[HybridOperation, ...] = ()
     expected_ownership_hash: str | None = None
@@ -175,6 +221,8 @@ class DeploymentPlan:
             for item in self.hybrid.operations
             if isinstance(item, HybridDirectoryMirror)
         )
+        if self.hybrid.ftp is not None:
+            return regular + len(self.hybrid.ftp.uploads)
         return regular + hybrid_files + mirrored_files
 
     @property
@@ -184,6 +232,10 @@ class DeploymentPlan:
         regular = sum(isinstance(item, DeleteOperation) for item in self.operations)
         if self.hybrid is None:
             return regular
+        if self.hybrid.ftp is not None:
+            return regular + len(self.hybrid.ftp.delete_files) + len(
+                self.hybrid.ftp.remove_directories
+            )
         return regular + sum(
             isinstance(item, (HybridRootFileDelete, HybridDirectoryDelete))
             for item in self.hybrid.operations
@@ -195,6 +247,8 @@ class DeploymentPlan:
 
         if self.hybrid is None:
             return 0
+        if self.hybrid.ftp is not None:
+            return len(self.hybrid.ftp.adoptions)
         return sum(isinstance(item, HybridAdoption) for item in self.hybrid.operations)
 
     @property
@@ -203,6 +257,16 @@ class DeploymentPlan:
 
         hybrid_count = 0
         if self.hybrid is not None:
+            if self.hybrid.ftp is not None:
+                hybrid_count = (
+                    len(self.hybrid.ftp.uploads)
+                    + len(self.hybrid.ftp.create_directories)
+                    + len(self.hybrid.ftp.delete_files)
+                    + len(self.hybrid.ftp.remove_directories)
+                    + int(self.hybrid.ftp.ownership_update)
+                    + int(self.hybrid.ftp.pending is not None)
+                )
+                return len(self.operations) + hybrid_count
             hybrid_count = sum(
                 not isinstance(item, HybridAdoption) for item in self.hybrid.operations
             )
@@ -231,6 +295,18 @@ class DeploymentPlan:
             or (
                 self.hybrid
                 and (self.hybrid.operations or self.hybrid.recovery_records)
+            )
+            or (
+                self.hybrid
+                and self.hybrid.ftp
+                and (
+                    self.hybrid.ftp.uploads
+                    or self.hybrid.ftp.create_directories
+                    or self.hybrid.ftp.delete_files
+                    or self.hybrid.ftp.remove_directories
+                    or self.hybrid.ftp.ownership_update
+                    or self.hybrid.ftp.pending is not None
+                )
             )
         )
 
@@ -314,7 +390,11 @@ def create_plan(
         full=effective_full,
         allow_adoption=full,
         hybrid=(
-            HybridPlan(hybrid_local, dict(state.outputs) if state is not None else {})
+            HybridPlan(
+                hybrid_local,
+                dict(state.outputs) if state is not None else {},
+                resolve_hybrid_backend(resolved_target),
+            )
             if hybrid_local is not None
             else None
         ),
@@ -343,6 +423,10 @@ def complete_remote_plan(
         return plan
     if config.project_id is None:
         raise PlanError("hybrid output lacks a resolved project_id")
+    if hybrid.backend is HybridBackend.FTP_IN_PLACE:
+        if not isinstance(transport, FTPTransport):
+            raise PlanError("FTP Hybrid planning requires FTPTransport semantics")
+        return _complete_ftp_remote_plan(plan, config, transport)
     validate_internal_paths(transport)
     records = read_recovery_records(
         transport,
@@ -456,6 +540,301 @@ def complete_remote_plan(
     return replace(plan, hybrid=completed)
 
 
+def _complete_ftp_remote_plan(
+    plan: DeploymentPlan,
+    config: Config,
+    transport: FTPTransport,
+) -> DeploymentPlan:
+    """Build an exact typed FTP publish/prune plan without remote mutations.
+
+    Args:
+        plan: Frozen local plan with an FTP Hybrid backend.
+        config: Project identity and local output contract.
+        transport: Connected FTP adapter used only for FEAT/MLSD/RETR reads.
+
+    Returns:
+        Remote-complete plan with exact uploads, deletes, RMDs, and resume phase.
+    """
+
+    hybrid = plan.hybrid
+    if hybrid is None or config.project_id is None:
+        raise PlanError("FTP Hybrid planning requires one mapping and project_id")
+    if plan.target.runtime_dir is None:
+        raise PlanError("FTP Hybrid planning lacks a Git runtime directory")
+    capabilities = load_capability_profile(
+        plan.target.runtime_dir,
+        plan.target,
+        server_banner_hash=transport.server_banner_hash(),
+    )
+    ownership, ownership_snapshot = read_ownership_snapshot(
+        transport,
+        project_id=config.project_id,
+        mapping=hybrid.local.mapping,
+        remote=hybrid.local.remote,
+    )
+    pending = read_pending(
+        transport,
+        project_id=config.project_id,
+        mapping=hybrid.local.mapping,
+        remote=hybrid.local.remote,
+        target=plan.target,
+    )
+    manifest_snapshot = local_manifest_hash(hybrid.local, plan.output_manifest)
+    if pending is not None:
+        validate_pending_resume(
+            pending,
+            manifest_hash=manifest_snapshot,
+            head=plan.head,
+            current_ownership_hash=ownership_snapshot,
+        )
+    previous_updated_at = ownership.updated_at if ownership is not None else -1
+    next_updated_at = (
+        pending.created_at
+        if pending is not None
+        else max(int(time.time()), previous_updated_at + 1)
+    )
+    next_ownership = make_ownership(
+        hybrid.local,
+        config.project_id,
+        plan.head,
+        now=next_updated_at,
+    )
+    next_ownership_hash = ownership_hash(next_ownership)
+    if pending is not None and pending.next_ownership_hash != next_ownership_hash:
+        raise PlanError("FTP Hybrid Pending next Ownership does not match the local view")
+    if (
+        pending is not None
+        and pending.phase
+        in {FTPPendingPhase.OWNERSHIP_COMMITTED, FTPPendingPhase.STATE_COMPLETE}
+        and ownership_snapshot != pending.next_ownership_hash
+    ):
+        raise PlanError("FTP Hybrid Pending phase claims committed Ownership but it is stale")
+
+    current_files = set(hybrid.local.root_file_names)
+    current_directories = set(hybrid.local.directory_names)
+    current = current_files | current_directories
+    old_files = set(ownership.root_files if ownership is not None else ())
+    old_directories = set(ownership.directories if ownership is not None else ())
+    old = old_files | old_directories
+    _reject_historical_transfer(plan, old - current)
+    type_changes = sorted((current_files & old_directories) | (current_directories & old_files))
+    if type_changes:
+        raise PlanError(
+            "FTP Hybrid cannot safely change an owned direct path between file and directory; "
+            "remove or migrate it explicitly, deploy that deletion, then add the new type "
+            "with --full: "
+            + ", ".join(type_changes)
+        )
+
+    expected_types: dict[str, RemotePathType] = {}
+    adoptions: set[str] = set()
+    resume_owned = current if pending is not None else set()
+    for name in sorted(current | old):
+        kind = transport.lstat(name)
+        expected_types[name] = kind
+        if name in current_files and kind not in {RemotePathType.MISSING, RemotePathType.FILE}:
+            raise PlanError(f"FTP Hybrid remote path type mismatch for file {name!r}: {kind.value}")
+        if name in current_directories and kind not in {
+            RemotePathType.MISSING,
+            RemotePathType.DIRECTORY,
+        }:
+            raise PlanError(
+                f"FTP Hybrid remote path type mismatch for directory {name!r}: {kind.value}"
+            )
+        if name in old_files - current and kind not in {
+            RemotePathType.MISSING,
+            RemotePathType.FILE,
+        }:
+            raise PlanError(f"FTP Hybrid historical file changed type: {name!r}")
+        if name in old_directories - current and kind not in {
+            RemotePathType.MISSING,
+            RemotePathType.DIRECTORY,
+        }:
+            raise PlanError(f"FTP Hybrid historical directory changed type: {name!r}")
+        if (
+            name in current
+            and name not in old
+            and name not in resume_owned
+            and kind is not RemotePathType.MISSING
+        ):
+            if not plan.allow_adoption:
+                raise PlanError(
+                    f"remote path {name!r} exists but is not owned by FTP Hybrid output "
+                    f"{hybrid.local.mapping!r}; review it and rerun with --full to adopt it"
+                )
+            adoptions.add(name)
+
+    directory_manifests = {item.name: item for item in hybrid.local.directories}
+    remote_trees: dict[str, FTPRemoteTree] = {}
+    for name in sorted(current_directories | old_directories):
+        if expected_types.get(name, RemotePathType.MISSING) is RemotePathType.DIRECTORY:
+            remote_trees[name] = scan_ftp_tree(transport, name)
+        else:
+            remote_trees[name] = FTPRemoteTree(name, (), ())
+    for name in sorted(current_directories):
+        local = directory_manifests[name]
+        tree = remote_trees[name]
+        nested_type_changes = sorted(
+            (set(local.files) & set(tree.directories))
+            | (set(local.directories) & set(tree.files))
+        )
+        if nested_type_changes:
+            raise PlanError(
+                "FTP Hybrid cannot safely change a Mirror path between file and directory "
+                "while preserving upload-first: "
+                + ", ".join(f"{name}/{path}" for path in nested_type_changes[:10])
+            )
+
+    phase = pending.phase if pending is not None else None
+    publish_needed = phase not in {
+        FTPPendingPhase.PRUNED,
+        FTPPendingPhase.OWNERSHIP_COMMITTED,
+        FTPPendingPhase.STATE_COMPLETE,
+    }
+    prune_needed = phase not in {
+        FTPPendingPhase.PRUNED,
+        FTPPendingPhase.OWNERSHIP_COMMITTED,
+        FTPPendingPhase.STATE_COMPLETE,
+    }
+    uploads: list[FTPHybridFileUpload] = []
+    if publish_needed:
+        for item in hybrid.local.root_files:
+            previous = hybrid.previous_outputs.get(item.name)
+            if (
+                pending is not None
+                or plan.full
+                or previous != item.entry
+                or expected_types[item.name] is not RemotePathType.FILE
+                or item.name in adoptions
+            ):
+                uploads.append(
+                    FTPHybridFileUpload(
+                        item.name,
+                        item.local_path,
+                        item.entry.sha256,
+                        item.entry.size,
+                    )
+                )
+        for directory in hybrid.local.directories:
+            for relative, scanned in sorted(directory.files.items()):
+                uploads.append(
+                    FTPHybridFileUpload(
+                        f"{directory.name}/{relative}",
+                        scanned.local_path,
+                        scanned.entry.sha256,
+                        scanned.entry.size,
+                    )
+                )
+
+    create_directories: set[str] = set()
+    if publish_needed:
+        for directory in hybrid.local.directories:
+            create_directories.add(directory.name)
+            create_directories.update(
+                f"{directory.name}/{relative}" for relative in directory.directories
+            )
+    delete_files: set[str] = set()
+    remove_directories: set[str] = set()
+    if prune_needed:
+        for name in old_files - current:
+            if expected_types[name] is RemotePathType.FILE:
+                delete_files.add(name)
+        for name in current_directories:
+            tree = remote_trees[name]
+            local = directory_manifests[name]
+            delete_files.update(f"{name}/{path}" for path in set(tree.files) - set(local.files))
+            remove_directories.update(
+                f"{name}/{path}" for path in set(tree.directories) - set(local.directories)
+            )
+        for name in old_directories - current:
+            tree = remote_trees[name]
+            delete_files.update(f"{name}/{path}" for path in tree.files)
+            remove_directories.update(f"{name}/{path}" for path in tree.directories)
+            if expected_types[name] is RemotePathType.DIRECTORY:
+                remove_directories.add(name)
+
+    if phase in {
+        FTPPendingPhase.PRUNED,
+        FTPPendingPhase.OWNERSHIP_COMMITTED,
+        FTPPendingPhase.STATE_COMPLETE,
+    }:
+        for item in hybrid.local.root_files:
+            if transport.lstat(item.name) is not RemotePathType.FILE:
+                raise PlanError(f"FTP Hybrid resume cannot verify published file: {item.name}")
+        for directory in hybrid.local.directories:
+            tree = remote_trees[directory.name]
+            missing = sorted(set(directory.files) - set(tree.files))
+            if missing:
+                raise PlanError(
+                    "FTP Hybrid resume cannot verify published mirror files: "
+                    + ", ".join(f"{directory.name}/{path}" for path in missing[:10])
+                )
+            orphan_files = sorted(set(tree.files) - set(directory.files))
+            orphan_directories = sorted(set(tree.directories) - set(directory.directories))
+            if orphan_files or orphan_directories:
+                raise PlanError(
+                    "FTP Hybrid Pending phase claims prune complete but owned orphans remain: "
+                    + ", ".join(
+                        [
+                            *(f"{directory.name}/{path}" for path in orphan_files[:5]),
+                            *(f"{directory.name}/{path}/" for path in orphan_directories[:5]),
+                        ]
+                    )
+                )
+        remaining_historical = sorted(
+            name
+            for name in (old_files | old_directories) - current
+            if transport.lstat(name) is not RemotePathType.MISSING
+        )
+        if remaining_historical:
+            raise PlanError(
+                "FTP Hybrid Pending phase claims prune complete but historical paths remain: "
+                + ", ".join(remaining_historical)
+            )
+
+    ownership_changed = ownership is None or (
+        ownership.directories != next_ownership.directories
+        or ownership.root_files != next_ownership.root_files
+        or ownership.last_commit != next_ownership.last_commit
+    )
+    ownership_update = (
+        phase not in {FTPPendingPhase.OWNERSHIP_COMMITTED, FTPPendingPhase.STATE_COMPLETE}
+        and (
+            bool(uploads or create_directories or delete_files or remove_directories)
+            or bool(plan.operations)
+            or ownership_changed
+            or pending is not None
+        )
+    )
+    ftp = FTPHybridPlan(
+        capabilities,
+        pending,
+        next_ownership,
+        tuple(sorted(uploads, key=lambda item: item.path)),
+        tuple(sorted(create_directories, key=lambda path: (len(PurePosixPath(path).parts), path))),
+        tuple(sorted(delete_files)),
+        tuple(
+            sorted(
+                remove_directories,
+                key=lambda path: (-len(PurePosixPath(path).parts), path),
+            )
+        ),
+        tuple(sorted(adoptions)),
+        tuple(remote_trees[name] for name in sorted(remote_trees)),
+        ownership_update,
+        phase,
+    )
+    completed = replace(
+        hybrid,
+        ownership=ownership,
+        ftp=ftp,
+        expected_ownership_hash=ownership_snapshot,
+        expected_path_types=tuple(sorted(expected_types.items())),
+        remote_complete=True,
+    )
+    return replace(plan, hybrid=completed)
+
+
 def create_recovery_plan(
     config: Config,
     target: TargetConfig,
@@ -475,6 +854,11 @@ def create_recovery_plan(
     hybrid_outputs = tuple(output for output in config.outputs if output.mode == "hybrid")
     if not hybrid_outputs:
         return None
+    if target.protocol == "ftp":
+        raise PlanError(
+            "FTP Hybrid uses automatic Forward Resume during a normal reviewed deployment; "
+            "--recover is only for SFTP Staged Hybrid"
+        )
     if len(hybrid_outputs) != 1 or config.project_id is None:
         raise PlanError("Hybrid recovery requires one mapping and a resolved project_id")
     output = hybrid_outputs[0]
@@ -623,7 +1007,15 @@ def render_plan(plan: DeploymentPlan) -> str:
 def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
     """Render local Hybrid facts or the completed remote ownership plan."""
 
-    lines = [f"HYBRID Mapping: {hybrid.local.mapping} -> {hybrid.local.remote}"]
+    lines = [
+        f"HYBRID Mapping: {hybrid.local.mapping} -> {hybrid.local.remote}",
+        "HYBRID BACKEND: "
+        + (
+            "FTP IN-PLACE"
+            if hybrid.backend is HybridBackend.FTP_IN_PLACE
+            else "SFTP STAGED"
+        ),
+    ]
     if not hybrid.remote_complete:
         for item in hybrid.local.root_files:
             lines.append(f"LOCAL   [hybrid-file] {item.name} ({item.entry.size} byte(s))")
@@ -632,7 +1024,54 @@ def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
                 f"LOCAL   [hybrid-mirror] {item.name}/ "
                 f"({item.file_count} file(s), {item.total_size} byte(s))"
             )
-        lines.append("REMOTE  [hybrid-owner] not read; use --remote-plan for full ownership plan")
+        if hybrid.backend is HybridBackend.FTP_IN_PLACE:
+            lines.append("REMOTE  [ftp-hybrid] not read; use --remote-plan for exact orphan deletes")
+            lines.append("GUARANTEE upload-first=yes, prune-last=yes, forward-resume=yes")
+            lines.append(
+                "LIMITS directory-atomic-swap=no, rollback=no, after_deploy=no, "
+                "concurrent-last-moment-no-overwrite=no"
+            )
+        else:
+            lines.append(
+                "REMOTE  [hybrid-owner] not read; use --remote-plan for full ownership plan"
+            )
+        return tuple(lines)
+    if hybrid.ftp is not None:
+        ftp = hybrid.ftp
+        lines.append(
+            "SNAPSHOT [ftp-profile] "
+            f"banner={ftp.capabilities.server_banner_hash[:12]} "
+            f"({len(hybrid.expected_path_types)} direct path type(s))"
+        )
+        if ftp.pending is not None:
+            lines.append(
+                f"RESUME  [ftp-forward] {ftp.pending.deployment_id} "
+                f"from {ftp.pending.phase.value}"
+            )
+        for path in ftp.create_directories:
+            lines.append(f"MKDIR  [ftp-hybrid] {path}/")
+        for operation in ftp.uploads:
+            lines.append(f"UPLOAD [ftp-hybrid] {operation.path}")
+        for path in ftp.delete_files:
+            lines.append(f"DELETE [ftp-owner] {path}")
+        for path in ftp.remove_directories:
+            lines.append(f"RMD    [ftp-owner] {path}/")
+        for path in ftp.adoptions:
+            lines.append(f"ADOPT  [ftp-owner] {path}")
+        if ftp.ownership_update:
+            lines.append(f"OWNERSHIP UPDATE [ftp-owner] {hybrid.local.mapping}")
+        if len(ftp.delete_files) > 10_000:
+            lines.append("WARNING FTP Hybrid will delete more than 10,000 files")
+        if len(ftp.remove_directories) > 1_000:
+            lines.append("WARNING FTP Hybrid will remove more than 1,000 directories")
+        owned_count = len(hybrid.ownership.root_files) + len(hybrid.ownership.directories) if hybrid.ownership else 0
+        if owned_count and not hybrid.local.names:
+            lines.append("WARNING FTP Hybrid will delete all previously owned paths")
+        lines.append("GUARANTEE upload-first=yes, prune-last=yes, forward-resume=yes")
+        lines.append(
+            "LIMITS directory-atomic-swap=no, rollback=no, after_deploy=no, "
+            "concurrent-last-moment-no-overwrite=no"
+        )
         return tuple(lines)
     if hybrid.recovery_records:
         for record in hybrid.recovery_records:
@@ -736,6 +1175,11 @@ def validate_remote_freshness(
     hybrid = plan.hybrid
     if hybrid is None or not hybrid.remote_complete or config.project_id is None:
         raise PlanError("hybrid freshness validation requires a remote-complete plan")
+    if hybrid.backend is HybridBackend.FTP_IN_PLACE:
+        if not isinstance(transport, FTPTransport):
+            raise PlanError("FTP Hybrid freshness requires FTPTransport semantics")
+        _validate_ftp_remote_freshness(plan, config, transport, check_path_types=check_path_types)
+        return
     validate_internal_paths(transport)
     records = read_recovery_records(
         transport,
@@ -769,6 +1213,65 @@ def validate_remote_freshness(
                     f"remote path type changed after plan approval: {path!r} "
                     f"({expected.value} -> {actual.value}); rerun and review the plan"
                 )
+
+
+def _validate_ftp_remote_freshness(
+    plan: DeploymentPlan,
+    config: Config,
+    transport: FTPTransport,
+    *,
+    check_path_types: bool,
+) -> None:
+    """Re-read every reviewed FTP ownership, pending, type, and tree fact."""
+
+    hybrid = plan.hybrid
+    if hybrid is None or hybrid.ftp is None or config.project_id is None:
+        raise PlanError("FTP Hybrid freshness requires a remote-complete FTP plan")
+    if plan.target.runtime_dir is None:
+        raise PlanError("FTP Hybrid freshness lacks a Git runtime directory")
+    profile = load_capability_profile(
+        plan.target.runtime_dir,
+        plan.target,
+        server_banner_hash=transport.server_banner_hash(),
+    )
+    if profile != hybrid.ftp.capabilities:
+        raise StaleRemotePlanError("FTP Hybrid Capability Profile changed after plan approval")
+    _, actual_ownership_hash = read_ownership_snapshot(
+        transport,
+        project_id=config.project_id,
+        mapping=hybrid.local.mapping,
+        remote=hybrid.local.remote,
+    )
+    if actual_ownership_hash != hybrid.expected_ownership_hash:
+        raise StaleRemotePlanError(
+            "FTP Hybrid Ownership changed after plan approval; rerun and review the plan"
+        )
+    actual_pending = read_pending(
+        transport,
+        project_id=config.project_id,
+        mapping=hybrid.local.mapping,
+        remote=hybrid.local.remote,
+        target=plan.target,
+    )
+    if actual_pending != hybrid.ftp.pending:
+        raise StaleRemotePlanError(
+            "FTP Hybrid Pending Marker changed after plan approval; rerun and review the plan"
+        )
+    if not check_path_types:
+        return
+    for path, expected in hybrid.expected_path_types:
+        actual = transport.lstat(path)
+        if actual is not expected:
+            raise StaleRemotePlanError(
+                f"FTP Hybrid path type changed after plan approval: {path!r} "
+                f"({expected.value} -> {actual.value})"
+            )
+    for expected_tree in hybrid.ftp.remote_trees:
+        actual_tree = scan_ftp_tree(transport, expected_tree.root)
+        if actual_tree != expected_tree:
+            raise StaleRemotePlanError(
+                f"FTP Hybrid managed tree changed after plan approval: {expected_tree.root!r}"
+            )
 
 
 def validate_recovery_freshness(

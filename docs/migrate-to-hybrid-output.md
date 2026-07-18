@@ -35,7 +35,7 @@ remote = "."
 mode = "hybrid"
 ```
 
-Hybrid 只支持 SFTP，必须有唯一 Name、`remote = "."`，且不能配置 `delete_removed`。同一配置最多一个 Hybrid。`project_id` 可省略并从无凭据的 Git Origin 推导；无法推导时必须显式填写。
+Hybrid 根据 Target 协议选择 SFTP Staged 或 FTP In-place backend，必须有唯一 Name、`remote = "."`，且不能配置 `delete_removed`。同一配置最多一个 Hybrid。`project_id` 可省略并从无凭据的 Git Origin 推导；无法推导时必须显式填写。FTP 迁移还需先完成 Capability Probe，详见 [FTP Hybrid 迁移指南](migrate-to-ftp-hybrid.md)。
 
 不要让 Source 或其他 Output 管理 Hybrid 当前直接子项，也不要聚合 `.env`、`.git`、`.deploy`、`.git-deploy`、`uploads`、`runtime`、`storage` 等保护路径。Hybrid Local Root 不能是项目根目录或其符号链接别名；路径名不得包含首尾空格、Tab、控制字符或不可见空白。
 
@@ -69,7 +69,7 @@ git-deploy prod --yes
 
 Mirror Directory 每次都会完整 Stage/Swap并保留嵌套空目录，因此聚合根只要含直接目录，通常就不是 No-op，`after_deploy` 也会执行。Root File 仍按本地 State Hash 跳过未变化上传；若受管 Root File 被外部修改，请用 `--full` 重新发布。
 
-中断后不要直接执行新的部署写入。先只读审阅，再显式恢复：
+SFTP 中断后不要直接执行新的部署写入。先只读审阅，再显式恢复：
 
 ```bash
 git-deploy prod --remote-plan
@@ -79,5 +79,7 @@ git-deploy prod --yes
 ```
 
 `--recover` 走独立的 Recovery-only Prepare：即使当前 Build 失败、Local Hybrid 缺失或既有 State 内容损坏，也不会因此阻塞远端恢复。它只执行已确认的当前 Recovery 并退出；下一条普通命令会重新读取 Ownership 和路径类型、重新生成计划。不要手工删除 `.git-deploy`，也不要让另一个发布器修改 Hybrid 拥有的路径。Doctor 会只读报告 Ownership、Recovery、路径类型和是否需要 Adoption；必要 Backup 缺失时会要求人工检查并保留现场。
+
+FTP In-place Hybrid 不使用显式 `--recover`；普通部署会验证 Pending、Local Manifest、HEAD 与 Ownership 后 Forward Resume。Local Build 已变化时 Fail Closed，不会把两个部署合并。
 
 从 v1.4.0 升级时无需迁移 Ownership。旧 schema-1 Recovery 若尚未提交 Ownership，可由 v1.4.2 保守恢复；若 Ownership 已提交且 `after_deploy` 命令仍待执行，旧记录无法证明中断时的命令与超时契约，`--recover` 会 Fail Closed，Doctor 显示 `Legacy Command Contract Unknown`。此时不要改跑当前配置命令或删除记录，应先备份 `.git-deploy` 现场并人工核对旧版本配置、命令执行记录和远端状态。
