@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from git_deploy.config import Config, TargetConfig
 from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
 from git_deploy.ftp_hybrid import (
-    FTP_HYBRID_SCHEMA,
+    FTP_PENDING_SCHEMA,
     FTPHybridPending,
     FTPPendingPhase,
     local_manifest_hash,
@@ -508,7 +508,7 @@ def _execute_ftp_hybrid_plan(
         )
         deployment_id = uuid.uuid4().hex
         pending = FTPHybridPending(
-            FTP_HYBRID_SCHEMA,
+            FTP_PENDING_SCHEMA,
             config.project_id,
             hybrid.local.mapping,
             hybrid.local.remote,
@@ -521,6 +521,8 @@ def _execute_ftp_hybrid_plan(
             plan.head,
             next_state,
             ftp_plan.next_ownership.updated_at,
+            plan.non_hybrid_plan_hash,
+            plan.previous_state_hash,
         )
         try:
             _ensure_ftp_internal_directories(transport, deployment_id)
@@ -544,7 +546,7 @@ def _execute_ftp_hybrid_plan(
 
     stage_root = f".git-deploy/ftp-hybrid/stage/{pending.deployment_id}"
     phase = pending.phase
-    if phase in {FTPPendingPhase.PREPARED, FTPPendingPhase.FILES_PUBLISHED}:
+    if phase is FTPPendingPhase.PREPARED:
         for operation in plan.operations:
             _execute_with_retry(
                 operation,
@@ -847,8 +849,10 @@ def execute_recovery_plan(
             raise PlanError("FTP Hybrid recovery requires FTPTransport semantics")
         validate_recovery_freshness(plan, transport)
         pending = plan.pending
+        # Frozen Pending State remains authoritative for both post-commit phases.
+        # Re-saving it makes cross-machine and deleted/stale local recovery converge.
+        state_store.save(pending.next_state)
         if pending.phase is FTPPendingPhase.OWNERSHIP_COMMITTED:
-            state_store.save(pending.next_state)
             pending = pending.with_phase(FTPPendingPhase.STATE_COMPLETE)
             _write_ftp_pending(transport, pending)
         try:
@@ -1131,15 +1135,34 @@ def freeze_uploads(
         destination.parent.mkdir(parents=True, exist_ok=True)
         if operation.origin == "source":
             if not operation.git_path:
-                raise PlanError(f"source upload lacks a Git path: {operation.remote_path}")
+                raise PlanError(
+                    f"source upload lacks a Git path: {operation.remote_path}"
+                )
             repository.export_file(plan.head, operation.git_path, destination)
+            actual = hash_file(destination)
+            if (
+                operation.sha256 is None
+                or operation.size is None
+                or actual
+                != ManifestEntry(
+                    operation.sha256,
+                    operation.size,
+                )
+            ):
+                raise PlanError(
+                    f"source content does not match the frozen plan: {operation.git_path}"
+                )
         else:
             if operation.local_path is None:
-                raise PlanError(f"output upload lacks a local path: {operation.remote_path}")
+                raise PlanError(
+                    f"output upload lacks a local path: {operation.remote_path}"
+                )
             try:
                 shutil.copyfile(operation.local_path, destination)
             except OSError as exc:
-                raise PlanError(f"cannot freeze output {operation.local_path}: {exc}") from exc
+                raise PlanError(
+                    f"cannot freeze output {operation.local_path}: {exc}"
+                ) from exc
             expected = plan.output_manifest.get(operation.remote_path)
             actual = hash_file(destination)
             if expected is None or actual != expected:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import time
+import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-import time
-from typing import Literal
+from typing import Iterable, Literal
 
 from git_deploy.config import (
     Config,
@@ -45,7 +48,13 @@ from git_deploy.hybrid import (
     scan_hybrid_output,
     validate_internal_paths,
 )
-from git_deploy.manifest import ManifestEntry, ScannedOutput, TargetState, scan_outputs
+from git_deploy.manifest import (
+    ManifestEntry,
+    ScannedOutput,
+    TargetState,
+    scan_outputs,
+    target_state_hash,
+)
 from git_deploy.transports.base import RemotePathType, Transport
 from git_deploy.transports.ftp import FTPTransport
 
@@ -62,6 +71,7 @@ class UploadOperation:
     git_path: str | None = None
     size: int | None = None
     executable: bool = False
+    sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +248,8 @@ class DeploymentPlan:
     allow_adoption: bool = False
     hybrid: HybridPlan | None = None
     non_hybrid_owned: tuple[str, ...] = ()
+    previous_state_hash: str = ""
+    non_hybrid_plan_hash: str = ""
 
     @property
     def upload_count(self) -> int:
@@ -408,12 +420,40 @@ def create_plan(
                 "FTP cannot guarantee executable mode for source path(s): "
                 + ", ".join(executable_paths[:5])
             )
-    output_operations = _plan_outputs(incremental_outputs, current_outputs, state, effective_full)
+    output_operations = _plan_outputs(
+        incremental_outputs, current_outputs, state, effective_full
+    )
     operations = _merge_operations((*source_operations, *output_operations), config)
     manifest = {path: item.entry for path, item in current_outputs.items()}
     if hybrid_local is not None:
         manifest.update({item.name: item.entry for item in hybrid_local.root_files})
-    return DeploymentPlan(
+    if hybrid_local is not None and resolved_target.protocol == "ftp":
+        historical_source: set[str] = set()
+        if state is not None:
+            if not repository.commit_exists(state.last_commit):
+                raise PlanError(
+                    "FTP Hybrid cannot prove the historical Source root namespace "
+                    f"because State commit {state.last_commit!r} is unavailable"
+                )
+            historical_source = {
+                entry.path
+                for entry in repository.list_entries(state.last_commit)
+                if is_source_managed(entry.path, config.source)
+            }
+        namespace_entries = [
+            *(("source", path) for path in sorted(source_owned | historical_source)),
+            *(
+                ("incremental", path)
+                for path in sorted(
+                    set(current_outputs)
+                    | set(state.outputs if state is not None else {})
+                )
+            ),
+            *(("hybrid", name) for name in hybrid_local.names),
+            ("internal", ".git-deploy"),
+        ]
+        _validate_ftp_root_namespace(namespace_entries)
+    plan = DeploymentPlan(
         target=resolved_target,
         target_fingerprint=target_fingerprint,
         head=head,
@@ -432,7 +472,113 @@ def create_plan(
             else None
         ),
         non_hybrid_owned=tuple(sorted((*source_owned, *current_outputs.keys()))),
+        previous_state_hash=target_state_hash(state),
     )
+    return replace(plan, non_hybrid_plan_hash=deployment_contract_hash(plan, config))
+
+
+def deployment_contract_hash(plan: DeploymentPlan, config: Config) -> str:
+    """Hash every immutable non-Hybrid input needed for safe FTP resume.
+
+    Args:
+        plan: Frozen local deployment plan.
+        config: Source and incremental-output policy used to create the plan.
+
+    Returns:
+        Lowercase SHA256 of deterministic, machine-independent JSON.
+    """
+
+    operations: list[dict[str, object]] = []
+    for operation in plan.operations:
+        if isinstance(operation, UploadOperation):
+            if operation.sha256 is None or operation.size is None:
+                raise PlanError(
+                    f"upload operation lacks frozen content identity: {operation.remote_path}"
+                )
+            operations.append(
+                {
+                    "type": "upload",
+                    "origin": operation.origin,
+                    "remote_path": operation.remote_path,
+                    "git_path": operation.git_path,
+                    "executable": operation.executable,
+                    "sha256": operation.sha256,
+                    "size": operation.size,
+                }
+            )
+        else:
+            operations.append(
+                {
+                    "type": "delete",
+                    "origin": operation.origin,
+                    "remote_path": operation.remote_path,
+                }
+            )
+    incremental_policy = [
+        {
+            "remote": output.remote.as_posix(),
+            "delete_removed": output.delete_removed,
+            "mode": output.mode,
+        }
+        for output in sorted(
+            (item for item in config.outputs if item.mode == "incremental"),
+            key=lambda item: (item.remote.as_posix(), item.name or ""),
+        )
+    ]
+    payload = {
+        "head": plan.head,
+        "previous_commit": plan.previous_commit,
+        "previous_state_hash": plan.previous_state_hash,
+        "target_fingerprint": plan.target_fingerprint,
+        "full": plan.full,
+        "allow_adoption": plan.allow_adoption,
+        "operations": operations,
+        "source_policy": {
+            "include": list(config.source.include),
+            "exclude": list(config.source.exclude),
+            "protect": list(config.source.protect),
+            "require_clean_worktree": config.source.require_clean_worktree,
+        },
+        "incremental_output_policy": incremental_policy,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_ftp_root_namespace(entries: Iterable[tuple[str, str]]) -> None:
+    """Reject non-portable FTP root names across every ownership domain.
+
+    Args:
+        entries: Pairs of ownership domain and managed relative path.
+
+    Returns:
+        ``None`` when every root component is unique under NFC plus casefold.
+    """
+
+    roots: dict[str, tuple[str, str]] = {}
+    for domain, path in entries:
+        candidate = PurePosixPath(path)
+        if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+            raise PlanError(f"unsafe {domain} path in FTP root namespace: {path!r}")
+        root = candidate.parts[0]
+        key = unicodedata.normalize("NFC", root).casefold()
+        previous = roots.get(key)
+        if previous is None:
+            roots[key] = (domain, root)
+            continue
+        previous_domain, previous_root = previous
+        if root == previous_root and root != ".git-deploy":
+            continue
+        raise PlanError(
+            "FTP root namespace is not portable: "
+            f"{previous_domain} {previous_root!r} conflicts with {domain} {root!r} "
+            "under NFC plus casefold semantics"
+        )
 
 
 def complete_remote_plan(
@@ -594,6 +740,7 @@ def _complete_ftp_remote_plan(
         raise PlanError("FTP Hybrid planning requires one mapping and project_id")
     if plan.target.runtime_dir is None:
         raise PlanError("FTP Hybrid planning lacks a Git runtime directory")
+    transport.enable_utf8()
     capabilities = load_capability_profile(
         plan.target.runtime_dir,
         plan.target,
@@ -618,6 +765,8 @@ def _complete_ftp_remote_plan(
             pending,
             manifest_hash=manifest_snapshot,
             head=plan.head,
+            non_hybrid_plan_hash=plan.non_hybrid_plan_hash,
+            previous_state_hash=plan.previous_state_hash,
             current_ownership_hash=ownership_snapshot,
         )
     previous_updated_at = ownership.updated_at if ownership is not None else -1
@@ -649,14 +798,23 @@ def _complete_ftp_remote_plan(
     old_files = set(ownership.root_files if ownership is not None else ())
     old_directories = set(ownership.directories if ownership is not None else ())
     old = old_files | old_directories
+    _validate_ftp_root_namespace(
+        [
+            *(("non-hybrid", path) for path in plan.non_hybrid_owned),
+            *(("hybrid", name) for name in sorted(current)),
+            *(("historical hybrid", name) for name in sorted(old)),
+            ("internal", ".git-deploy"),
+        ]
+    )
     _reject_historical_transfer(plan, old - current)
-    type_changes = sorted((current_files & old_directories) | (current_directories & old_files))
+    type_changes = sorted(
+        (current_files & old_directories) | (current_directories & old_files)
+    )
     if type_changes:
         raise PlanError(
             "FTP Hybrid cannot safely change an owned direct path between file and directory; "
             "remove or migrate it explicitly, deploy that deletion, then add the new type "
-            "with --full: "
-            + ", ".join(type_changes)
+            "with --full: " + ", ".join(type_changes)
         )
 
     expected_types: dict[str, RemotePathType] = {}
@@ -897,6 +1055,7 @@ def create_recovery_plan(
             raise PlanError("FTP Hybrid recovery requires FTPTransport semantics")
         if target.runtime_dir is None:
             raise PlanError("FTP Hybrid recovery lacks a Git runtime directory")
+        transport.enable_utf8()
         load_capability_profile(
             target.runtime_dir,
             target,
@@ -1381,9 +1540,14 @@ def validate_recovery_freshness(
 
     if isinstance(plan, FTPRecoveryPlan):
         if not isinstance(transport, FTPTransport):
-            raise PlanError("FTP Hybrid recovery freshness requires FTPTransport semantics")
+            raise PlanError(
+                "FTP Hybrid recovery freshness requires FTPTransport semantics"
+            )
         if plan.target.runtime_dir is None:
-            raise PlanError("FTP Hybrid recovery freshness lacks a Git runtime directory")
+            raise PlanError(
+                "FTP Hybrid recovery freshness lacks a Git runtime directory"
+            )
+        transport.enable_utf8()
         load_capability_profile(
             plan.target.runtime_dir,
             plan.target,
@@ -1463,12 +1627,15 @@ def _plan_source(
         for path, entry in entries.items():
             if is_source_managed(path, config.source):
                 _require_regular_git_entry(entry)
+                content = repository.blob_manifest(head, path)
                 operations.append(
                     UploadOperation(
                         path,
                         "source",
                         git_path=path,
+                        size=content.size,
                         executable=entry.mode == "100755",
+                        sha256=content.sha256,
                     )
                 )
         return tuple(operations)
@@ -1484,12 +1651,15 @@ def _plan_source(
             if entry is None:
                 raise PlanError(f"changed source is missing from HEAD: {change.path}")
             _require_regular_git_entry(entry)
+            content = repository.blob_manifest(head, change.path)
             operations.append(
                 UploadOperation(
                     change.path,
                     "source",
                     git_path=change.path,
+                    size=content.size,
                     executable=entry.mode == "100755",
+                    sha256=content.sha256,
                 )
             )
     return tuple(operations)
@@ -1509,7 +1679,13 @@ def _plan_outputs(
         old = previous.get(remote)
         if full or old != scanned.entry:
             operations.append(
-                UploadOperation(remote, "output", local_path=scanned.local_path, size=scanned.entry.size)
+                UploadOperation(
+                    remote,
+                    "output",
+                    local_path=scanned.local_path,
+                    size=scanned.entry.size,
+                    sha256=scanned.entry.sha256,
+                )
             )
     if not full:
         for remote in sorted(previous.keys() - current.keys()):
@@ -1553,6 +1729,7 @@ def _merge_operations(operations: tuple[Operation, ...], config: Config) -> tupl
                 operation.git_path,
                 operation.size,
                 operation.executable,
+                operation.sha256,
             )
         else:
             normalized_operation = DeleteOperation(normalized, operation.origin)

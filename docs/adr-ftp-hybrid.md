@@ -1,6 +1,6 @@
 # ADR：FTP In-place Hybrid
 
-状态：Accepted；v1.5.1 安全收口
+状态：Accepted；v1.5.2 Pending/Unicode 契约收口
 
 日期：2026-07-18
 
@@ -17,7 +17,7 @@
 - FTP 只提供 Forward Resume，不提供目录 Swap、旧目录树回滚或 `after_deploy`；
 - 两种 backend 继续复用 `.git-deploy/hybrid/<mapping>.json` Ownership Schema；未被 Ownership 或经验证 Pending 声明拥有的未知根目录内容永不接管或删除。
 
-FTP Hybrid 强制要求大小写敏感路径、FEAT/MLSD、二进制 STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD。能力必须由用户显式运行 `git-deploy doctor TARGET --probe-ftp-hybrid` 探测，并缓存绑定 Target Fingerprint 与 Server Banner 的本地 Capability Profile Schema 2。Schema 1 没有路径语义证明，升级后必须重新 Probe。普通部署和只读 `--remote-plan` 不得静默写 Probe。
+FTP Hybrid 强制要求大小写敏感且保留 Unicode normalization 的 UTF-8 路径、FEAT/MLSD、二进制 STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD。能力必须由用户显式运行 `git-deploy doctor TARGET --probe-ftp-hybrid` 探测：服务器需广告 `UTF8`、接受 `OPTS UTF8 ON`，并通过中文名及 NFC/NFD 精确 MLSD/RETR/Rename/Delete。结果缓存为绑定 Target Fingerprint 与 Server Banner 的 Capability Profile Schema 3；旧 Schema 1/2 升级后必须重新 Probe。普通部署和只读 `--remote-plan` 不得静默写 Probe。
 
 ## 为什么不用 Incremental
 
@@ -29,7 +29,9 @@ FTP 没有跨服务器一致的目录原子替换、目录备份恢复和符号�
 
 ## Forward Resume
 
-`.git-deploy/ftp-hybrid/pending/<mapping>.json` 记录冻结的 Local Manifest、旧/新 Ownership Hash、下一份 Local State 与阶段：`PREPARED`、`FILES_PUBLISHED`、`PRUNED`、`OWNERSHIP_COMMITTED`、`STATE_COMPLETE`。前三个阶段必须验证当前 Local Manifest、HEAD 和严格 Ownership Hash 矩阵；后两个阶段只接受 Next Ownership，并通过显式 `--recover` 保存 Marker 中冻结的 State/清理，不运行 Build、不读取当前 State、不扫描当前 Hybrid 输出。
+`.git-deploy/ftp-hybrid/pending/<mapping>.json` Schema 2 记录冻结的 Local Manifest、非 Hybrid Operation/Policy Hash、Previous State Hash、旧/新 Ownership Hash、下一份 Local State 与阶段：`PREPARED`、`FILES_PUBLISHED`、`PRUNED`、`OWNERSHIP_COMMITTED`、`STATE_COMPLETE`。前三个阶段必须验证当前 Local Manifest、HEAD、稳定计划、Previous State 与严格 Ownership Hash 矩阵；`FILES_PUBLISHED` 不会重放普通 Source/Incremental Operations。Schema 1 的提交前 Marker 因缺少这些事实而 Fail Closed，提交后 Marker 仍可显式恢复。后两个阶段只接受 Next Ownership，并通过显式 `--recover` 始终重写 Marker 中冻结的 State 后再清理，不运行 Build、不读取当前 State、不扫描当前 Hybrid 输出。普通部署发现后提交 Marker 时在 Build/Plan 前提示改用 `--recover`。
+
+FTP Hybrid 的 Source、Incremental、Hybrid Direct、历史受管根以及内部 `.git-deploy` 共用一个 NFC + casefold 根命名空间。任何不具备跨平台唯一性的根名都必须在连接前拒绝；历史 Source commit 不可用时也不得猜测。
 
 每次 Freshness Gate 必须先清空 FTP MLSD、NLST 和 Missing Cache。清理只强制删除当前 Deployment Stage 和 Pending Marker；共享 Stage Parent 仅 best-effort 删除，旧 Orphan Stage 不得阻断当前部署完成。Doctor 只读报告 Orphan，不静默删除。
 

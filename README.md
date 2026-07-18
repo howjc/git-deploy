@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.5.1/git_deploy-1.5.1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.5.2/git_deploy-1.5.2-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -146,9 +146,9 @@ git-deploy doctor prod --probe-ftp-hybrid
 git-deploy doctor prod --probe-ftp-hybrid --yes
 ```
 
-Probe 只在 `.git-deploy/ftp-probe/<随机 ID>` 写入并清理本次临时内容，本地 Capability Profile Schema 2 绑定 Target Fingerprint 与 Server Banner。服务器必须可靠支持大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；缺少任一能力时 Fail Closed，不回退 LIST/NLST 类型猜测或直接覆盖上传。v1.5.0 的 Profile Schema 1 必须重新 Probe，不能无证据迁移。
+Probe 只在 `.git-deploy/ftp-probe/<随机 ID>` 写入并清理本次临时内容，本地 Capability Profile Schema 3 绑定 Target Fingerprint 与 Server Banner。服务器必须广告 UTF8、接受 `OPTS UTF8 ON`，并可靠支持中文名、NFC/NFD 精确名称、大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；缺少任一能力时 Fail Closed，不回退 LIST/NLST 类型猜测或直接覆盖上传。旧 Profile Schema 1/2 必须重新 Probe，不能无证据迁移。
 
-无 Ownership Manifest 且当前同名路径已存在时，普通部署会拒绝。先人工审阅，再用 `--full` 只接管当前本地存在的同名路径；未知路径不会被 Adoption。Hybrid 固定要求 `remote = "."`、单 Mapping，并禁止显式 `delete_removed`、本地 Local Root 等于项目根目录、本地/远端符号链接和隐式所有权转移。路径组件必须可稳定枚举：拒绝首尾空格、Tab、控制字符和不可见空白；直接 `.git`、`.deploy`、`.git-deploy` 永远拒绝。
+无 Ownership Manifest 且当前同名路径已存在时，普通部署会拒绝。先人工审阅，再用 `--full` 只接管当前本地存在的同名路径；未知路径不会被 Adoption。Hybrid 固定要求 `remote = "."`、单 Mapping，并禁止显式 `delete_removed`、本地 Local Root 等于项目根目录、本地/远端符号链接和隐式所有权转移。路径组件必须可稳定枚举：拒绝首尾空格、Tab、控制字符和不可见空白；直接 `.git`、`.deploy`、`.git-deploy` 永远拒绝。FTP Hybrid 还会在连接前统一检查 Source、Incremental、Hybrid Direct、历史受管根和内部 `.git-deploy`，拒绝任何 NFC + casefold 根名称冲突。
 
 FTP In-place Hybrid 还要求单发布器：部署期间不得由 CI、另一台机器、面板或手工 FTP 修改受管路径。FTP Rename Replace 无法保证 Planned-Missing 路径最后一刻不覆盖。受管直接路径的 File→Directory / Directory→File 会被拒绝；先从聚合视图移除旧类型并完成一次删除部署，再添加新类型并用 `--full` 审阅。
 
@@ -188,7 +188,7 @@ git-deploy prod --skip-build --yes
 git-deploy prod --full --yes
 ```
 
-`--dry-run` 默认仍执行构建，但不连接服务器、不写 State；FTP Hybrid 会提示使用 `--remote-plan` 获取精确孤儿列表。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读 Capability Profile、Ownership、Pending、MLSD 受管树和当前路径类型，完整显示 Adoption/Upload/Delete/RMD Plan，绝不 Probe、上传、删除、执行命令或写远端 Manifest/本地 State。FTP Pending 的 `PREPARED`、`FILES_PUBLISHED`、`PRUNED` 仍由普通部署在严格匹配 Local Manifest/HEAD 后向前收敛；`OWNERSHIP_COMMITTED`、`STATE_COMPLETE` 使用独立 `--recover`，不 Build、不读当前 State、不扫描本地 Hybrid，只保存 Marker 中冻结的 State 并清理本次 Stage/Marker。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
+`--dry-run` 默认仍执行构建，但不连接服务器、不写 State；FTP Hybrid 会提示使用 `--remote-plan` 获取精确孤儿列表。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读 Capability Profile、Ownership、Pending、MLSD 受管树和当前路径类型，完整显示 Adoption/Upload/Delete/RMD Plan，绝不 Probe、上传、删除、执行命令或写远端 Manifest/本地 State。FTP Pending Schema 2 的 `PREPARED`、`FILES_PUBLISHED`、`PRUNED` 仅在 Local Manifest、HEAD、Previous State、Source/Incremental Operation 与配置策略全部匹配后向前收敛；`FILES_PUBLISHED` 不重放普通上传/删除。`OWNERSHIP_COMMITTED`、`STATE_COMPLETE` 使用独立 `--recover`，普通部署会在 Build/Plan 前拒绝；恢复不 Build、不读当前 State、不扫描本地 Hybrid，并始终保存 Marker 中冻结的 State 后再清理 Stage/Marker。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
 
 只构建或诊断：
 
@@ -237,7 +237,7 @@ git-deploy build
 git-deploy build prod  # 可选：只校验每仓都存在 prod 这个名称
 ```
 
-部署前会先完成所有仓库的 Target 校验、Build、Local Plan 和上传字节冻结；任一 Local Prepare 失败时不会建立远端连接。Hybrid 普通部署随后只读完成所有 Remote Ownership Plan，再显示包含 Local/Remote Hybrid、Adoption、文件、命令和 Bytes 的 Combined Plan，只确认一次。每仓按“普通文件 → Hybrid → Ownership → 命令 → State → Cleanup”完成后才进入下一仓；相同 Native OpenSSH Endpoint 共用当前命令生命周期内的一条 ControlMaster。
+部署前会先完成所有仓库的 Target 校验；非 dry-run 的 FTP Hybrid 会先对全部仓库只读检查后提交 Pending，发现后统一提示 `--recover`，不会启动任何 Build/Plan。随后才执行全部 Build、Local Plan 和上传字节冻结；Hybrid 普通部署再只读完成所有 Remote Ownership Plan，显示包含 Local/Remote Hybrid、Adoption、文件、命令和 Bytes 的 Combined Plan，只确认一次。每仓按“普通文件 → Hybrid → Ownership → 命令 → State → Cleanup”完成后才进入下一仓；相同 Native OpenSSH Endpoint 共用当前命令生命周期内的一条 ControlMaster。
 
 Workspace 的独立 `build` 命令是纯本地操作：只加载各仓配置并顺序执行 Build，不解析 SSH Alias、不要求 `ssh`/`sftp`、不检查 Git 或远端 Root 所有权。显式附带 Target 时只检查该名称是否在每仓配置中存在。
 

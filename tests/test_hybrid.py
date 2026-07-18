@@ -1417,6 +1417,52 @@ def test_recovery_only_prepare_ignores_broken_local_deployment_inputs(
     assert store.load("dev") is not None
 
 
+def test_normal_prepare_checks_post_commit_pending_before_build_or_plan(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The normal CLI gate points to --recover before new deployment work begins."""
+
+    config_path = write_config(
+        git_project,
+        """
+[build]
+steps = ["printf built > build-marker"]
+
+[targets.dev]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+    )
+
+    def reject(*_args: object) -> None:
+        """Model a committed remote Pending marker."""
+
+        raise PlanError("run this target with --recover")
+
+    monkeypatch.setattr(
+        "git_deploy.prepared._reject_post_commit_ftp_pending",
+        reject,
+    )
+    monkeypatch.setattr(
+        "git_deploy.prepared.create_plan",
+        lambda *_args, **_kwargs: pytest.fail("new deployment plan was built"),
+    )
+
+    with pytest.raises(PlanError, match="--recover"):
+        prepare_project(
+            "project",
+            config_path,
+            None,
+            full=False,
+            skip_build=False,
+            check_post_commit_pending=True,
+        )
+    assert not (git_project / "build-marker").exists()
+
+
 def test_schema1_pending_commands_fail_closed_and_doctor_explains(
     git_project: Path,
 ) -> None:
@@ -1881,6 +1927,49 @@ def test_workspace_hybrid_root_gate_precedes_build_and_combined_plan_shows_remot
     assert all(remote.mutations == 0 for remote in remotes.values())
     for item in prepared:
         item.close()
+
+
+def test_workspace_post_commit_pending_gate_checks_all_repositories_before_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later recovery-only FTP marker prevents every earlier workspace Build."""
+
+    first = _create_repository(
+        tmp_path,
+        "api",
+        remote_root="/srv/api",
+        build_steps=("printf built > build-marker",),
+    )
+    second = _create_repository(tmp_path, "web", remote_root="/srv/web")
+    workspace = load_workspace(
+        _write_workspace(tmp_path, (("api", first), ("web", second)))
+    )
+    calls = 0
+
+    def reject_second(*_args: object) -> None:
+        """Model a post-commit Pending marker in the later repository."""
+
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PlanError("run this target with --recover")
+
+    monkeypatch.setattr(
+        "git_deploy.workspace._reject_post_commit_ftp_pending",
+        reject_second,
+    )
+
+    with pytest.raises(PlanError, match="--recover"):
+        prepare_workspace(
+            workspace,
+            None,
+            full=False,
+            skip_build=False,
+            check_post_commit_pending=True,
+        )
+    assert calls == 2
+    assert not (first / "build-marker").exists()
 
 
 def test_workspace_hybrid_partial_failure_stops_then_rerun_converges(

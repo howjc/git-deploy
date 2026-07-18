@@ -17,6 +17,11 @@ from git_deploy.deployer import (
     freeze_uploads,
 )
 from git_deploy.errors import PlanError, StateError
+from git_deploy.ftp_hybrid import (
+    FTPPendingPhase,
+    load_capability_profile,
+    read_pending,
+)
 from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
@@ -31,6 +36,7 @@ from git_deploy.planner import (
 )
 from git_deploy.transports import create_transport
 from git_deploy.transports.base import Transport
+from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
 
 
@@ -99,8 +105,9 @@ def prepare_project(
     prepared_config: Config | None = None,
     prepared_target: TargetConfig | None = None,
     prepared_lock: TargetLock | None = None,
+    check_post_commit_pending: bool = False,
 ) -> PreparedDeployment:
-    """Preflight, build, plan, and freeze one project with zero remote connection.
+    """Preflight, build, plan, and freeze one project under its target lock.
 
     Args:
         name: Human-readable repository label for warnings and summaries.
@@ -111,6 +118,8 @@ def prepare_project(
         prepared_config: Workspace-preloaded immutable project configuration.
         prepared_target: Workspace-pre-resolved physical target for this project.
         prepared_lock: Workspace lock already acquired before any project Build.
+        check_post_commit_pending: Read FTP metadata before Build and require
+            explicit recovery when remote ownership is already committed.
 
     Returns:
         A locked deployment whose upload bytes cannot change after confirmation.
@@ -126,6 +135,11 @@ def prepare_project(
         lock.acquire()
     temporary: tempfile.TemporaryDirectory[str] | None = None
     try:
+        resolved_target = prepared_target or resolve_target_for_plan(
+            target, runtime_dir=state_store.base
+        )
+        if check_post_commit_pending:
+            _reject_post_commit_ftp_pending(config, resolved_target)
         legacy_store = StateStore(repository.git_dir())
         if state_store.migrate_from(legacy_store, target.name):
             print(f"[{name}] Migrated target state to Git common dir.")
@@ -148,9 +162,6 @@ def prepare_project(
                 raise
             print(f"[{name}] WARNING: unreadable State will be rebuilt after full success.")
             state = None
-        resolved_target = prepared_target or resolve_target_for_plan(
-            target, runtime_dir=state_store.base
-        )
         if (
             state is not None
             and state.target_fingerprint != resolved_target.fingerprint
@@ -206,6 +217,61 @@ def prepare_project(
             temporary.cleanup()
         lock.release()
         raise
+
+
+def _reject_post_commit_ftp_pending(config: Config, target: TargetConfig) -> None:
+    """Stop a normal FTP deployment before Build when frozen recovery is authoritative.
+
+    Args:
+        config: Loaded project configuration containing the Hybrid mapping.
+        target: Resolved physical target used to read protected metadata.
+
+    Returns:
+        ``None`` when no post-commit FTP Pending marker exists.
+    """
+
+    hybrid_outputs = tuple(item for item in config.outputs if item.mode == "hybrid")
+    if target.protocol != "ftp" or not hybrid_outputs:
+        return
+    if len(hybrid_outputs) != 1 or config.project_id is None:
+        raise PlanError(
+            "FTP Hybrid pending preflight requires one mapping and project_id"
+        )
+    output = hybrid_outputs[0]
+    if output.name is None or target.runtime_dir is None:
+        raise PlanError(
+            "FTP Hybrid pending preflight lacks mapping or runtime identity"
+        )
+    transport = create_transport(target)
+    try:
+        transport.connect()
+        if not isinstance(transport, FTPTransport):
+            raise PlanError(
+                "FTP Hybrid pending preflight requires FTPTransport semantics"
+            )
+        transport.enable_utf8()
+        load_capability_profile(
+            target.runtime_dir,
+            target,
+            server_banner_hash=transport.server_banner_hash(),
+        )
+        pending = read_pending(
+            transport,
+            project_id=config.project_id,
+            mapping=output.name,
+            remote=output.remote.as_posix(),
+            target=target,
+        )
+        if pending is not None and pending.phase in {
+            FTPPendingPhase.OWNERSHIP_COMMITTED,
+            FTPPendingPhase.STATE_COMPLETE,
+        }:
+            raise PlanError(
+                "FTP Hybrid remote Ownership is already committed for a frozen Pending "
+                "deployment; run this target with --recover before starting a new deployment"
+            )
+    finally:
+        transport.close()
 
 
 def prepare_remote_plan(

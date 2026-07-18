@@ -14,6 +14,7 @@ from git_deploy.config import OutputConfig, TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.ftp_hybrid import (
     FTP_CAPABILITY_SCHEMA,
+    FTP_PENDING_SCHEMA,
     FTPHybridCapabilities,
     FTPHybridPending,
     FTPPendingPhase,
@@ -61,7 +62,9 @@ def _manifest(tmp_path: Path):  # noqa: ANN202
     )
 
 
-def test_capability_profile_round_trip_atomic_store_and_staleness(tmp_path: Path) -> None:
+def test_capability_profile_round_trip_atomic_store_and_staleness(
+    tmp_path: Path,
+) -> None:
     """Profiles are strict, non-secret, atomic, and bound to target plus banner."""
 
     target = _target()
@@ -78,12 +81,17 @@ def test_capability_profile_round_trip_atomic_store_and_staleness(tmp_path: Path
         True,
         True,
         123,
+        True,
+        True,
+        True,
     )
     data = serialize_capabilities(profile)
     assert parse_capabilities(data) == profile
     path = save_capability_profile(tmp_path, profile)
     assert path == capability_profile_path(tmp_path, target)
-    assert load_capability_profile(tmp_path, target, server_banner_hash=banner) == profile
+    assert (
+        load_capability_profile(tmp_path, target, server_banner_hash=banner) == profile
+    )
     assert "FTP_PASSWORD" not in data.decode("utf-8")
 
     with pytest.raises(PlanError, match="banner changed"):
@@ -93,7 +101,9 @@ def test_capability_profile_round_trip_atomic_store_and_staleness(tmp_path: Path
         load_capability_profile(tmp_path, target, server_banner_hash=banner)
 
 
-def test_capability_profile_rejects_missing_feature_and_target_change(tmp_path: Path) -> None:
+def test_capability_profile_rejects_missing_feature_and_target_change(
+    tmp_path: Path,
+) -> None:
     """A partial proof or different endpoint never silently enables FTP Hybrid."""
 
     target = _target()
@@ -109,6 +119,9 @@ def test_capability_profile_rejects_missing_feature_and_target_change(tmp_path: 
         True,
         True,
         1,
+        True,
+        True,
+        True,
     )
     save_capability_profile(tmp_path, partial)
     with pytest.raises(PlanError, match="does not satisfy"):
@@ -119,12 +132,16 @@ def test_capability_profile_rejects_missing_feature_and_target_change(tmp_path: 
         load_capability_profile(tmp_path, changed, server_banner_hash="c" * 64)
 
 
-def test_schema_one_capability_profile_requires_a_new_probe(tmp_path: Path) -> None:
-    """v1.5.0 profiles cannot migrate without proving remote path semantics."""
+@pytest.mark.parametrize("schema", [1, 2])
+def test_old_capability_profile_requires_a_new_probe(
+    tmp_path: Path,
+    schema: int,
+) -> None:
+    """Schema 1/2 profiles cannot migrate without proving Unicode semantics."""
 
     target = _target()
     legacy = {
-        "schema": 1,
+        "schema": schema,
         "target_fingerprint": target.fingerprint,
         "server_banner_hash": "a" * 64,
         "features": {
@@ -134,14 +151,32 @@ def test_schema_one_capability_profile_requires_a_new_probe(tmp_path: Path) -> N
             "rename_replace_file": True,
             "delete_file": True,
             "remove_directory": True,
+            **({"case_sensitive_paths": True} if schema == 2 else {}),
         },
         "probed_at": 1,
     }
-    with pytest.raises(PlanError, match="schema 1.*probe"):
+    with pytest.raises(PlanError, match="obsolete.*probe"):
         parse_capabilities(json.dumps(legacy).encode())
 
 
-def test_local_hybrid_rejects_root_and_nested_casefold_collisions(tmp_path: Path) -> None:
+def test_capability_probe_requires_advertised_utf8() -> None:
+    """An ASCII-only server fails before the probe creates any remote path."""
+
+    class MissingUTF8Transport:
+        """Advertise MLSD without the mandatory UTF8 feature."""
+
+        def features(self) -> frozenset[str]:
+            """Return the incomplete server feature set."""
+
+            return frozenset({"MLSD"})
+
+    with pytest.raises(DeployError, match="mandatory UTF8"):
+        probe_ftp_hybrid_capabilities(cast(Any, MissingUTF8Transport()), _target())
+
+
+def test_local_hybrid_rejects_root_and_nested_casefold_collisions(
+    tmp_path: Path,
+) -> None:
     """Local sibling names must remain portable before any remote connection."""
 
     root = tmp_path / "aggregation"
@@ -175,7 +210,7 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
         {"index.html": ManifestEntry("d" * 64, 5)},
     )
     pending = FTPHybridPending(
-        1,
+        FTP_PENDING_SCHEMA,
         "github.com/acme/project",
         "frontend-root",
         ".",
@@ -188,6 +223,8 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
         "head-1",
         state,
         11,
+        "3" * 64,
+        "4" * 64,
     )
     parsed = parse_pending(
         serialize_pending(pending),
@@ -197,17 +234,24 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
         target=target,
     )
     assert parsed == pending
-    assert parsed.with_phase(FTPPendingPhase.FILES_PUBLISHED).phase is FTPPendingPhase.FILES_PUBLISHED
+    assert (
+        parsed.with_phase(FTPPendingPhase.FILES_PUBLISHED).phase
+        is FTPPendingPhase.FILES_PUBLISHED
+    )
     validate_pending_resume(
         parsed,
         manifest_hash=manifest_hash,
         head="head-1",
+        non_hybrid_plan_hash="3" * 64,
+        previous_state_hash="4" * 64,
         current_ownership_hash="1" * 64,
     )
     validate_pending_resume(
         parsed.with_phase(FTPPendingPhase.PRUNED),
         manifest_hash=manifest_hash,
         head="head-1",
+        non_hybrid_plan_hash="3" * 64,
+        previous_state_hash="4" * 64,
         current_ownership_hash="2" * 64,
     )
     validate_pending_resume(
@@ -222,6 +266,8 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
             parsed,
             manifest_hash=manifest_hash,
             head="head-1",
+            non_hybrid_plan_hash="3" * 64,
+            previous_state_hash="4" * 64,
             current_ownership_hash="2" * 64,
         )
 
@@ -230,6 +276,8 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
             parsed,
             manifest_hash="3" * 64,
             head="head-1",
+            non_hybrid_plan_hash="3" * 64,
+            previous_state_hash="4" * 64,
             current_ownership_hash="1" * 64,
         )
     with pytest.raises(PlanError, match="HEAD"):
@@ -237,6 +285,8 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
             parsed,
             manifest_hash=manifest_hash,
             head="head-2",
+            non_hybrid_plan_hash="3" * 64,
+            previous_state_hash="4" * 64,
             current_ownership_hash="1" * 64,
         )
     with pytest.raises(PlanError, match="Ownership"):
@@ -244,6 +294,8 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
             parsed,
             manifest_hash=manifest_hash,
             head="head-1",
+            non_hybrid_plan_hash="3" * 64,
+            previous_state_hash="4" * 64,
             current_ownership_hash="4" * 64,
         )
     with pytest.raises(PlanError, match="identity"):
@@ -275,6 +327,82 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
         )
 
 
+def test_schema_one_pending_only_allows_post_commit_frozen_recovery(
+    tmp_path: Path,
+) -> None:
+    """Legacy markers fail closed pre-commit but remain recoverable after Ownership."""
+
+    target = _target()
+    state = TargetState(1, target.name, target.fingerprint, "head-1", 10, {})
+    legacy = FTPHybridPending(
+        1,
+        "github.com/acme/project",
+        "frontend-root",
+        ".",
+        target.fingerprint,
+        "deployment-1",
+        FTPPendingPhase.PREPARED,
+        "1" * 64,
+        "2" * 64,
+        local_manifest_hash(_manifest(tmp_path)),
+        "head-1",
+        state,
+        11,
+    )
+    parsed = parse_pending(
+        serialize_pending(legacy),
+        project_id=legacy.project_id,
+        mapping=legacy.mapping,
+        remote=legacy.remote,
+        target=target,
+    )
+    with pytest.raises(PlanError, match="schema 1 cannot safely resume"):
+        validate_pending_resume(
+            parsed,
+            manifest_hash=legacy.local_manifest_hash,
+            head=legacy.head,
+            current_ownership_hash=legacy.previous_ownership_hash,
+        )
+    validate_pending_resume(
+        parsed.with_phase(FTPPendingPhase.STATE_COMPLETE),
+        current_ownership_hash=legacy.next_ownership_hash,
+    )
+
+
+def test_schema_two_pending_requires_both_contract_hashes(tmp_path: Path) -> None:
+    """Strict Schema 2 parsing rejects a missing stable-plan or State identity."""
+
+    target = _target()
+    state = TargetState(1, target.name, target.fingerprint, "head-1", 10, {})
+    record = FTPHybridPending(
+        FTP_PENDING_SCHEMA,
+        "github.com/acme/project",
+        "frontend-root",
+        ".",
+        target.fingerprint,
+        "deployment-1",
+        FTPPendingPhase.PREPARED,
+        "1" * 64,
+        "2" * 64,
+        local_manifest_hash(_manifest(tmp_path)),
+        "head-1",
+        state,
+        11,
+        "3" * 64,
+        "4" * 64,
+    )
+    raw = json.loads(serialize_pending(record))
+    del raw["previous_state_hash"]
+    with pytest.raises(PlanError, match="invalid schema"):
+        parse_pending(
+            json.dumps(raw).encode(),
+            project_id=record.project_id,
+            mapping=record.mapping,
+            remote=record.remote,
+            target=target,
+        )
+
+
 class FakeMLSDSession:
     """Expose deterministic FEAT, MLSD, and RETR responses to FTPTransport."""
 
@@ -295,6 +423,7 @@ class FakeMLSDSession:
             "/root/assets/app.js": b"app",
             "/root/assets/nested/x.css": b"x",
         }
+        self.encoding = "latin-1"
 
     def mlsd(self, path: str):  # noqa: ANN201
         """Return configured MLSD rows or one permanent listing failure."""
@@ -311,8 +440,10 @@ class FakeMLSDSession:
     def sendcmd(self, command: str) -> str:
         """Return a multiline feature response with MLST semantics."""
 
-        assert command == "FEAT"
-        return "211-Features\n MLST type*;size*;modify*;\n UTF8\n211 End"
+        if command == "FEAT":
+            return "211-Features\n MLST type*;size*;modify*;\n UTF8\n211 End"
+        assert command == "OPTS UTF8 ON"
+        return "200 UTF8 enabled"
 
     def getwelcome(self) -> str:
         """Return one stable non-secret server greeting."""
@@ -328,6 +459,8 @@ def test_typed_mlsd_scanner_bounded_read_and_cache() -> None:
     transport.ftp = cast(Any, session)
 
     assert transport.features() == frozenset({"MLST", "MLSD", "UTF8"})
+    transport.enable_utf8()
+    assert session.encoding == "utf-8"
     assert transport.server_banner_hash() == transport.server_banner_hash()
     tree = scan_ftp_tree(transport, "assets")
     assert tree.files == ("app.js", "nested/x.css")
@@ -416,7 +549,10 @@ def test_case_insensitive_capability_probe_fails_closed() -> None:
         def features(self) -> frozenset[str]:
             """Advertise MLSD so path semantics become the decisive gate."""
 
-            return frozenset({"MLSD"})
+            return frozenset({"MLSD", "UTF8"})
+
+        def enable_utf8(self) -> None:
+            """Accept UTF-8 so case aliasing remains the decisive failure."""
 
         def make_directory(self, path: str, *, mode: int = 0o755) -> None:
             """Record one directory using case-insensitive identity."""
@@ -468,20 +604,31 @@ def test_case_insensitive_capability_probe_fails_closed() -> None:
                     )
             return tuple(names.values())
 
-        def remove_tree(self, path: str) -> None:
+        def remove_tree(
+            self, path: str, *, allow_name_collisions: bool = False
+        ) -> None:
             """Remove the current random probe root during finally cleanup."""
 
+            del allow_name_collisions
             prefix = path.casefold().rstrip("/")
             self.files = {
-                key: value for key, value in self.files.items() if not key.startswith(prefix)
+                key: value
+                for key, value in self.files.items()
+                if not key.startswith(prefix)
             }
             self.directories = {
                 value for value in self.directories if not value.startswith(prefix)
             }
 
-        def remove_directory(self, path: str) -> None:
+        def remove_directory(
+            self,
+            path: str,
+            *,
+            allow_name_collisions: bool = False,
+        ) -> None:
             """Best-effort-remove one empty shared directory."""
 
+            del allow_name_collisions
             self.directories.discard(path.casefold())
 
     with pytest.raises(DeployError, match="case-insensitive"):

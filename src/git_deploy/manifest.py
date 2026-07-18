@@ -238,11 +238,46 @@ def new_state(
     return TargetState(1, target, fingerprint, head, int(time.time()), outputs)
 
 
+def target_state_hash(state: TargetState | None) -> str:
+    """Return a deterministic SHA256 contract for one prior target State.
+
+    Args:
+        state: Validated prior State, or ``None`` for a true first deployment.
+
+    Returns:
+        Lowercase SHA256 over every semantic State field.
+    """
+
+    payload: dict[str, Any] | None
+    if state is None:
+        payload = None
+    else:
+        payload = {
+            "schema": state.schema,
+            "target": state.target,
+            "target_fingerprint": state.target_fingerprint,
+            "last_commit": state.last_commit,
+            "deployed_at": state.deployed_at,
+            "outputs": {
+                path: asdict(entry) for path, entry in sorted(state.outputs.items())
+            },
+        }
+    data = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
 def _parse_state(raw: Any, target: str, path: Path) -> TargetState:
     """Validate untrusted JSON state and build the typed model."""
 
     if not isinstance(raw, dict) or raw.get("schema") != 1:
-        raise StateError(f"unsupported or missing state schema in {path}; rerun with --full")
+        raise StateError(
+            f"unsupported or missing state schema in {path}; rerun with --full"
+        )
     if raw.get("target") != target:
         raise StateError(f"state target mismatch in {path}; rerun with --full")
     fingerprint = raw.get("target_fingerprint")

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from git_deploy.errors import PlanError
+from git_deploy.manifest import ManifestEntry
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +124,19 @@ class GitRepository:
     def list_head_entries(self) -> tuple[GitEntry, ...]:
         """Return every file-like entry tracked by HEAD in deterministic order."""
 
-        raw = self._run("ls-tree", "-r", "-z", "HEAD")
+        return self.list_entries("HEAD")
+
+    def list_entries(self, commit: str) -> tuple[GitEntry, ...]:
+        """Return every file-like entry tracked by one commit.
+
+        Args:
+            commit: Commit whose recursive tree should be inspected.
+
+        Returns:
+            Deterministically sorted file-like Git entries.
+        """
+
+        raw = self._run("ls-tree", "-r", "-z", commit)
         entries: list[GitEntry] = []
         for record in raw.split(b"\0"):
             if not record:
@@ -211,7 +225,23 @@ class GitRepository:
         try:
             return int(raw)
         except ValueError as exc:
-            raise PlanError(f"Git returned an invalid blob size for {path!r}: {raw!r}") from exc
+            raise PlanError(
+                f"Git returned an invalid blob size for {path!r}: {raw!r}"
+            ) from exc
+
+    def blob_manifest(self, commit: str, path: str) -> ManifestEntry:
+        """Return SHA256 and size for one exact committed source blob.
+
+        Args:
+            commit: Frozen deployment commit.
+            path: Relative Git path owned by the source plan.
+
+        Returns:
+            Content identity used by the stable non-Hybrid plan contract.
+        """
+
+        data = self._run("cat-file", "blob", f"{commit}:{path}")
+        return ManifestEntry(hashlib.sha256(data).hexdigest(), len(data))
 
     def _run(self, *arguments: str) -> bytes:
         """Run Git with byte-safe output and convert failures to plan errors."""
