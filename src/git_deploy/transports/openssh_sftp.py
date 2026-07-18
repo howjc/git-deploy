@@ -637,13 +637,24 @@ class OpenSSHSFTPTransport(Transport):
         )
 
     def rename_path(self, source: str, destination: str) -> None:
-        """Rename one Native SFTP path without overwriting a destination."""
+        """Atomically rename one Native SFTP path without replacing destination.
+
+        Args:
+            source: Safe relative path owned by the current deployment.
+            destination: Safe relative path that must remain absent remotely.
+
+        Returns:
+            ``None`` after OpenSSH's legacy no-replace rename succeeds.
+        """
 
         if self.lstat(destination) is not RemotePathType.MISSING:
             raise DeployError(f"remote rename destination already exists: {destination}")
         self._require_master().run_batch(
             (
-                f"rename {_quote_sftp(self._absolute(source))} "
+                # ``rename -l`` forces SSH2_FXP_RENAME. Plain OpenSSH ``rename``
+                # may negotiate posix-rename@openssh.com and overwrite a target
+                # created after the preflight lstat, violating this contract.
+                f"rename -l {_quote_sftp(self._absolute(source))} "
                 f"{_quote_sftp(self._absolute(destination))}",
             ),
             operation=f"rename {source} to {destination}",

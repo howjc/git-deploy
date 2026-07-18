@@ -8,7 +8,7 @@
 git-deploy
 ```
 
-v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、History、Verify、通用 Recover 或 Rollback。v1.4.2 的 `--recover` 只处理一个已审阅的 Hybrid 中断记录，不是历史恢复接口。旧实现冻结在 `legacy/v0.3` 分支和 v0.3.x tags；v1 配置和 state 与旧版不兼容。
+v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、History、Verify、通用 Recover 或 Rollback。v1.4.3 的 `--recover` 只处理一个已审阅的 Hybrid 中断记录，不是历史恢复接口。旧实现冻结在 `legacy/v0.3` 分支和 v0.3.x tags；v1 配置和 state 与旧版不兼容。
 
 ## 安装
 
@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.4.2/git_deploy-1.4.2-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.4.3/git_deploy-1.4.3-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -322,7 +322,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.4.2-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.4.3-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

@@ -93,6 +93,46 @@ def test_batch_path_quoting_rejects_command_delimiters() -> None:
         _quote_sftp("safe\nrm /important")
 
 
+def test_native_rename_path_forces_legacy_no_replace_in_all_deployment_contexts(
+    tmp_path: Path,
+) -> None:
+    """Stage publish, Backup, and Recovery restore all use legacy no-replace rename."""
+
+    calls: list[tuple[tuple[str, ...], str]] = []
+
+    class RecordingMaster:
+        """Capture the exact SFTP batch contract without opening a connection."""
+
+        def run_batch(self, commands, *, operation, check=True):  # noqa: ANN001, ANN202
+            """Record one batch and return a successful result."""
+
+            del check
+            calls.append((commands, operation))
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    transport = OpenSSHSFTPTransport(native_target(tmp_path, root="/srv/app root"))
+    transport.master = RecordingMaster()  # type: ignore[assignment]
+    transport.lstat = lambda remote_path: RemotePathType.MISSING  # type: ignore[method-assign]
+
+    scenarios = (
+        ('stage/file "one".js', 'final/file "one".js'),
+        ("assets", ".git-deploy/backup/deploy-id/assets"),
+        (".git-deploy/backup/deploy-id/assets", "assets"),
+    )
+    for source, destination in scenarios:
+        transport.rename_path(source, destination)
+
+    assert len(calls) == len(scenarios)
+    for (commands, operation), (source, destination) in zip(
+        calls, scenarios, strict=True
+    ):
+        expected_source = _quote_sftp(f"/srv/app root/{source}")
+        expected_destination = _quote_sftp(f"/srv/app root/{destination}")
+        assert commands == (f"rename -l {expected_source} {expected_destination}",)
+        assert operation == f"rename {source} to {destination}"
+        assert not commands[0].startswith('rename "')
+
+
 def test_long_common_dir_uses_short_private_socket_root(tmp_path: Path) -> None:
     """Deep worktree paths avoid sockaddr limits without sharing a public socket."""
 
