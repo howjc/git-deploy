@@ -102,3 +102,43 @@ def test_reference_aggregator_rejects_symlinked_destination_component(
     assert result.returncode != 0
     assert "contains a symbolic link" in result.stderr
     assert (actual / "known-good").read_text(encoding="utf-8") == "old"
+
+
+def test_reference_aggregator_rejects_core_protected_and_unstable_names(
+    tmp_path: Path,
+) -> None:
+    """The example enforces the same direct-name boundary as Hybrid Core."""
+
+    (tmp_path / "frontend/dist/.git").mkdir(parents=True)
+    (tmp_path / "admin/dist").mkdir(parents=True)
+    (tmp_path / "frontend/dist/.git/config").write_text("secret", encoding="utf-8")
+    destination = tmp_path / ".deploy/frontend-root"
+    destination.mkdir(parents=True)
+    (destination / "known-good").write_text("old", encoding="utf-8")
+
+    protected = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert protected.returncode != 0
+    assert "unsafe aggregate path" in protected.stderr
+    assert (destination / "known-good").read_text(encoding="utf-8") == "old"
+
+    (tmp_path / "frontend/dist/.git/config").unlink()
+    (tmp_path / "frontend/dist/.git").rmdir()
+    (tmp_path / "frontend/dist/trailing ").mkdir()
+    unstable = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert unstable.returncode != 0
+    assert "unsafe aggregate path" in unstable.stderr
+    assert (destination / "known-good").read_text(encoding="utf-8") == "old"

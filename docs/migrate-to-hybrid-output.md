@@ -37,7 +37,7 @@ mode = "hybrid"
 
 Hybrid 只支持 SFTP，必须有唯一 Name、`remote = "."`，且不能配置 `delete_removed`。同一配置最多一个 Hybrid。`project_id` 可省略并从无凭据的 Git Origin 推导；无法推导时必须显式填写。
 
-不要让 Source 或其他 Output 管理 Hybrid 当前直接子项，也不要聚合 `.env`、`.git`、`.git-deploy`、`uploads`、`runtime`、`storage` 等保护路径。
+不要让 Source 或其他 Output 管理 Hybrid 当前直接子项，也不要聚合 `.env`、`.git`、`.deploy`、`.git-deploy`、`uploads`、`runtime`、`storage` 等保护路径。Hybrid Local Root 不能是项目根目录或其符号链接别名；路径名不得包含首尾空格、Tab、控制字符或不可见空白。
 
 ## 3. 首次审阅与接管
 
@@ -67,6 +67,15 @@ git-deploy prod --full
 git-deploy prod --yes
 ```
 
-Mirror Directory 每次都会完整 Stage/Swap，因此聚合根只要含直接目录，通常就不是 No-op，`after_deploy` 也会执行。Root File 仍按 Hash 跳过未变化上传。
+Mirror Directory 每次都会完整 Stage/Swap并保留嵌套空目录，因此聚合根只要含直接目录，通常就不是 No-op，`after_deploy` 也会执行。Root File 仍按本地 State Hash 跳过未变化上传；若受管 Root File 被外部修改，请用 `--full` 重新发布。
 
-中断后直接重跑同一命令。工具只根据受身份约束的 Recovery Record 恢复/继续当前 Swap；不要手工删除 `.git-deploy`，也不要让另一个发布器修改 Hybrid 拥有的路径。Doctor 会只读报告 Ownership、Recovery、路径类型和是否需要 Adoption。
+中断后不要直接执行新的部署写入。先只读审阅，再显式恢复：
+
+```bash
+git-deploy prod --remote-plan
+git-deploy prod --recover
+git-deploy prod --remote-plan
+git-deploy prod --yes
+```
+
+`--recover` 只执行已确认的当前 Recovery 并退出；下一条普通命令会重新读取 Ownership 和路径类型、重新生成计划。不要手工删除 `.git-deploy`，也不要让另一个发布器修改 Hybrid 拥有的路径。Doctor 会只读报告 Ownership、Recovery、路径类型和是否需要 Adoption；必要 Backup 缺失时会要求人工检查并保留现场。

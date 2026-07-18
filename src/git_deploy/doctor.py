@@ -9,6 +9,7 @@ from git_deploy.config import Config, TargetConfig, resolve_target_for_plan
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
     HybridLocalManifest,
+    inspect_recovery,
     read_ownership,
     read_recovery_records,
     scan_hybrid_output,
@@ -247,11 +248,32 @@ def _append_hybrid_remote_results(
             mapping=mapping,
             target_fingerprint=target.fingerprint,
         )
+        try:
+            outcomes = tuple(inspect_recovery(transport, record) for record in records)
+        except Exception as exc:
+            results.append(
+                DoctorResult(
+                    "hybrid recovery",
+                    False,
+                    f"manual inspection required: {exc}",
+                )
+            )
+            return
         results.append(
             DoctorResult(
                 "hybrid recovery",
                 not records,
-                "none" if not records else f"pending: {len(records)} record(s)",
+                "none"
+                if not records
+                else "pending: "
+                + ", ".join(
+                    "commands"
+                    if outcome.commands_pending
+                    else "cleanup"
+                    if outcome.ownership_committed
+                    else "restore"
+                    for outcome in outcomes
+                ),
             )
         )
         ownership = read_ownership(

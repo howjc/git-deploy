@@ -19,7 +19,12 @@ from git_deploy.errors import PlanError, StateError
 from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
-from git_deploy.planner import DeploymentPlan, complete_remote_plan, create_plan
+from git_deploy.planner import (
+    DeploymentPlan,
+    complete_remote_plan,
+    create_plan,
+    validate_remote_freshness,
+)
 from git_deploy.transports import create_transport
 from git_deploy.transports.base import Transport
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
@@ -249,6 +254,7 @@ def execute_prepared(
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
+    recover_only: bool = False,
 ) -> None:
     """Execute one prepared project and always release its local resources."""
 
@@ -262,7 +268,25 @@ def execute_prepared(
             transport_factory=transport_factory,
             connection_pool=connection_pool,
             prepared_transport=prepared.transport,
+            recover_only=recover_only,
         )
         prepared.transport = None
     finally:
         prepared.close()
+
+
+def validate_prepared_freshness(prepared: PreparedDeployment) -> None:
+    """Revalidate one connected Hybrid plan without mutating remote state.
+
+    Args:
+        prepared: Remote-complete prepared deployment retaining its transport.
+
+    Returns:
+        ``None`` when the reviewed remote snapshot remains current.
+    """
+
+    if prepared.plan.hybrid is None:
+        return
+    if prepared.transport is None:
+        raise PlanError("hybrid freshness validation requires a prepared transport")
+    validate_remote_freshness(prepared.plan, prepared.config, prepared.transport)

@@ -51,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read remote ownership and print the full plan without writing",
     )
+    planning.add_argument(
+        "--recover",
+        action="store_true",
+        help="review and explicitly execute one pending Hybrid Recovery",
+    )
     parser.add_argument("--skip-build", action="store_true", help="skip configured build steps")
     parser.add_argument(
         "--full",
@@ -205,6 +210,8 @@ def _deploy_project(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
+    if args.recover and args.full:
+        raise ConfigError("--recover does not accept --full")
 
     prepared = prepare_project(
         config.project_root.name,
@@ -214,8 +221,10 @@ def _deploy_project(
         skip_build=args.skip_build,
     )
     try:
-        if not args.dry_run and (args.remote_plan or prepared.plan.hybrid is not None):
-            prepare_remote_plan(prepared, allow_recovery=not args.remote_plan)
+        if not args.dry_run and (
+            args.remote_plan or args.recover or prepared.plan.hybrid is not None
+        ):
+            prepare_remote_plan(prepared, allow_recovery=False)
         print(render_plan(prepared.plan))
         if args.dry_run:
             print("Dry-run complete: no remote connection and no state change.")
@@ -226,9 +235,25 @@ def _deploy_project(
                 "or local state write."
             )
             return 0
+        has_recovery = bool(
+            prepared.plan.hybrid and prepared.plan.hybrid.recovery_records
+        )
+        if has_recovery and not args.recover:
+            raise ConfigError(
+                "pending Hybrid Recovery requires a separate reviewed --recover run"
+            )
+        if args.recover and not has_recovery:
+            raise ConfigError("no pending Hybrid Recovery exists for this target")
         if prepared.plan.has_remote_work and not args.yes:
             _confirm(prepared.plan)
-        execute_prepared(prepared, verbose=args.verbose)
+        execute_prepared(
+            prepared,
+            verbose=args.verbose,
+            recover_only=args.recover,
+        )
+        if args.recover:
+            print("Hybrid Recovery step finished; rerun --remote-plan to verify its state.")
+            return 0
         print(
             f"Deployment completed: {prepared.plan.upload_count} upload(s), "
             f"{prepared.plan.delete_count} delete(s)."
@@ -256,6 +281,8 @@ def _deploy_workspace(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
+    if args.recover and args.full:
+        raise ConfigError("--recover does not accept --full")
 
     target, prepared = prepare_workspace(
         workspace,
@@ -266,13 +293,15 @@ def _deploy_workspace(
     pool = SSHConnectionPool()
     try:
         if not args.dry_run and (
-            args.remote_plan or any(item.plan.hybrid is not None for item in prepared)
+            args.remote_plan
+            or args.recover
+            or any(item.plan.hybrid is not None for item in prepared)
         ):
             for item in prepared:
                 if args.remote_plan or item.plan.hybrid is not None:
                     prepare_remote_plan(
                         item,
-                        allow_recovery=not args.remote_plan,
+                        allow_recovery=False,
                         connection_pool=pool,
                     )
         print(render_workspace_plan(target, prepared))
@@ -284,6 +313,17 @@ def _deploy_workspace(
                 "Workspace remote plan complete: no remote or local state mutation."
             )
             return 0
+        recovery_count = sum(
+            len(item.plan.hybrid.recovery_records)
+            for item in prepared
+            if item.plan.hybrid is not None
+        )
+        if recovery_count and not args.recover:
+            raise ConfigError(
+                "pending Hybrid Recovery requires a separate reviewed --recover run"
+            )
+        if args.recover and not recovery_count:
+            raise ConfigError("no pending Hybrid Recovery exists in this workspace")
         operation_count = sum(item.plan.operation_count for item in prepared)
         adoption_count = sum(item.plan.adoption_count for item in prepared)
         command_count = sum(
@@ -301,7 +341,13 @@ def _deploy_workspace(
             prepared,
             verbose=args.verbose,
             connection_pool=pool,
+            recover_only=args.recover,
         )
+        if args.recover:
+            print(
+                "Workspace Hybrid Recovery step finished; rerun --remote-plan to verify."
+            )
+            return 0
         uploads = sum(item.plan.upload_count for item in prepared)
         deletes = sum(item.plan.delete_count for item in prepared)
         print(
@@ -400,6 +446,7 @@ def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> Non
     if (
         args.dry_run
         or args.remote_plan
+        or args.recover
         or args.skip_build
         or args.full
         or args.yes
@@ -411,7 +458,14 @@ def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> Non
 def _validate_doctor_args(args: argparse.Namespace) -> None:
     """Reject deploy-only options accidentally passed to doctor."""
 
-    if args.dry_run or args.remote_plan or args.skip_build or args.full or args.yes:
+    if (
+        args.dry_run
+        or args.remote_plan
+        or args.recover
+        or args.skip_build
+        or args.full
+        or args.yes
+    ):
         raise ConfigError("doctor does not accept deploy-only flags")
 
 
@@ -423,6 +477,7 @@ def _validate_init_args(args: argparse.Namespace) -> None:
     if (
         args.dry_run
         or args.remote_plan
+        or args.recover
         or args.skip_build
         or args.full
         or args.yes

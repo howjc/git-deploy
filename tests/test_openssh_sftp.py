@@ -16,6 +16,7 @@ from git_deploy.errors import DeployError
 from git_deploy.planner import UploadOperation
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
+from git_deploy.transports.base import RemotePathType
 from git_deploy.transports.openssh_sftp import (
     OpenSSHMaster,
     OpenSSHSFTPTransport,
@@ -523,6 +524,29 @@ def test_native_probe_accepts_only_confirmed_missing(
 
     assert transport._probe("/srv/app/old.js") is PathProbeResult.MISSING
     transport.delete("old.js")
+
+
+@pytest.mark.parametrize("unsafe_name", [" leading", "trailing ", "tab\tname"])
+def test_native_listing_rejects_names_changed_by_text_normalization(
+    tmp_path: Path,
+    unsafe_name: str,
+) -> None:
+    """Native listings fail closed instead of trimming ambiguous remote names."""
+
+    class ListingMaster:
+        """Return one unsafe direct child from a successful SFTP batch."""
+
+        def run_batch(self, commands, **kwargs):  # noqa: ANN001, ANN202
+            """Return the configured listing without normalizing its bytes."""
+
+            return subprocess.CompletedProcess([], 0, f"{unsafe_name}\n", "")
+
+    transport = OpenSSHSFTPTransport(native_target(tmp_path))
+    transport.master = ListingMaster()  # type: ignore[assignment]
+    transport.lstat = lambda remote_path: RemotePathType.DIRECTORY  # type: ignore[method-assign]
+
+    with pytest.raises(DeployError, match="unsafe name"):
+        transport.list_directory("assets")
 
 
 def test_pool_evicts_dead_master_and_establishes_a_second_connection(

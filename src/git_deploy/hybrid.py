@@ -14,10 +14,14 @@ from typing import Any
 from git_deploy.config import OutputConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.manifest import ManifestEntry, ScannedOutput, hash_file
-from git_deploy.transports.base import RemotePathType, Transport
+from git_deploy.transports.base import (
+    RemotePathType,
+    Transport,
+    is_stable_remote_component,
+)
 
 OWNERSHIP_SCHEMA = 1
-RECOVERY_SCHEMA = 1
+RECOVERY_SCHEMA = 2
 MAX_REMOTE_RECORD_BYTES = 64 * 1024
 
 
@@ -37,6 +41,7 @@ class HybridDirectoryManifest:
     name: str
     local_root: Path
     files: dict[str, ScannedOutput]
+    directories: tuple[str, ...]
     file_count: int
     total_size: int
 
@@ -89,6 +94,7 @@ class RecoveryPhase(str, Enum):
     PREPARED = "PREPARED"
     STAGED = "STAGED"
     SWAPPING = "SWAPPING"
+    RESTORED = "RESTORED"
     OWNERSHIP_COMMITTED = "OWNERSHIP_COMMITTED"
     COMMANDS_COMPLETE = "COMMANDS_COMPLETE"
     STATE_COMPLETE = "STATE_COMPLETE"
@@ -110,6 +116,9 @@ class HybridRecoveryRecord:
     new_ownership_hash: str
     backup_names: tuple[str, ...]
     old_existing_names: tuple[str, ...]
+    completed_names: tuple[str, ...] = ()
+    active_name: str | None = None
+    command_hash: str | None = None
 
     def with_phase(self, phase: RecoveryPhase) -> HybridRecoveryRecord:
         """Return an immutable record advanced to one lifecycle phase.
@@ -122,6 +131,30 @@ class HybridRecoveryRecord:
         """
 
         return replace(self, phase=phase)
+
+    def starting(self, name: str) -> HybridRecoveryRecord:
+        """Return a record durably identifying the next path mutation.
+
+        Args:
+            name: Direct owned path whose backup/swap is about to start.
+
+        Returns:
+            Copy with the prior active path completed and this path active.
+        """
+
+        completed = self.completed_names
+        if self.active_name is not None:
+            completed = tuple(sorted((*completed, self.active_name)))
+        return replace(self, completed_names=completed, active_name=name)
+
+@dataclass(frozen=True, slots=True)
+class HybridRecoveryOutcome:
+    """Describe read-only recovery work still required after interruption."""
+
+    ownership_committed: bool
+    commands_pending: bool
+    state_pending: bool
+    cleanup_pending: bool
 
 
 def scan_hybrid_output(output: OutputConfig) -> HybridLocalManifest:
@@ -313,13 +346,19 @@ def serialize_recovery(record: HybridRecoveryRecord) -> bytes:
         record: Validated recovery state.
 
     Returns:
-        UTF-8 schema-1 JSON.
+        UTF-8 JSON matching the record's recovery schema.
     """
 
     payload = asdict(record)
     payload["phase"] = record.phase.value
     payload["backup_names"] = list(record.backup_names)
     payload["old_existing_names"] = list(record.old_existing_names)
+    if record.schema >= 2:
+        payload["completed_names"] = list(record.completed_names)
+    else:
+        payload.pop("completed_names")
+        payload.pop("active_name")
+        payload.pop("command_hash")
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -346,7 +385,7 @@ def parse_recovery(
         raw = json.loads(data.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise DeployError(f"remote hybrid recovery record is invalid JSON: {exc}") from exc
-    expected_fields = {
+    schema_1_fields = {
         "schema",
         "deployment_id",
         "mapping",
@@ -359,7 +398,17 @@ def parse_recovery(
         "backup_names",
         "old_existing_names",
     }
-    if not isinstance(raw, dict) or set(raw) != expected_fields or raw.get("schema") != 1:
+    schema_2_fields = {
+        *schema_1_fields,
+        "completed_names",
+        "active_name",
+        "command_hash",
+    }
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema") not in {1, RECOVERY_SCHEMA}
+        or set(raw) != (schema_1_fields if raw.get("schema") == 1 else schema_2_fields)
+    ):
         raise DeployError("remote hybrid recovery record has invalid fields or schema")
     if raw.get("mapping") != mapping or raw.get("target_fingerprint") != target_fingerprint:
         raise DeployError("remote hybrid recovery identity mismatch")
@@ -384,8 +433,23 @@ def parse_recovery(
     old_existing = _parse_names(raw.get("old_existing_names"), "old_existing_names")
     if not set(old_existing).issubset(names):
         raise DeployError("remote hybrid recovery old-existing names are inconsistent")
+    completed = (
+        _parse_names(raw.get("completed_names"), "completed_names")
+        if raw["schema"] == RECOVERY_SCHEMA
+        else ()
+    )
+    active = raw.get("active_name") if raw["schema"] == RECOVERY_SCHEMA else None
+    command_hash = raw.get("command_hash") if raw["schema"] == RECOVERY_SCHEMA else None
+    if (
+        not set(completed).issubset(names)
+        or active is not None
+        and (not isinstance(active, str) or active not in names or active in completed)
+        or raw["schema"] == RECOVERY_SCHEMA
+        and not _valid_sha256(command_hash)
+    ):
+        raise DeployError("remote hybrid recovery path progress is inconsistent")
     return HybridRecoveryRecord(
-        RECOVERY_SCHEMA,
+        raw["schema"],
         deployment_id,
         mapping,
         target_fingerprint,
@@ -396,7 +460,32 @@ def parse_recovery(
         raw["new_ownership_hash"],
         names,
         old_existing,
+        completed,
+        active,
+        command_hash,
     )
+
+
+def recovery_command_hash(
+    commands: tuple[str, ...],
+    timeout: float | None,
+) -> str:
+    """Hash the reviewed remote command contract stored outside Recovery.
+
+    Args:
+        commands: Frozen validated after-deploy commands.
+        timeout: Frozen per-command timeout.
+
+    Returns:
+        SHA256 of a deterministic command/timeout representation.
+    """
+
+    payload = json.dumps(
+        {"commands": commands, "timeout": timeout},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def read_ownership(
@@ -418,16 +507,47 @@ def read_ownership(
         Valid ownership, or ``None`` for a confirmed first deployment.
     """
 
+    ownership, _ = read_ownership_snapshot(
+        transport,
+        project_id=project_id,
+        mapping=mapping,
+        remote=remote,
+    )
+    return ownership
+
+
+def read_ownership_snapshot(
+    transport: Transport,
+    *,
+    project_id: str,
+    mapping: str,
+    remote: str,
+) -> tuple[HybridOwnership | None, str]:
+    """Read ownership and return the SHA256 of its exact approved bytes.
+
+    Args:
+        transport: Connected SFTP transport.
+        project_id: Expected project identity.
+        mapping: Expected Hybrid mapping name.
+        remote: Expected mapping remote value.
+
+    Returns:
+        Parsed ownership (or ``None``) and raw-byte hash for freshness checks.
+    """
+
     path = ownership_path(mapping)
     kind = transport.lstat(path)
     if kind is RemotePathType.MISSING:
-        return None
+        return None, hashlib.sha256(b"").hexdigest()
     if kind is not RemotePathType.FILE:
         raise DeployError(
             f"remote hybrid ownership manifest must be a regular file, not {kind.value}: {path}"
         )
     data = transport.read_file(path, max_bytes=MAX_REMOTE_RECORD_BYTES)
-    return parse_ownership(data, project_id=project_id, mapping=mapping, remote=remote)
+    return (
+        parse_ownership(data, project_id=project_id, mapping=mapping, remote=remote),
+        hashlib.sha256(data).hexdigest(),
+    )
 
 
 def validate_internal_paths(transport: Transport) -> None:
@@ -495,7 +615,79 @@ def read_recovery_records(
     return tuple(sorted(records, key=lambda item: item.deployment_id))
 
 
-def reconcile_recovery(transport: Transport, record: HybridRecoveryRecord) -> None:
+def inspect_recovery(
+    transport: Transport,
+    record: HybridRecoveryRecord,
+) -> HybridRecoveryOutcome:
+    """Validate Recovery facts without changing any remote path.
+
+    Args:
+        transport: Connected SFTP transport used only for reads.
+        record: Valid record bound to this mapping and physical target.
+
+    Returns:
+        Pending command/state/cleanup classification for confirmed execution.
+    """
+
+    actual_ownership_hash = _remote_ownership_hash(transport, record.mapping)
+    if actual_ownership_hash not in {
+        record.old_ownership_hash,
+        record.new_ownership_hash,
+    }:
+        raise DeployError("cannot reconcile recovery because ownership hash is unknown")
+    committed = actual_ownership_hash == record.new_ownership_hash
+    phase_claims_commit = record.phase in {
+        RecoveryPhase.OWNERSHIP_COMMITTED,
+        RecoveryPhase.COMMANDS_COMPLETE,
+        RecoveryPhase.STATE_COMPLETE,
+        RecoveryPhase.CLEANUP_COMPLETE,
+    }
+    if phase_claims_commit and not committed:
+        raise DeployError("recovery phase claims committed ownership but its hash is stale")
+    if record.phase in {RecoveryPhase.PREPARED, RecoveryPhase.STAGED} and committed:
+        raise DeployError("recovery phase precedes swap but ownership already changed")
+    if record.phase is RecoveryPhase.SWAPPING and not committed:
+        progressed = (
+            set(record.completed_names) | ({record.active_name} if record.active_name else set())
+            if record.schema >= 2
+            else set(record.old_existing_names)
+        )
+        for name in set(record.old_existing_names) & progressed:
+            backup = f"{record.backup_root}/{name}"
+            if transport.lstat(backup) is RemotePathType.MISSING:
+                raise DeployError(
+                    "manual inspection required: recovery backup is missing for "
+                    f"previously existing path {name!r}"
+                )
+        if record.schema == 1:
+            for name in set(record.backup_names) - set(record.old_existing_names):
+                backup = f"{record.backup_root}/{name}"
+                if (
+                    transport.lstat(backup) is RemotePathType.MISSING
+                    and transport.lstat(name) is not RemotePathType.MISSING
+                ):
+                    raise DeployError(
+                        "manual inspection required: legacy recovery cannot prove "
+                        f"whether newly existing path {name!r} was deployed"
+                    )
+    if record.phase is RecoveryPhase.RESTORED and committed:
+        raise DeployError("restored recovery unexpectedly has committed ownership")
+    commands_pending = committed and record.phase in {
+        RecoveryPhase.SWAPPING,
+        RecoveryPhase.OWNERSHIP_COMMITTED,
+    }
+    state_pending = committed and record.phase in {
+        RecoveryPhase.SWAPPING,
+        RecoveryPhase.OWNERSHIP_COMMITTED,
+        RecoveryPhase.COMMANDS_COMPLETE,
+    }
+    return HybridRecoveryOutcome(committed, commands_pending, state_pending, True)
+
+
+def reconcile_recovery(
+    transport: Transport,
+    record: HybridRecoveryRecord,
+) -> HybridRecoveryOutcome:
     """Restore a pre-commit swap or clean a post-commit interrupted deployment.
 
     Args:
@@ -503,53 +695,75 @@ def reconcile_recovery(transport: Transport, record: HybridRecoveryRecord) -> No
         record: Valid record bound to this mapping and physical target.
 
     Returns:
-        ``None`` after the remote is safe for a fresh ownership preflight.
+        Read-only outcome. Pre-commit swaps are restored and removed; committed
+        records remain for command/state continuation by the deployer.
     """
 
-    ownership_file = ownership_path(record.mapping)
-    ownership_type = transport.lstat(ownership_file)
-    if ownership_type is RemotePathType.MISSING:
-        actual_ownership_hash = hashlib.sha256(b"").hexdigest()
-    elif ownership_type is RemotePathType.FILE:
-        actual_ownership_hash = hashlib.sha256(
-            transport.read_file(ownership_file, max_bytes=MAX_REMOTE_RECORD_BYTES)
-        ).hexdigest()
-    else:
-        raise DeployError("cannot reconcile recovery because ownership path is not a file")
-    if actual_ownership_hash not in {
-        record.old_ownership_hash,
-        record.new_ownership_hash,
-    }:
-        raise DeployError("cannot reconcile recovery because ownership hash is unknown")
-    committed = actual_ownership_hash == record.new_ownership_hash or record.phase in {
-        RecoveryPhase.OWNERSHIP_COMMITTED,
-        RecoveryPhase.COMMANDS_COMPLETE,
-        RecoveryPhase.STATE_COMPLETE,
-        RecoveryPhase.CLEANUP_COMPLETE,
-    }
-    if committed and actual_ownership_hash != record.new_ownership_hash:
-        raise DeployError("recovery phase claims committed ownership but its hash is stale")
-    if record.phase in {RecoveryPhase.PREPARED, RecoveryPhase.STAGED}:
-        if actual_ownership_hash != record.old_ownership_hash:
-            raise DeployError(
-                "recovery phase precedes swap but ownership already changed"
-            )
-    elif not committed:
-        for name in record.backup_names:
+    outcome = inspect_recovery(transport, record)
+    if outcome.ownership_committed:
+        return outcome
+    if record.phase is RecoveryPhase.SWAPPING:
+        affected_names = (
+            tuple(sorted(set(record.completed_names) | ({record.active_name} if record.active_name else set())))
+            if record.schema >= 2
+            else record.backup_names
+        )
+        for name in affected_names:
             backup = f"{record.backup_root}/{name}"
             if transport.lstat(backup) is RemotePathType.MISSING:
-                if (
-                    name not in record.old_existing_names
-                    and transport.lstat(name) is not RemotePathType.MISSING
-                ):
+                if transport.lstat(name) is not RemotePathType.MISSING:
                     transport.remove_tree(name)
                 continue
             if transport.lstat(name) is not RemotePathType.MISSING:
                 transport.remove_tree(name)
             transport.rename_path(backup, name)
+        record = record.with_phase(RecoveryPhase.RESTORED)
+        write_recovery(transport, record)
     transport.remove_tree(record.stage_root)
     transport.remove_tree(record.backup_root)
     transport.remove_tree(recovery_path(record.deployment_id))
+    return outcome
+
+
+def cleanup_committed_recovery(
+    transport: Transport,
+    record: HybridRecoveryRecord,
+) -> None:
+    """Remove committed Stage/Backup data and finally its Recovery Record.
+
+    Args:
+        transport: Connected SFTP transport allowed to mutate internal paths.
+        record: Record already advanced to ``STATE_COMPLETE`` or later.
+
+    Returns:
+        ``None`` after durable cleanup; failures leave the record for retry.
+    """
+
+    if record.phase not in {
+        RecoveryPhase.STATE_COMPLETE,
+        RecoveryPhase.CLEANUP_COMPLETE,
+    }:
+        raise DeployError("committed recovery cleanup requires completed local state")
+    transport.remove_tree(record.stage_root)
+    transport.remove_tree(record.backup_root)
+    if record.phase is not RecoveryPhase.CLEANUP_COMPLETE:
+        record = record.with_phase(RecoveryPhase.CLEANUP_COMPLETE)
+        write_recovery(transport, record)
+    transport.remove_tree(recovery_path(record.deployment_id))
+
+
+def _remote_ownership_hash(transport: Transport, mapping: str) -> str:
+    """Hash exact current Ownership bytes without trusting their contents."""
+
+    ownership_file = ownership_path(mapping)
+    ownership_type = transport.lstat(ownership_file)
+    if ownership_type is RemotePathType.MISSING:
+        return hashlib.sha256(b"").hexdigest()
+    if ownership_type is not RemotePathType.FILE:
+        raise DeployError("cannot reconcile recovery because ownership path is not a file")
+    return hashlib.sha256(
+        transport.read_file(ownership_file, max_bytes=MAX_REMOTE_RECORD_BYTES)
+    ).hexdigest()
 
 
 def write_recovery(transport: Transport, record: HybridRecoveryRecord) -> None:
@@ -569,6 +783,7 @@ def _scan_hybrid_directory(root: Path) -> HybridDirectoryManifest:
     """
 
     files: dict[str, ScannedOutput] = {}
+    directories: list[str] = []
 
     def visit(directory: Path) -> None:
         """Visit one verified directory and accumulate regular files."""
@@ -582,6 +797,15 @@ def _scan_hybrid_directory(root: Path) -> HybridDirectoryManifest:
             if stat.S_ISLNK(mode):
                 raise PlanError(f"hybrid output does not support symlinks: {child}")
             if stat.S_ISDIR(mode):
+                relative = child.relative_to(root).as_posix()
+                if any(
+                    not _safe_component(part)
+                    for part in PurePosixPath(relative).parts
+                ):
+                    raise PlanError(
+                        f"hybrid output has an unsafe relative path: {child}"
+                    )
+                directories.append(relative)
                 visit(child)
             elif stat.S_ISREG(mode):
                 relative = child.relative_to(root).as_posix()
@@ -597,6 +821,7 @@ def _scan_hybrid_directory(root: Path) -> HybridDirectoryManifest:
         root.name,
         root,
         ordered,
+        tuple(sorted(directories)),
         len(ordered),
         sum(item.entry.size for item in ordered.values()),
     )
@@ -605,19 +830,30 @@ def _scan_hybrid_directory(root: Path) -> HybridDirectoryManifest:
 def _validate_direct_name(name: str, root: Path) -> None:
     """Reject direct names that cannot be represented as one safe remote child."""
 
-    if not _safe_component(name):
+    if name in {".git", ".deploy", ".git-deploy"} or not _safe_component(name):
         raise PlanError(f"hybrid output has an unsafe direct child below {root}: {name!r}")
 
 
 def _safe_component(value: str) -> bool:
-    """Return whether text is one non-control POSIX path component."""
+    """Return whether text is one stable SFTP-representable path component."""
+
+    return is_stable_remote_component(value)
+
+
+def _valid_sha256(value: object) -> bool:
+    """Return whether an untrusted value is one lowercase SHA256 digest.
+
+    Args:
+        value: Untrusted decoded JSON value.
+
+    Returns:
+        ``True`` only for exactly 64 lowercase hexadecimal characters.
+    """
 
     return bool(
-        value
-        and value not in {".", ".."}
-        and "/" not in value
-        and "\\" not in value
-        and all(ord(character) >= 32 and character != "\x7f" for character in value)
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 

@@ -17,7 +17,7 @@ from pyftpdlib.servers import FTPServer
 
 from git_deploy.config import TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.deployer import execute_plan
-from git_deploy.errors import DeployError, PlanError
+from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from git_deploy.planner import create_plan
@@ -392,6 +392,7 @@ def _create_hybrid_local_view(root: Path) -> None:
     )
     hybrid = root / ".deploy/frontend-root"
     (hybrid / "assets").mkdir(parents=True)
+    (hybrid / "assets/empty/nested").mkdir(parents=True)
     (hybrid / "old-assets").mkdir()
     (hybrid / "fonts").mkdir()
     (hybrid / "index.html").write_text("hybrid index\n", encoding="utf-8")
@@ -399,13 +400,18 @@ def _create_hybrid_local_view(root: Path) -> None:
     (hybrid / "old-assets/old.js").write_text("old bundle\n", encoding="utf-8")
 
 
-def _deploy_hybrid(root: Path, *, full: bool = False) -> None:
-    """Run the complete local-freeze, remote-plan, Hybrid execution pipeline."""
+def _deploy_hybrid(
+    root: Path,
+    *,
+    full: bool = False,
+    recover: bool = False,
+) -> None:
+    """Run the local-freeze and explicit deploy or Recovery pipeline."""
 
     prepared = prepare_project("hybrid", root / "deploy.toml", None, full=full, skip_build=True)
     try:
         prepare_remote_plan(prepared, allow_recovery=True)
-        execute_prepared(prepared)
+        execute_prepared(prepared, recover_only=recover)
     finally:
         prepared.close()
 
@@ -486,11 +492,42 @@ remote_root = "/srv/application/hybrid-paramiko"
     assert _docker(
         "exec",
         container,
+        "test",
+        "-d",
+        "/srv/application/hybrid-paramiko/assets/empty/nested",
+    ) == ""
+    assert _docker(
+        "exec",
+        container,
         "stat",
         "-c",
         "%a",
         "/srv/application/hybrid-paramiko/.git-deploy",
     ) == "700"
+
+    race = git_project / ".deploy/frontend-root/race.txt"
+    race.write_text("planned", encoding="utf-8")
+    stale = prepare_project(
+        "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
+    )
+    try:
+        prepare_remote_plan(stale, allow_recovery=False)
+        _docker(
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "printf important > /srv/application/hybrid-paramiko/race.txt && "
+            "chown deploy:deploy /srv/application/hybrid-paramiko/race.txt",
+        )
+        with pytest.raises(StaleRemotePlanError, match="path type changed"):
+            execute_prepared(stale)
+    finally:
+        stale.close()
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-paramiko/race.txt"
+    ) == "important"
+    race.unlink()
 
     store = StateStore(GitRepository(git_project).common_dir())
     store.path_for("dev").unlink()
@@ -537,6 +574,7 @@ remote_root = "/srv/application/hybrid-paramiko"
         "-type f -print -quit)\"",
     ) == ""
 
+    _deploy_hybrid(git_project, recover=True)
     _deploy_hybrid(git_project)
 
     for unknown, content in (("index.php", "backend"), (".env", "secret"), ("manual-backup/item", "unknown")):
@@ -555,6 +593,9 @@ remote_root = "/srv/application/hybrid-paramiko"
     assert _docker(
         "exec", container, "cat", "/srv/application/hybrid-paramiko/index10.css"
     ) == "new css"
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-paramiko/race.txt"
+    ) == "important"
     assert _docker(
         "exec",
         container,
@@ -629,6 +670,33 @@ remote_root = "/srv/application/hybrid-native"
         "%a",
         "/srv/application/hybrid-native/.git-deploy",
     ) == "700"
+    race = git_project / ".deploy/frontend-root/native-race"
+    race.write_text("planned", encoding="utf-8")
+    stale = prepare_project(
+        "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
+    )
+    try:
+        prepare_remote_plan(stale, allow_recovery=False)
+        _docker(
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "mkdir /srv/application/hybrid-native/native-race && "
+            "printf important > /srv/application/hybrid-native/native-race/item && "
+            "chown -R deploy:deploy /srv/application/hybrid-native/native-race",
+        )
+        with pytest.raises(StaleRemotePlanError, match="path type changed"):
+            execute_prepared(stale)
+    finally:
+        stale.close()
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-native/native-race/item",
+    ) == "important"
+    race.unlink()
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
         "native next\n", encoding="utf-8"
     )
@@ -636,6 +704,12 @@ remote_root = "/srv/application/hybrid-native"
     assert _docker(
         "exec", container, "cat", "/srv/application/hybrid-native/assets/app.js"
     ) == "native next"
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-native/native-race/item",
+    ) == "important"
     assert _docker(
         "exec",
         container,

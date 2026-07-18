@@ -16,7 +16,12 @@ from pathlib import Path, PurePosixPath
 
 from git_deploy.config import TargetConfig, resolve_current_ssh_alias
 from git_deploy.errors import DeployError
-from git_deploy.transports.base import ProgressCallback, RemotePathType, Transport
+from git_deploy.transports.base import (
+    ProgressCallback,
+    RemotePathType,
+    Transport,
+    is_stable_remote_component,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,12 +617,12 @@ class OpenSSHSFTPTransport(Transport):
         names_list: list[str] = []
         prefix = absolute + "/"
         for raw in result.stdout.splitlines():
-            line = raw.strip()
+            line = raw.rstrip("\r")
             if not line or line.startswith("sftp>"):
                 continue
             names_list.append(line[len(prefix) :] if line.startswith(prefix) else line)
         names = tuple(sorted(names_list))
-        if any(name in {".", ".."} or "/" in name or "\\" in name for name in names):
+        if any(not is_stable_remote_component(name) for name in names):
             raise DeployError(f"remote directory contains an unsafe name: {remote_path}")
         return names
 

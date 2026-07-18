@@ -30,6 +30,8 @@ DEFAULT_EXCLUDE = (
     "storage/logs/**",
 )
 DEFAULT_PROTECT = (
+    ".git/**",
+    ".deploy/**",
     ".env",
     ".env.*",
     "uploads/**",
@@ -539,6 +541,10 @@ def _parse_outputs(raw: Any, root: Path) -> tuple[OutputConfig, ...]:
         if mode == "hybrid":
             if name is None:
                 raise ConfigError(f"outputs[{index}].name is required for hybrid mode")
+            if local == root:
+                raise ConfigError(
+                    f"outputs[{index}].local must not be the project root in hybrid mode"
+                )
             if remote != PurePosixPath("."):
                 raise ConfigError(f"outputs[{index}].remote must be '.' for hybrid mode")
             if "delete_removed" in table:
