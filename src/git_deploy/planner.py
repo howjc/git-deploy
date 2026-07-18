@@ -19,8 +19,10 @@ from git_deploy.git import GitEntry, GitRepository
 from git_deploy.hybrid import (
     HybridLocalManifest,
     HybridOwnership,
+    HybridRecoveryOutcome,
     HybridRecoveryRecord,
     RecoveryPhase,
+    inspect_recovery,
     read_ownership_snapshot,
     read_recovery_records,
     recovery_command_hash,
@@ -126,6 +128,21 @@ class HybridPlan:
     expected_path_types: tuple[tuple[str, RemotePathType], ...] = ()
     recovery_records: tuple[HybridRecoveryRecord, ...] = ()
     remote_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPlan:
+    """Contain only remote facts required for one explicit Hybrid recovery."""
+
+    target: TargetConfig
+    target_fingerprint: str
+    project_id: str
+    mapping: str
+    remote: str
+    ownership: HybridOwnership | None
+    expected_ownership_hash: str
+    record: HybridRecoveryRecord
+    outcome: HybridRecoveryOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,8 +326,6 @@ def complete_remote_plan(
     plan: DeploymentPlan,
     config: Config,
     transport: Transport,
-    *,
-    allow_recovery: bool,
 ) -> DeploymentPlan:
     """Merge remote ownership/adoption facts into one frozen local plan.
 
@@ -318,8 +333,6 @@ def complete_remote_plan(
         plan: Local plan whose upload bytes are already frozen.
         config: Project identity and safety configuration.
         transport: Connected SFTP transport used only for preflight reads.
-        allow_recovery: Retained for API compatibility; recovery is always planned
-            read-only and requires explicit confirmed execution.
 
     Returns:
         Immutable full plan ready for confirmation or read-only display.
@@ -330,7 +343,6 @@ def complete_remote_plan(
         return plan
     if config.project_id is None:
         raise PlanError("hybrid output lacks a resolved project_id")
-    del allow_recovery
     validate_internal_paths(transport)
     records = read_recovery_records(
         transport,
@@ -374,7 +386,7 @@ def complete_remote_plan(
             recovery_records=records,
             remote_complete=True,
         )
-        return replace(plan, hybrid=completed)
+        return replace(plan, operations=(), hybrid=completed)
     current_files = set(hybrid.local.root_file_names)
     current_directories = set(hybrid.local.directory_names)
     current = current_files | current_directories
@@ -444,6 +456,101 @@ def complete_remote_plan(
     return replace(plan, hybrid=completed)
 
 
+def create_recovery_plan(
+    config: Config,
+    target: TargetConfig,
+    transport: Transport,
+) -> RecoveryPlan | None:
+    """Read one Recovery without building, scanning outputs, or loading State.
+
+    Args:
+        config: Loaded project configuration containing one Hybrid mapping.
+        target: Fully resolved target bound to the local lock and remote root.
+        transport: Connected read-only transport.
+
+    Returns:
+        Recovery-only plan, or ``None`` when this project has no pending record.
+    """
+
+    hybrid_outputs = tuple(output for output in config.outputs if output.mode == "hybrid")
+    if not hybrid_outputs:
+        return None
+    if len(hybrid_outputs) != 1 or config.project_id is None:
+        raise PlanError("Hybrid recovery requires one mapping and a resolved project_id")
+    output = hybrid_outputs[0]
+    if output.name is None:
+        raise PlanError("Hybrid recovery mapping is missing its validated name")
+    validate_internal_paths(transport)
+    records = read_recovery_records(
+        transport,
+        mapping=output.name,
+        target_fingerprint=target.fingerprint,
+    )
+    if not records:
+        return None
+    if len(records) != 1:
+        raise PlanError("multiple remote hybrid recovery records require manual inspection")
+    ownership, ownership_hash = read_ownership_snapshot(
+        transport,
+        project_id=config.project_id,
+        mapping=output.name,
+        remote=output.remote.as_posix(),
+    )
+    record = records[0]
+    outcome = inspect_recovery(transport, record)
+    if (
+        outcome.commands_pending
+        and record.command_hash
+        != recovery_command_hash(target.after_deploy, target.command_timeout)
+    ):
+        raise PlanError(
+            "after_deploy commands or timeout changed since the interrupted "
+            "Hybrid deployment; restore the reviewed configuration before recovery"
+        )
+    return RecoveryPlan(
+        target,
+        target.fingerprint,
+        config.project_id,
+        output.name,
+        output.remote.as_posix(),
+        ownership,
+        ownership_hash,
+        record,
+        outcome,
+    )
+
+
+def render_recovery_plan(plan: RecoveryPlan) -> str:
+    """Render only actions that explicit recovery will actually execute.
+
+    Args:
+        plan: Read-only Recovery plan and classified pending phases.
+
+    Returns:
+        Human-readable target, phase action, commands, and exact summary.
+    """
+
+    action = _recovery_action(plan.record, plan.outcome)
+    lines = [
+        f"Target: {plan.target.name} "
+        f"({plan.target.protocol}://"
+        f"{plan.target.host or plan.target.ssh_host_alias}{plan.target.remote_root})",
+        "Mode: RECOVERY",
+        f"RECOVER [{plan.record.phase.value.lower()}] "
+        f"{plan.record.deployment_id} {action}",
+    ]
+    if plan.outcome.commands_pending:
+        lines.extend(f"AFTER  {command}" for command in plan.target.after_deploy)
+    lines.append(
+        "Summary: 1 recovery action(s), "
+        f"{len(plan.target.after_deploy) if plan.outcome.commands_pending else 0} "
+        "pending command(s), "
+        f"state={'yes' if plan.outcome.state_pending else 'no'}, "
+        f"cleanup={'yes' if plan.outcome.cleanup_pending else 'no'}"
+    )
+    return "\n".join(lines)
+
+
 def render_plan(plan: DeploymentPlan) -> str:
     """Render a stable human-readable dry-run/deploy preview.
 
@@ -454,6 +561,44 @@ def render_plan(plan: DeploymentPlan) -> str:
         Multi-line summary containing every remote operation.
     """
 
+    recovery = (
+        plan.hybrid.recovery_records[0]
+        if plan.hybrid is not None and plan.hybrid.recovery_records
+        else None
+    )
+    if recovery is not None and plan.hybrid is not None:
+        committed = plan.hybrid.expected_ownership_hash == recovery.new_ownership_hash
+        outcome = HybridRecoveryOutcome(
+            committed,
+            committed
+            and recovery.phase
+            in {RecoveryPhase.SWAPPING, RecoveryPhase.OWNERSHIP_COMMITTED},
+            committed
+            and recovery.phase
+            in {
+                RecoveryPhase.SWAPPING,
+                RecoveryPhase.OWNERSHIP_COMMITTED,
+                RecoveryPhase.COMMANDS_COMPLETE,
+            },
+            True,
+        )
+        lines = [
+            f"Target: {plan.target.name} "
+            f"({plan.target.protocol}://"
+            f"{plan.target.host or plan.target.ssh_host_alias}{plan.target.remote_root})",
+            "Mode: RECOVERY",
+            *render_hybrid_plan(plan.hybrid),
+        ]
+        executable_commands = outcome.commands_pending and recovery.schema >= 2
+        if executable_commands:
+            lines.extend(f"AFTER  {command}" for command in plan.target.after_deploy)
+        lines.append(
+            "Summary: 1 recovery action(s), "
+            f"{len(plan.target.after_deploy) if executable_commands else 0} "
+            "pending command(s), "
+            f"state={'yes' if outcome.state_pending else 'no'}, cleanup=yes"
+        )
+        return "\n".join(lines)
     mode = "FULL" if plan.full else "INCREMENTAL"
     lines = [
         f"Target: {plan.target.name} ({plan.target.protocol}://{plan.target.host or plan.target.ssh_host_alias}{plan.target.remote_root})",
@@ -492,21 +637,21 @@ def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
     if hybrid.recovery_records:
         for record in hybrid.recovery_records:
             committed = hybrid.expected_ownership_hash == record.new_ownership_hash
-            if committed and record.phase in {
-                RecoveryPhase.SWAPPING,
-                RecoveryPhase.OWNERSHIP_COMMITTED,
-            }:
-                action = "RESUME COMMANDS"
-            elif committed and record.phase is RecoveryPhase.COMMANDS_COMPLETE:
-                action = "SAVE STATE + CLEANUP"
-            elif committed or record.phase in {
-                RecoveryPhase.PREPARED,
-                RecoveryPhase.STAGED,
-                RecoveryPhase.RESTORED,
-            }:
-                action = "CLEANUP"
-            else:
-                action = "RESTORE"
+            outcome = HybridRecoveryOutcome(
+                committed,
+                committed
+                and record.phase
+                in {RecoveryPhase.SWAPPING, RecoveryPhase.OWNERSHIP_COMMITTED},
+                committed
+                and record.phase
+                in {
+                    RecoveryPhase.SWAPPING,
+                    RecoveryPhase.OWNERSHIP_COMMITTED,
+                    RecoveryPhase.COMMANDS_COMPLETE,
+                },
+                True,
+            )
+            action = _recovery_action(record, outcome)
             lines.append(
                 f"RECOVER [{record.phase.value.lower()}] {record.deployment_id} {action}"
             )
@@ -538,10 +683,42 @@ def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
     return tuple(lines)
 
 
+def _recovery_action(
+    record: HybridRecoveryRecord,
+    outcome: HybridRecoveryOutcome,
+) -> str:
+    """Return the exact user-facing action for one classified Recovery.
+
+    Args:
+        record: Durable Recovery phase.
+        outcome: Read-only classification against current Ownership.
+
+    Returns:
+        Concise restore, command, state, or cleanup action label.
+    """
+
+    if outcome.commands_pending:
+        if record.schema == 1:
+            return "MANUAL: LEGACY COMMAND CONTRACT UNKNOWN"
+        return "RESUME COMMANDS"
+    if outcome.state_pending:
+        return "SAVE STATE + CLEANUP"
+    if outcome.ownership_committed or record.phase in {
+        RecoveryPhase.PREPARED,
+        RecoveryPhase.STAGED,
+        RecoveryPhase.RESTORED,
+    }:
+        return "CLEANUP"
+    return "RESTORE"
+
+
 def validate_remote_freshness(
     plan: DeploymentPlan,
     config: Config,
     transport: Transport,
+    *,
+    expected_recovery_records: tuple[HybridRecoveryRecord, ...] | None = None,
+    check_path_types: bool = True,
 ) -> None:
     """Prove execution facts still equal the user-reviewed Remote Plan.
 
@@ -549,6 +726,8 @@ def validate_remote_freshness(
         plan: Remote-complete immutable deployment plan.
         config: Expected project identity.
         transport: Connected transport used only for read-only validation.
+        expected_recovery_records: Optional execution-owned Recovery snapshot.
+        check_path_types: Whether approved direct-path types must still match.
 
     Returns:
         ``None`` when ownership, recovery, and path types remain unchanged.
@@ -563,7 +742,12 @@ def validate_remote_freshness(
         mapping=hybrid.local.mapping,
         target_fingerprint=plan.target_fingerprint,
     )
-    if records != hybrid.recovery_records:
+    expected_records = (
+        hybrid.recovery_records
+        if expected_recovery_records is None
+        else expected_recovery_records
+    )
+    if records != expected_records:
         raise StaleRemotePlanError(
             "remote recovery facts changed after plan approval; rerun and review the plan"
         )
@@ -577,13 +761,56 @@ def validate_remote_freshness(
         raise StaleRemotePlanError(
             "remote ownership changed after plan approval; rerun and review the plan"
         )
-    for path, expected in hybrid.expected_path_types:
-        actual = transport.lstat(path)
-        if actual is not expected:
-            raise StaleRemotePlanError(
-                f"remote path type changed after plan approval: {path!r} "
-                f"({expected.value} -> {actual.value}); rerun and review the plan"
-            )
+    if check_path_types:
+        for path, expected in hybrid.expected_path_types:
+            actual = transport.lstat(path)
+            if actual is not expected:
+                raise StaleRemotePlanError(
+                    f"remote path type changed after plan approval: {path!r} "
+                    f"({expected.value} -> {actual.value}); rerun and review the plan"
+                )
+
+
+def validate_recovery_freshness(
+    plan: RecoveryPlan,
+    transport: Transport,
+) -> HybridRecoveryOutcome:
+    """Revalidate one Recovery-only plan immediately before mutation.
+
+    Args:
+        plan: User-reviewed Recovery facts.
+        transport: Connected read-only transport.
+
+    Returns:
+        Current outcome when record, Ownership, and phase facts are unchanged.
+    """
+
+    validate_internal_paths(transport)
+    records = read_recovery_records(
+        transport,
+        mapping=plan.mapping,
+        target_fingerprint=plan.target_fingerprint,
+    )
+    if records != (plan.record,):
+        raise StaleRemotePlanError(
+            "remote recovery facts changed after plan approval; rerun and review the plan"
+        )
+    _, actual_hash = read_ownership_snapshot(
+        transport,
+        project_id=plan.project_id,
+        mapping=plan.mapping,
+        remote=plan.remote,
+    )
+    if actual_hash != plan.expected_ownership_hash:
+        raise StaleRemotePlanError(
+            "remote ownership changed after recovery approval; rerun and review the plan"
+        )
+    outcome = inspect_recovery(transport, plan.record)
+    if outcome != plan.outcome:
+        raise StaleRemotePlanError(
+            "remote recovery phase changed after plan approval; rerun and review the plan"
+        )
+    return outcome
 
 
 def _plan_source(

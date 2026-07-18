@@ -15,15 +15,24 @@ from git_deploy.errors import ConfigError, GitDeployError, PlanError
 from git_deploy.git import GitRepository
 from git_deploy.initializer import initialize_project
 from git_deploy.manifest import StateStore
-from git_deploy.planner import DeploymentPlan, render_plan
-from git_deploy.prepared import execute_prepared, prepare_project, prepare_remote_plan
+from git_deploy.planner import DeploymentPlan, render_plan, render_recovery_plan
+from git_deploy.prepared import (
+    execute_prepared,
+    execute_prepared_recovery,
+    prepare_project,
+    prepare_recovery,
+    prepare_remote_plan,
+)
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
 from git_deploy.workspace import (
     WorkspaceConfig,
     execute_workspace,
+    execute_workspace_recovery,
     load_workspace,
     prepare_workspace,
+    prepare_workspace_recovery,
     render_workspace_plan,
+    render_workspace_recovery_plan,
     run_workspace_build,
     run_workspace_doctor,
 )
@@ -212,6 +221,30 @@ def _deploy_project(
         raise ConfigError("--create-root is only valid with doctor")
     if args.recover and args.full:
         raise ConfigError("--recover does not accept --full")
+    if args.recover:
+        prepared_recovery = prepare_recovery(
+            config.project_root.name,
+            config,
+            requested_target,
+        )
+        if prepared_recovery is None:
+            raise ConfigError("no pending Hybrid Recovery exists for this target")
+        try:
+            print(render_recovery_plan(prepared_recovery.plan))
+            if not args.yes:
+                _confirm_recovery(
+                    prepared_recovery.plan.target.name,
+                    1,
+                    len(prepared_recovery.plan.target.after_deploy)
+                    if prepared_recovery.plan.outcome.commands_pending
+                    else 0,
+                    1,
+                )
+            execute_prepared_recovery(prepared_recovery, verbose=args.verbose)
+            print("Hybrid Recovery step finished; rerun --remote-plan to verify its state.")
+            return 0
+        finally:
+            prepared_recovery.close()
 
     prepared = prepare_project(
         config.project_root.name,
@@ -222,9 +255,9 @@ def _deploy_project(
     )
     try:
         if not args.dry_run and (
-            args.remote_plan or args.recover or prepared.plan.hybrid is not None
+            args.remote_plan or prepared.plan.hybrid is not None
         ):
-            prepare_remote_plan(prepared, allow_recovery=False)
+            prepare_remote_plan(prepared)
         print(render_plan(prepared.plan))
         if args.dry_run:
             print("Dry-run complete: no remote connection and no state change.")
@@ -238,22 +271,16 @@ def _deploy_project(
         has_recovery = bool(
             prepared.plan.hybrid and prepared.plan.hybrid.recovery_records
         )
-        if has_recovery and not args.recover:
+        if has_recovery:
             raise ConfigError(
                 "pending Hybrid Recovery requires a separate reviewed --recover run"
             )
-        if args.recover and not has_recovery:
-            raise ConfigError("no pending Hybrid Recovery exists for this target")
         if prepared.plan.has_remote_work and not args.yes:
             _confirm(prepared.plan)
         execute_prepared(
             prepared,
             verbose=args.verbose,
-            recover_only=args.recover,
         )
-        if args.recover:
-            print("Hybrid Recovery step finished; rerun --remote-plan to verify its state.")
-            return 0
         print(
             f"Deployment completed: {prepared.plan.upload_count} upload(s), "
             f"{prepared.plan.delete_count} delete(s)."
@@ -283,6 +310,39 @@ def _deploy_workspace(
         raise ConfigError("--create-root is only valid with doctor")
     if args.recover and args.full:
         raise ConfigError("--recover does not accept --full")
+    if args.recover:
+        pool = SSHConnectionPool()
+        prepared_recovery = ()
+        try:
+            target, prepared_recovery = prepare_workspace_recovery(
+                workspace,
+                requested_target,
+                connection_pool=pool,
+            )
+            if not prepared_recovery:
+                raise ConfigError("no pending Hybrid Recovery exists in this workspace")
+            print(render_workspace_recovery_plan(target, prepared_recovery))
+            command_count = sum(
+                len(item.plan.target.after_deploy)
+                for item in prepared_recovery
+                if item.plan.outcome.commands_pending
+            )
+            if not args.yes:
+                _confirm_recovery(
+                    target,
+                    len(prepared_recovery),
+                    command_count,
+                    len(prepared_recovery),
+                )
+            execute_workspace_recovery(prepared_recovery, verbose=args.verbose)
+            print(
+                "Workspace Hybrid Recovery step finished; rerun --remote-plan to verify."
+            )
+            return 0
+        finally:
+            for item in prepared_recovery:
+                item.close()
+            pool.close_all()
 
     target, prepared = prepare_workspace(
         workspace,
@@ -294,14 +354,12 @@ def _deploy_workspace(
     try:
         if not args.dry_run and (
             args.remote_plan
-            or args.recover
             or any(item.plan.hybrid is not None for item in prepared)
         ):
             for item in prepared:
                 if args.remote_plan or item.plan.hybrid is not None:
                     prepare_remote_plan(
                         item,
-                        allow_recovery=False,
                         connection_pool=pool,
                     )
         print(render_workspace_plan(target, prepared))
@@ -318,12 +376,10 @@ def _deploy_workspace(
             for item in prepared
             if item.plan.hybrid is not None
         )
-        if recovery_count and not args.recover:
+        if recovery_count:
             raise ConfigError(
                 "pending Hybrid Recovery requires a separate reviewed --recover run"
             )
-        if args.recover and not recovery_count:
-            raise ConfigError("no pending Hybrid Recovery exists in this workspace")
         operation_count = sum(item.plan.operation_count for item in prepared)
         adoption_count = sum(item.plan.adoption_count for item in prepared)
         command_count = sum(
@@ -341,13 +397,7 @@ def _deploy_workspace(
             prepared,
             verbose=args.verbose,
             connection_pool=pool,
-            recover_only=args.recover,
         )
-        if args.recover:
-            print(
-                "Workspace Hybrid Recovery step finished; rerun --remote-plan to verify."
-            )
-            return 0
         uploads = sum(item.plan.upload_count for item in prepared)
         deletes = sum(item.plan.delete_count for item in prepared)
         print(
@@ -436,6 +486,34 @@ def _confirm_workspace(
     )
     if answer.strip().lower() not in {"y", "yes"}:
         raise ConfigError("deployment cancelled")
+
+
+def _confirm_recovery(
+    target: str,
+    actions: int,
+    commands: int,
+    repositories: int,
+) -> None:
+    """Require explicit confirmation for only rendered Recovery actions.
+
+    Args:
+        target: Logical target name.
+        actions: Number of Recovery records to execute.
+        commands: Number of pending reviewed commands.
+        repositories: Number of affected projects.
+
+    Returns:
+        ``None`` only after an affirmative interactive answer.
+    """
+
+    if not sys.stdin.isatty():
+        raise ConfigError("recovery requires --yes when stdin is not interactive")
+    answer = input(
+        f"Execute {actions} recovery action(s) and {commands} pending command(s) "
+        f"across {repositories} project(s) for {target}? [y/N] "
+    )
+    if answer.strip().lower() not in {"y", "yes"}:
+        raise ConfigError("recovery cancelled")
 
 
 def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> None:

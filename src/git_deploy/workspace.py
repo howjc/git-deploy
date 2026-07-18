@@ -14,14 +14,24 @@ from git_deploy.deployer import TransportFactory
 from git_deploy.doctor import DoctorResult, run_doctor
 from git_deploy.errors import ConfigError, PlanError
 from git_deploy.git import GitRepository
+from git_deploy.hybrid import RecoveryPhase
 from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
-from git_deploy.planner import UploadOperation, render_hybrid_plan
+from git_deploy.planner import (
+    UploadOperation,
+    render_hybrid_plan,
+    render_plan,
+    render_recovery_plan,
+)
 from git_deploy.prepared import (
     PreparedDeployment,
+    PreparedRecovery,
     execute_prepared,
+    execute_prepared_recovery,
     prepare_project,
+    prepare_recovery,
     validate_prepared_freshness,
+    validate_prepared_recovery,
 )
 from git_deploy.transports import create_transport
 from git_deploy.transports.openssh_sftp import OpenSSHMaster, SSHConnectionPool
@@ -191,6 +201,37 @@ def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...])
         Combined plan including physical endpoints, commits, and frozen bytes.
     """
 
+    recovery_projects = tuple(
+        item
+        for item in prepared
+        if item.plan.hybrid is not None and item.plan.hybrid.recovery_records
+    )
+    if recovery_projects:
+        lines = [f"Workspace Target: {target}", "Mode: RECOVERY"]
+        pending_commands = 0
+        for item in recovery_projects:
+            lines.extend(("", f"[{item.name}]"))
+            lines.extend(f"  {line}" for line in render_plan(item.plan).splitlines())
+            hybrid = item.plan.hybrid
+            if hybrid is None:
+                raise PlanError("workspace Recovery project lacks a Hybrid plan")
+            record = hybrid.recovery_records[0]
+            if (
+                record.schema >= 2
+                and hybrid.expected_ownership_hash == record.new_ownership_hash
+                and record.phase
+                in {RecoveryPhase.SWAPPING, RecoveryPhase.OWNERSHIP_COMMITTED}
+            ):
+                pending_commands += len(item.plan.target.after_deploy)
+        lines.extend(
+            (
+                "",
+                f"Total: {len(recovery_projects)} recovery action(s), "
+                f"{pending_commands} pending command(s)",
+            )
+        )
+        return "\n".join(lines)
+
     lines = [f"Workspace Target: {target}"]
     uploads = 0
     deletes = 0
@@ -247,13 +288,124 @@ def render_workspace_plan(target: str, prepared: tuple[PreparedDeployment, ...])
     return "\n".join(lines)
 
 
+def prepare_workspace_recovery(
+    workspace: WorkspaceConfig,
+    requested_target: str | None,
+    *,
+    transport_factory: TransportFactory | None = None,
+    connection_pool: SSHConnectionPool | None = None,
+) -> tuple[str, tuple[PreparedRecovery, ...]]:
+    """Discover and retain only pending workspace Recoveries without Build.
+
+    Args:
+        workspace: Validated repository list.
+        requested_target: Shared explicit/default target name.
+        transport_factory: Optional fake/custom transport factory.
+        connection_pool: Optional Native OpenSSH connection pool.
+
+    Returns:
+        Target name and connected locked projects that actually need Recovery.
+    """
+
+    target, preflight = preflight_workspace(workspace, requested_target)
+    prepared: list[PreparedRecovery] = []
+    locks: list[TargetLock | None] = []
+    try:
+        for item in preflight:
+            if item.target.runtime_dir is None:
+                raise PlanError("workspace recovery preflight lacks a Git runtime directory")
+            lock = TargetLock(item.target.runtime_dir, target)
+            lock.acquire()
+            locks.append(lock)
+        for index, item in enumerate(preflight):
+            recovery = prepare_recovery(
+                item.repository.name,
+                item.config,
+                target,
+                prepared_target=item.target,
+                prepared_lock=locks[index],
+                transport_factory=transport_factory,
+                connection_pool=connection_pool,
+            )
+            locks[index] = None
+            if recovery is not None:
+                prepared.append(recovery)
+        return target, tuple(prepared)
+    except BaseException:
+        for item in reversed(prepared):
+            item.close()
+        for lock in reversed(locks):
+            if lock is not None:
+                lock.release()
+        raise
+
+
+def render_workspace_recovery_plan(
+    target: str,
+    prepared: tuple[PreparedRecovery, ...],
+) -> str:
+    """Render only actual Recovery actions for selected workspace projects.
+
+    Args:
+        target: Shared logical target name.
+        prepared: Projects with one pending Recovery each.
+
+    Returns:
+        Combined Recovery-only plan and exact action/command totals.
+    """
+
+    lines = [f"Workspace Target: {target}", "Mode: RECOVERY"]
+    command_count = 0
+    for item in prepared:
+        lines.extend(("", f"[{item.name}]"))
+        lines.extend(f"  {line}" for line in render_recovery_plan(item.plan).splitlines())
+        if item.plan.outcome.commands_pending:
+            command_count += len(item.plan.target.after_deploy)
+    lines.extend(
+        (
+            "",
+            f"Total: {len(prepared)} recovery action(s), "
+            f"{command_count} pending command(s)",
+        )
+    )
+    return "\n".join(lines)
+
+
+def execute_workspace_recovery(
+    prepared: tuple[PreparedRecovery, ...],
+    *,
+    verbose: bool = False,
+) -> tuple[str, ...]:
+    """Execute Recovery projects sequentially after an all-project recheck.
+
+    Args:
+        prepared: Connected Recovery-only projects.
+        verbose: Whether to print remote command context.
+
+    Returns:
+        Repository names whose Recovery execution was attempted successfully.
+    """
+
+    completed: list[str] = []
+    try:
+        for item in prepared:
+            validate_prepared_recovery(item)
+        for item in prepared:
+            print(f"Recovering {item.name}...")
+            execute_prepared_recovery(item, verbose=verbose)
+            completed.append(item.name)
+        return tuple(completed)
+    finally:
+        for item in prepared:
+            item.close()
+
+
 def execute_workspace(
     prepared: tuple[PreparedDeployment, ...],
     *,
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
-    recover_only: bool = False,
 ) -> tuple[str, ...]:
     """Deploy repositories sequentially after one all-project freshness gate."""
 
@@ -261,26 +413,17 @@ def execute_workspace(
     owns_pool = connection_pool is None
     completed: list[str] = []
     try:
-        selected = tuple(
-            item
-            for item in prepared
-            if not recover_only
-            or (item.plan.hybrid is not None and item.plan.hybrid.recovery_records)
-        )
-        if recover_only and not selected:
-            raise PlanError("no pending Hybrid Recovery exists in this workspace")
         # Validate every selected repository before the first workspace write so
         # a stale later repository cannot partially deploy earlier repositories.
-        for item in selected:
+        for item in prepared:
             validate_prepared_freshness(item)
-        for item in selected:
+        for item in prepared:
             print(f"Deploying {item.name}...")
             execute_prepared(
                 item,
                 verbose=verbose,
                 transport_factory=transport_factory,
                 connection_pool=pool,
-                recover_only=recover_only,
             )
             completed.append(item.name)
         return tuple(completed)

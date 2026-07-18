@@ -21,7 +21,13 @@ from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
 from git_deploy.planner import create_plan
-from git_deploy.prepared import execute_prepared, prepare_project, prepare_remote_plan
+from git_deploy.prepared import (
+    execute_prepared,
+    execute_prepared_recovery,
+    prepare_project,
+    prepare_recovery,
+    prepare_remote_plan,
+)
 from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.sftp import SFTPTransport
 from tests.conftest import commit_all, write_config
@@ -408,10 +414,21 @@ def _deploy_hybrid(
 ) -> None:
     """Run the local-freeze and explicit deploy or Recovery pipeline."""
 
-    prepared = prepare_project("hybrid", root / "deploy.toml", None, full=full, skip_build=True)
+    if recover:
+        prepared_recovery = prepare_recovery(
+            "hybrid",
+            load_config(root / "deploy.toml"),
+            None,
+        )
+        assert prepared_recovery is not None
+        execute_prepared_recovery(prepared_recovery)
+        return
+    prepared = prepare_project(
+        "hybrid", root / "deploy.toml", None, full=full, skip_build=True
+    )
     try:
-        prepare_remote_plan(prepared, allow_recovery=True)
-        execute_prepared(prepared, recover_only=recover)
+        prepare_remote_plan(prepared)
+        execute_prepared(prepared)
     finally:
         prepared.close()
 
@@ -467,7 +484,7 @@ remote_root = "/srv/application/hybrid-paramiko"
     )
     try:
         with pytest.raises(PlanError, match="--full to adopt"):
-            prepare_remote_plan(blocked, allow_recovery=True)
+            prepare_remote_plan(blocked)
     finally:
         blocked.close()
     assert _docker(
@@ -511,7 +528,7 @@ remote_root = "/srv/application/hybrid-paramiko"
         "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
     )
     try:
-        prepare_remote_plan(stale, allow_recovery=False)
+        prepare_remote_plan(stale)
         _docker(
             "exec",
             container,
@@ -528,6 +545,56 @@ remote_root = "/srv/application/hybrid-paramiko"
         "exec", container, "cat", "/srv/application/hybrid-paramiko/race.txt"
     ) == "important"
     race.unlink()
+
+    stage_race = git_project / ".deploy/frontend-root/stage-race.txt"
+    stage_race.write_text("planned during stage", encoding="utf-8")
+    staged = prepare_project(
+        "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
+    )
+    try:
+        prepare_remote_plan(staged)
+        assert staged.transport is not None
+        original_write = staged.transport.write_file_atomic
+        raced_during_stage = False
+
+        def create_after_staged_record(remote_path: str, data: bytes) -> None:
+            """Create a real same-name file after Stage and before the second gate."""
+
+            nonlocal raced_during_stage
+            original_write(remote_path, data)
+            if (
+                not raced_during_stage
+                and remote_path.startswith(".git-deploy/recovery/")
+                and b'"phase": "STAGED"' in data
+            ):
+                raced_during_stage = True
+                _docker(
+                    "exec",
+                    container,
+                    "sh",
+                    "-c",
+                    "printf stage-important > "
+                    "/srv/application/hybrid-paramiko/stage-race.txt && "
+                    "chown deploy:deploy "
+                    "/srv/application/hybrid-paramiko/stage-race.txt",
+                )
+
+        monkeypatch.setattr(
+            staged.transport,
+            "write_file_atomic",
+            create_after_staged_record,
+        )
+        with pytest.raises(StaleRemotePlanError, match="path type changed"):
+            execute_prepared(staged)
+    finally:
+        staged.close()
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-paramiko/stage-race.txt",
+    ) == "stage-important"
+    stage_race.unlink()
 
     store = StateStore(GitRepository(git_project).common_dir())
     store.path_for("dev").unlink()
@@ -546,7 +613,7 @@ remote_root = "/srv/application/hybrid-paramiko"
         "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
     )
     try:
-        prepare_remote_plan(interrupted, allow_recovery=True)
+        prepare_remote_plan(interrupted)
         assert interrupted.transport is not None
         original_rename = interrupted.transport.rename_path
         failed = False
@@ -596,6 +663,9 @@ remote_root = "/srv/application/hybrid-paramiko"
     assert _docker(
         "exec", container, "cat", "/srv/application/hybrid-paramiko/race.txt"
     ) == "important"
+    assert _docker(
+        "exec", container, "cat", "/srv/application/hybrid-paramiko/stage-race.txt"
+    ) == "stage-important"
     assert _docker(
         "exec",
         container,
@@ -676,7 +746,7 @@ remote_root = "/srv/application/hybrid-native"
         "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
     )
     try:
-        prepare_remote_plan(stale, allow_recovery=False)
+        prepare_remote_plan(stale)
         _docker(
             "exec",
             container,

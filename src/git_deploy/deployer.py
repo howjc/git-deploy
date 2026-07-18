@@ -11,13 +11,14 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from git_deploy.config import Config, TargetConfig
-from git_deploy.errors import DeployError, PlanError
+from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
     RECOVERY_SCHEMA,
     HybridRecoveryRecord,
     RecoveryPhase,
     cleanup_committed_recovery,
+    discard_staged_recovery,
     make_ownership,
     ownership_hash,
     ownership_path,
@@ -35,8 +36,10 @@ from git_deploy.planner import (
     HybridRootFileDelete,
     HybridRootFileUpload,
     Operation,
+    RecoveryPlan,
     UploadOperation,
     complete_remote_plan,
+    validate_recovery_freshness,
     validate_remote_freshness,
 )
 from git_deploy.progress import ProgressReporter
@@ -98,7 +101,6 @@ def execute_frozen_plan(
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
     prepared_transport: Transport | None = None,
-    recover_only: bool = False,
 ) -> None:
     """Execute already frozen bytes and commit only this project's successful state.
 
@@ -110,7 +112,6 @@ def execute_frozen_plan(
         verbose: Enable more frequent progress output.
         transport_factory: Optional fake/custom transport factory.
         connection_pool: Command-scoped Native OpenSSH connection pool.
-        recover_only: Execute only a reviewed pending Hybrid Recovery action.
 
     Returns:
         ``None`` after this project's remote operations and state commit succeed.
@@ -141,7 +142,7 @@ def execute_frozen_plan(
             # execution mutation and therefore happens only at this point.
             transport.ensure_root()
         if plan.hybrid is not None and not plan.hybrid.remote_complete:
-            plan = complete_remote_plan(plan, config, transport, allow_recovery=True)
+            plan = complete_remote_plan(plan, config, transport)
         if plan.hybrid is not None:
             _execute_hybrid_plan(
                 plan,
@@ -151,7 +152,6 @@ def execute_frozen_plan(
                 transport,
                 progress,
                 verbose=verbose,
-                recover_only=recover_only,
             )
             return
         if not plan.operations:
@@ -190,7 +190,6 @@ def _execute_hybrid_plan(
     progress: ProgressReporter,
     *,
     verbose: bool,
-    recover_only: bool,
 ) -> None:
     """Execute one remote-complete Hybrid Plan with durable recovery phases.
 
@@ -202,7 +201,6 @@ def _execute_hybrid_plan(
         transport: Connected SFTP adapter reused for preflight and mutation.
         progress: Shared upload progress reporter.
         verbose: Whether to print command execution context.
-        recover_only: Whether this confirmed execution is restricted to Recovery.
 
     Returns:
         ``None`` after State commit and best-effort recovery cleanup.
@@ -213,19 +211,9 @@ def _execute_hybrid_plan(
         raise PlanError("hybrid deployment requires a complete remote ownership plan")
     validate_remote_freshness(plan, config, transport)
     if hybrid.recovery_records:
-        if not recover_only:
-            raise PlanError(
-                "pending Hybrid Recovery requires an explicit reviewed --recover run"
-            )
-        _execute_recovery_plan(
-            plan,
-            state_store,
-            transport,
-            verbose=verbose,
+        raise PlanError(
+            "pending Hybrid Recovery requires an explicit reviewed --recover run"
         )
-        return
-    if recover_only:
-        raise PlanError("no pending Hybrid Recovery exists for this target")
     transport.ensure_root()
     if not plan.has_remote_work:
         state_store.save(
@@ -273,10 +261,11 @@ def _execute_hybrid_plan(
             }
         )
     )
+    expected_types = dict(hybrid.expected_path_types)
     old_existing_names = tuple(
         name
         for name in mutation_names
-        if transport.lstat(name) is not RemotePathType.MISSING
+        if expected_types[name] is not RemotePathType.MISSING
     )
     record = HybridRecoveryRecord(
         RECOVERY_SCHEMA,
@@ -308,55 +297,119 @@ def _execute_hybrid_plan(
         transport.make_directory(deployment_root, mode=0o700)
     directories = {item.name: item for item in hybrid.local.directories}
     for operation in hybrid.operations:
-        if not isinstance(operation, HybridDirectoryMirror):
-            continue
-        directory = directories[operation.name]
-        staged_directory = f"{stage_root}/{operation.name}"
-        transport.make_directory(staged_directory)
-        for relative in sorted(
-            directory.directories,
-            key=lambda path: (len(PurePosixPath(path).parts), path),
-        ):
-            transport.make_directory(f"{staged_directory}/{relative}")
-        for relative in directory.files:
-            final_path = f"{operation.name}/{relative}"
-            staged_path = f"{staged_directory}/{relative}"
-            _upload_with_retry(
-                frozen[final_path],
-                staged_path,
-                transport,
-                progress,
-                attempts=config.deploy.retries,
-                delay=config.deploy.retry_delay,
-            )
-    record = record.with_phase(RecoveryPhase.STAGED)
-    write_recovery(transport, record)
-    record = record.with_phase(RecoveryPhase.SWAPPING)
-    write_recovery(transport, record)
-    for operation in hybrid.operations:
         if isinstance(operation, HybridRootFileUpload):
-            record = record.starting(operation.path)
-            write_recovery(transport, record)
-            _backup_current(transport, operation.path, backup_root)
             _upload_with_retry(
                 frozen[operation.path],
-                operation.path,
+                f"{stage_root}/{operation.path}",
                 transport,
                 progress,
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
         elif isinstance(operation, HybridDirectoryMirror):
+            directory = directories[operation.name]
+            staged_directory = f"{stage_root}/{operation.name}"
+            transport.make_directory(staged_directory)
+            for relative in sorted(
+                directory.directories,
+                key=lambda path: (len(PurePosixPath(path).parts), path),
+            ):
+                transport.make_directory(f"{staged_directory}/{relative}")
+            for relative in directory.files:
+                final_path = f"{operation.name}/{relative}"
+                staged_path = f"{staged_directory}/{relative}"
+                _upload_with_retry(
+                    frozen[final_path],
+                    staged_path,
+                    transport,
+                    progress,
+                    attempts=config.deploy.retries,
+                    delay=config.deploy.retry_delay,
+                )
+    record = record.with_phase(RecoveryPhase.STAGED)
+    write_recovery(transport, record)
+    try:
+        validate_remote_freshness(
+            plan,
+            config,
+            transport,
+            expected_recovery_records=(record,),
+        )
+    except StaleRemotePlanError:
+        try:
+            discard_staged_recovery(transport, record)
+        except Exception as cleanup_error:
+            print(
+                "WARNING: stale Hybrid Stage cleanup is pending; review with "
+                f"--remote-plan and run --recover: {cleanup_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise
+    record = record.with_phase(RecoveryPhase.SWAPPING)
+    write_recovery(transport, record)
+    for operation in hybrid.operations:
+        if isinstance(operation, HybridRootFileUpload):
+            record = record.starting(operation.path)
+            write_recovery(transport, record)
+            try:
+                _backup_current(
+                    transport,
+                    operation.path,
+                    backup_root,
+                    expected_types[operation.path],
+                )
+            except StaleRemotePlanError:
+                record = record.without_active()
+                write_recovery(transport, record)
+                raise
+            _publish_staged(
+                transport,
+                f"{stage_root}/{operation.path}",
+                operation.path,
+                expected_types[operation.path],
+            )
+        elif isinstance(operation, HybridDirectoryMirror):
             record = record.starting(operation.name)
             write_recovery(transport, record)
-            _backup_current(transport, operation.name, backup_root)
-            transport.rename_path(f"{stage_root}/{operation.name}", operation.name)
+            try:
+                _backup_current(
+                    transport,
+                    operation.name,
+                    backup_root,
+                    expected_types[operation.name],
+                )
+            except StaleRemotePlanError:
+                record = record.without_active()
+                write_recovery(transport, record)
+                raise
+            _publish_staged(
+                transport,
+                f"{stage_root}/{operation.name}",
+                operation.name,
+                expected_types[operation.name],
+            )
         elif isinstance(operation, (HybridRootFileDelete, HybridDirectoryDelete)):
             name = operation.path if isinstance(operation, HybridRootFileDelete) else operation.name
+            if expected_types[name] is RemotePathType.MISSING:
+                _backup_current(transport, name, backup_root, expected_types[name])
+                continue
             record = record.starting(name)
             write_recovery(transport, record)
-            _backup_current(transport, name, backup_root)
+            try:
+                _backup_current(transport, name, backup_root, expected_types[name])
+            except StaleRemotePlanError:
+                record = record.without_active()
+                write_recovery(transport, record)
+                raise
     if any(isinstance(item, HybridOwnershipUpdate) for item in hybrid.operations):
+        validate_remote_freshness(
+            plan,
+            config,
+            transport,
+            expected_recovery_records=(record,),
+            check_path_types=False,
+        )
         transport.write_file_atomic(
             ownership_path(hybrid.local.mapping),
             serialize_ownership(next_ownership),
@@ -375,14 +428,15 @@ def _execute_hybrid_plan(
         cleanup_committed_recovery(transport, record)
     except Exception as exc:
         print(
-            f"WARNING: hybrid cleanup is pending and will resume next deployment: {exc}",
+            "WARNING: hybrid cleanup is pending; review with --remote-plan and "
+            f"run --recover: {exc}",
             file=sys.stderr,
             flush=True,
         )
 
 
-def _execute_recovery_plan(
-    plan: DeploymentPlan,
+def execute_recovery_plan(
+    plan: RecoveryPlan,
     state_store: StateStore,
     transport: Transport,
     *,
@@ -400,17 +454,20 @@ def _execute_recovery_plan(
         ``None`` after restore or committed command/state/cleanup continuation.
     """
 
-    hybrid = plan.hybrid
-    if hybrid is None or len(hybrid.recovery_records) != 1:
-        raise PlanError("recovery execution requires exactly one reviewed record")
-    record = hybrid.recovery_records[0]
+    validate_recovery_freshness(plan, transport)
+    record = plan.record
     outcome = reconcile_recovery(transport, record)
     if not outcome.ownership_committed:
         print("Hybrid Recovery restored the pre-deployment remote state.")
         return
     current = record
     if outcome.commands_pending:
-        _execute_after_deploy(plan, transport, verbose=verbose)
+        _execute_remote_commands(
+            plan.target,
+            plan.target.after_deploy,
+            transport,
+            verbose=verbose,
+        )
         current = current.with_phase(RecoveryPhase.COMMANDS_COMPLETE)
         write_recovery(transport, current)
     if outcome.state_pending:
@@ -419,13 +476,13 @@ def _execute_recovery_plan(
         # deployment re-uploads current outputs instead of trusting unknown hashes.
         # The commit must come from committed Remote Ownership rather than today's
         # HEAD, otherwise commits created after the interruption could be skipped.
-        if hybrid.ownership is None:
+        if plan.ownership is None:
             raise PlanError("committed hybrid recovery lacks Remote Ownership")
         state_store.save(
             new_state(
                 plan.target.name,
                 plan.target_fingerprint,
-                hybrid.ownership.last_commit,
+                plan.ownership.last_commit,
                 {},
             )
         )
@@ -441,18 +498,72 @@ def _execute_recovery_plan(
         )
 
 
-def _backup_current(transport: Transport, name: str, backup_root: str) -> None:
-    """Move one existing owned direct child into this deployment's Backup."""
+def _backup_current(
+    transport: Transport,
+    name: str,
+    backup_root: str,
+    expected_type: RemotePathType,
+) -> None:
+    """Move one path only when its current type equals the approved plan.
+
+    Args:
+        transport: Connected SFTP adapter.
+        name: Direct Hybrid path about to be replaced or removed.
+        backup_root: Deployment-owned Backup directory.
+        expected_type: Exact type frozen in the reviewed Remote Plan.
+
+    Returns:
+        ``None`` after absence is reconfirmed or the expected path is backed up.
+    """
 
     kind = transport.lstat(name)
-    if kind is RemotePathType.MISSING:
+    if kind is not expected_type:
+        raise StaleRemotePlanError(
+            f"remote path type changed before Hybrid swap: {name!r} "
+            f"({expected_type.value} -> {kind.value})"
+        )
+    if expected_type is RemotePathType.MISSING:
         return
-    if kind in {RemotePathType.SYMLINK, RemotePathType.OTHER}:
-        raise DeployError(f"refusing to replace unsupported remote type {kind.value}: {name}")
+    if expected_type in {RemotePathType.SYMLINK, RemotePathType.OTHER}:
+        raise DeployError(
+            f"refusing to replace unsupported remote type {expected_type.value}: {name}"
+        )
     destination = f"{backup_root}/{name}"
     if transport.lstat(destination) is not RemotePathType.MISSING:
         raise DeployError(f"hybrid backup destination already exists: {destination}")
     transport.rename_path(name, destination)
+
+
+def _publish_staged(
+    transport: Transport,
+    staged_path: str,
+    final_path: str,
+    expected_type: RemotePathType,
+) -> None:
+    """Publish Stage with a fail-closed no-overwrite Missing-path contract.
+
+    Args:
+        transport: Connected SFTP adapter.
+        staged_path: Deployment-owned staged file or directory.
+        final_path: Reviewed direct Hybrid destination.
+        expected_type: Destination type approved by the Remote Plan.
+
+    Returns:
+        ``None`` after the transport's no-overwrite rename succeeds.
+    """
+
+    try:
+        transport.rename_path(staged_path, final_path)
+    except DeployError as exc:
+        if (
+            expected_type is RemotePathType.MISSING
+            and transport.lstat(staged_path) is not RemotePathType.MISSING
+            and transport.lstat(final_path) is not RemotePathType.MISSING
+        ):
+            raise StaleRemotePlanError(
+                f"remote path appeared during no-overwrite Hybrid publish: {final_path!r}"
+            ) from exc
+        raise
 
 
 def _upload_with_retry(
@@ -507,25 +618,51 @@ def _execute_after_deploy(
         ``None`` only after every configured command exits successfully.
     """
 
-    commands = plan.target.after_deploy
+    _execute_remote_commands(
+        plan.target,
+        plan.target.after_deploy,
+        transport,
+        verbose=verbose,
+    )
+
+
+def _execute_remote_commands(
+    target: TargetConfig,
+    commands: tuple[str, ...],
+    transport: Transport,
+    *,
+    verbose: bool,
+) -> None:
+    """Execute one frozen command contract through a connected transport.
+
+    Args:
+        target: Frozen endpoint, root, and command timeout.
+        commands: Exact reviewed command sequence.
+        transport: Connected SFTP transport.
+        verbose: Whether to print endpoint execution context.
+
+    Returns:
+        ``None`` only after all commands exit successfully.
+    """
+
     for index, command in enumerate(commands, start=1):
         marker = f"[{index}/{len(commands)}]"
         print(f"REMOTE {marker} {command}", flush=True)
         if verbose:
             endpoint = (
-                f"{plan.target.username or ''}@{plan.target.host or plan.target.ssh_host_alias}:"
-                f"{plan.target.port}"
+                f"{target.username or ''}@{target.host or target.ssh_host_alias}:"
+                f"{target.port}"
             )
             print(
                 f"REMOTE CONTEXT {marker} endpoint={endpoint} "
-                f"cwd={plan.target.remote_root} timeout={plan.target.command_timeout}",
+                f"cwd={target.remote_root} timeout={target.command_timeout}",
                 flush=True,
             )
         try:
             transport.run_command(
                 command,
-                cwd=plan.target.remote_root,
-                timeout=plan.target.command_timeout,
+                cwd=target.remote_root,
+                timeout=target.command_timeout,
             )
         except Exception as exc:
             print(f"REMOTE FAILED {marker} {exc}", file=sys.stderr, flush=True)

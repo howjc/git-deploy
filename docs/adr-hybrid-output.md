@@ -1,6 +1,6 @@
 # ADR：单 Hybrid Output 与远端所有权
 
-状态：Accepted；v1.4.1 安全边界修订
+状态：Accepted；v1.4.2 运行期新鲜度与独立恢复修订
 
 日期：2026-07-17
 
@@ -26,11 +26,11 @@ v1.4.0 只增加一个受控模型：项目 Build 先把明确来源聚合到一
 
 ## Recovery 与原子性边界
 
-Mirror Directory 先完整上传到 `.git-deploy/stage/<id>`，现有路径移动到 `.git-deploy/backup/<id>` 后再发布。`.git-deploy/recovery/<id>.json` 记录 Deployment ID、Mapping、Target Fingerprint、Stage/Backup、阶段和新旧 Ownership Hash。
+Root File 与 Mirror Directory 都先完整上传到 `.git-deploy/stage/<id>`，现有路径移动到 `.git-deploy/backup/<id>` 后再发布。计划时 Missing 的路径使用不覆盖目标的 Rename，目标最后一刻出现时发布失败，不会把外部路径移入 Backup。`.git-deploy/recovery/<id>.json` 记录 Deployment ID、Mapping、Target Fingerprint、Stage/Backup、阶段和新旧 Ownership Hash。
 
-中断记录的发现与执行严格分离。普通部署、`--remote-plan` 和 Doctor 都只读报告；只有用户确认后的 `--recover` 才执行恢复，并在完成后退出，要求下一次普通部署重新读取事实和确认计划。
+中断记录的发现与执行严格分离。普通部署、`--remote-plan` 和 Doctor 都只读报告；只有用户确认后的 `--recover` 才执行恢复，并在完成后退出，要求下一次普通部署重新读取事实和确认计划。Recovery-only Prepare 不运行 Build、不读取既有 State 内容、不扫描或冻结当前 Local Hybrid，也不生成当前 Source/Output 操作；它只冻结 Target/Command Contract，获取本地 Target Lock，并读取完成恢复所需的远端事实。Workspace 只保留实际存在 Recovery 的项目。
 
-中断发生在 Ownership Commit 前时恢复 Backup；Commit 后按持久阶段继续 `after_deploy`、Local State 和清理。命令采用至少一次语义；已记录完成的命令不会因 State/Cleanup 失败而重复。必要 Backup 缺失或无法证明新旧 Ownership Hash 时 Fail Closed 并保留 Recovery、Stage 和 Backup 现场。它只恢复当前 Hybrid Swap，不是历史、回滚或发布事务系统。
+中断发生在 Ownership Commit 前时恢复 Backup；Commit 后按持久阶段继续 `after_deploy`、Local State 和清理。命令采用至少一次语义；已记录完成的命令不会因 State/Cleanup 失败而重复。必要 Backup 缺失或无法证明新旧 Ownership Hash 时 Fail Closed 并保留 Recovery、Stage 和 Backup 现场。schema-1 记录的 Pre-commit Restore 继续支持；若其 Ownership 已提交且命令待执行，因为旧格式没有命令契约指纹，必须 Fail Closed 并人工处理，不能执行当前配置命令。它只恢复当前 Hybrid Swap，不是历史、回滚或发布事务系统。
 
 SFTP 没有标准目录交换操作，Rename 之间存在短暂切换窗口；本方案不宣称严格零停机或跨多个目录的全局事务。
 
@@ -41,6 +41,8 @@ SFTP 没有标准目录交换操作，Rename 之间存在短暂切换窗口；�
 - 普通部署：远端 Preflight 后显示完整计划并确认，才创建 Root、Stage、Backup 与 Recovery。
 
 确认后的首个写操作前，执行端重新读取 Ownership 的原始字节 Hash，并重新 `lstat` 当前与历史全部受管直接路径。任一事实变化抛出 Stale Plan，且不得创建 Root、Stage、Backup、Recovery 或执行普通上传。Workspace 在任一仓写入前先复核全部选中仓库。
+
+所有 Stage 上传（包括重试和重连）结束后、开始 `SWAPPING` 前，执行端再次核对 Ownership Hash、Recovery Record 和全部计划路径类型；Stale 时只清理执行器拥有的内部 Stage/Backup/Recovery，清理失败则保留 Recovery 供显式 `--recover` 续作，在线路径不修改。每条路径在 Backup 前还必须等于计划类型；写入新 Ownership 前再次核对旧 Ownership Hash。这是运行期逐边界的新鲜度保证，不是远端租约，仍不支持多发布器并发写同一受管路径。
 
 ## 明确不做
 

@@ -12,6 +12,7 @@ from git_deploy.config import Config, TargetConfig, load_config, resolve_target_
 from git_deploy.deployer import (
     TransportFactory,
     estimate_frozen_bytes,
+    execute_recovery_plan,
     execute_frozen_plan,
     freeze_uploads,
 )
@@ -21,8 +22,11 @@ from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
 from git_deploy.planner import (
     DeploymentPlan,
+    RecoveryPlan,
     complete_remote_plan,
+    create_recovery_plan,
     create_plan,
+    validate_recovery_freshness,
     validate_remote_freshness,
 )
 from git_deploy.transports import create_transport
@@ -57,6 +61,30 @@ class PreparedDeployment:
                 self.transport.close()
                 self.transport = None
             self._temporary.cleanup()
+        finally:
+            self._lock.release()
+
+
+@dataclass(slots=True)
+class PreparedRecovery:
+    """Own a Recovery-only plan, connected transport, State path, and lock."""
+
+    name: str
+    config: Config
+    state_store: StateStore
+    plan: RecoveryPlan
+    transport: Transport
+    _lock: TargetLock
+    _closed: bool = False
+
+    def close(self) -> None:
+        """Close the remote connection and release the local target lock."""
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.transport.close()
         finally:
             self._lock.release()
 
@@ -183,7 +211,6 @@ def prepare_project(
 def prepare_remote_plan(
     prepared: PreparedDeployment,
     *,
-    allow_recovery: bool,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
 ) -> None:
@@ -191,7 +218,6 @@ def prepare_remote_plan(
 
     Args:
         prepared: Locally frozen project plan.
-        allow_recovery: Whether normal deployment may reconcile prior recovery.
         transport_factory: Optional fake adapter factory.
         connection_pool: Optional command-scoped Native OpenSSH pool.
 
@@ -213,13 +239,68 @@ def prepare_remote_plan(
                 prepared.plan,
                 prepared.config,
                 transport,
-                allow_recovery=allow_recovery,
             )
         else:
             transport.root_exists()
         prepared.transport = transport
     except BaseException:
         transport.close()
+        raise
+
+
+def prepare_recovery(
+    name: str,
+    config: Config,
+    requested_target: str | None,
+    *,
+    prepared_target: TargetConfig | None = None,
+    prepared_lock: TargetLock | None = None,
+    transport_factory: TransportFactory | None = None,
+    connection_pool: SSHConnectionPool | None = None,
+) -> PreparedRecovery | None:
+    """Prepare only remote Recovery facts without Build, State read, or scans.
+
+    Args:
+        name: Human-readable project label.
+        config: Loaded project configuration.
+        requested_target: Explicit/default target name.
+        prepared_target: Workspace-resolved target, when available.
+        prepared_lock: Workspace-acquired lock transferred on success.
+        transport_factory: Optional fake/custom transport factory.
+        connection_pool: Optional Native OpenSSH connection pool.
+
+    Returns:
+        Locked connected Recovery, or ``None`` when no record exists.
+    """
+
+    target = config.target(requested_target)
+    repository = GitRepository(config.project_root)
+    state_store = StateStore(repository.common_dir())
+    lock = prepared_lock or TargetLock(state_store.base, target.name)
+    if prepared_lock is None:
+        lock.acquire()
+    transport: Transport | None = None
+    try:
+        resolved_target = prepared_target or resolve_target_for_plan(
+            target,
+            runtime_dir=state_store.base,
+        )
+        transport = (
+            transport_factory(resolved_target)
+            if transport_factory is not None
+            else create_transport(resolved_target, connection_pool)
+        )
+        transport.connect()
+        plan = create_recovery_plan(config, resolved_target, transport)
+        if plan is None:
+            transport.close()
+            lock.release()
+            return None
+        return PreparedRecovery(name, config, state_store, plan, transport, lock)
+    except BaseException:
+        if transport is not None:
+            transport.close()
+        lock.release()
         raise
 
 
@@ -254,7 +335,6 @@ def execute_prepared(
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
-    recover_only: bool = False,
 ) -> None:
     """Execute one prepared project and always release its local resources."""
 
@@ -268,9 +348,34 @@ def execute_prepared(
             transport_factory=transport_factory,
             connection_pool=connection_pool,
             prepared_transport=prepared.transport,
-            recover_only=recover_only,
         )
         prepared.transport = None
+    finally:
+        prepared.close()
+
+
+def execute_prepared_recovery(
+    prepared: PreparedRecovery,
+    *,
+    verbose: bool = False,
+) -> None:
+    """Execute one reviewed Recovery and always release connection and lock.
+
+    Args:
+        prepared: Recovery-only plan retaining its connected transport.
+        verbose: Whether to print remote command context.
+
+    Returns:
+        ``None`` after the pending recovery phases finish or remain recorded.
+    """
+
+    try:
+        execute_recovery_plan(
+            prepared.plan,
+            prepared.state_store,
+            prepared.transport,
+            verbose=verbose,
+        )
     finally:
         prepared.close()
 
@@ -290,3 +395,16 @@ def validate_prepared_freshness(prepared: PreparedDeployment) -> None:
     if prepared.transport is None:
         raise PlanError("hybrid freshness validation requires a prepared transport")
     validate_remote_freshness(prepared.plan, prepared.config, prepared.transport)
+
+
+def validate_prepared_recovery(prepared: PreparedRecovery) -> None:
+    """Revalidate one connected Recovery without mutating remote state.
+
+    Args:
+        prepared: Recovery-only plan retaining its transport and target lock.
+
+    Returns:
+        ``None`` when record, Ownership, and phase facts remain unchanged.
+    """
+
+    validate_recovery_freshness(prepared.plan, prepared.transport)

@@ -1,3 +1,3 @@
 """git-deploy v1-lite package metadata."""
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"

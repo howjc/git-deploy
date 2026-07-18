@@ -78,4 +78,6 @@ git-deploy prod --remote-plan
 git-deploy prod --yes
 ```
 
-`--recover` 只执行已确认的当前 Recovery 并退出；下一条普通命令会重新读取 Ownership 和路径类型、重新生成计划。不要手工删除 `.git-deploy`，也不要让另一个发布器修改 Hybrid 拥有的路径。Doctor 会只读报告 Ownership、Recovery、路径类型和是否需要 Adoption；必要 Backup 缺失时会要求人工检查并保留现场。
+`--recover` 走独立的 Recovery-only Prepare：即使当前 Build 失败、Local Hybrid 缺失或既有 State 内容损坏，也不会因此阻塞远端恢复。它只执行已确认的当前 Recovery 并退出；下一条普通命令会重新读取 Ownership 和路径类型、重新生成计划。不要手工删除 `.git-deploy`，也不要让另一个发布器修改 Hybrid 拥有的路径。Doctor 会只读报告 Ownership、Recovery、路径类型和是否需要 Adoption；必要 Backup 缺失时会要求人工检查并保留现场。
+
+从 v1.4.0 升级时无需迁移 Ownership。旧 schema-1 Recovery 若尚未提交 Ownership，可由 v1.4.2 保守恢复；若 Ownership 已提交且 `after_deploy` 命令仍待执行，旧记录无法证明中断时的命令与超时契约，`--recover` 会 Fail Closed，Doctor 显示 `Legacy Command Contract Unknown`。此时不要改跑当前配置命令或删除记录，应先备份 `.git-deploy` 现场并人工核对旧版本配置、命令执行记录和远端状态。
