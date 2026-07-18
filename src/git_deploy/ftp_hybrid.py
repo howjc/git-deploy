@@ -170,7 +170,8 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
             raise PlanError(
                 "FTP Hybrid Capability Profile is obsolete and does not prove UTF-8 "
                 "normalization-preserving path semantics; "
-                "run Doctor --probe-ftp-hybrid again"
+                "run Doctor --probe-ftp-hybrid again. Legacy Pending recovery "
+                "requires v1.5.1 or a successful Schema 3 re-probe"
             )
         raise PlanError("FTP Hybrid Capability Profile has an invalid schema")
     fingerprint = raw.get("target_fingerprint")
@@ -296,6 +297,7 @@ def probe_ftp_hybrid_capabilities(
     if "UTF8" not in features:
         raise DeployError("FTP server does not advertise mandatory UTF8 support")
     transport.enable_utf8()
+    validate_remote_root_aliases(transport, (("internal", ".git-deploy"),))
     probe_root = f".git-deploy/ftp-probe/{secrets.token_hex(16)}"
     primary_error: BaseException | None = None
     try:
@@ -470,6 +472,48 @@ def probe_ftp_hybrid_capabilities(
         True,
         True,
     )
+
+
+def validate_remote_root_aliases(
+    transport: FTPTransport,
+    planned_paths: tuple[tuple[str, str], ...],
+) -> None:
+    """Reject unknown remote root spellings that alias a managed root.
+
+    Args:
+        transport: Connected FTP adapter used for one non-recursive root MLSD.
+        planned_paths: Ownership-domain and managed relative-path pairs.
+
+    Returns:
+        ``None`` when every matching remote root uses the exact planned spelling.
+    """
+
+    existing_by_key: dict[str, tuple[str, ...]] = {}
+    for existing in transport.list_root_names():
+        key = unicodedata.normalize("NFC", existing).casefold()
+        existing_by_key[key] = (*existing_by_key.get(key, ()), existing)
+    checked: set[tuple[str, str]] = set()
+    for domain, path in planned_paths:
+        candidate = PurePosixPath(path)
+        if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+            raise PlanError(f"unsafe {domain} path in FTP root alias gate: {path!r}")
+        planned_root = candidate.parts[0]
+        planned_key = unicodedata.normalize("NFC", planned_root).casefold()
+        identity = (planned_key, planned_root)
+        if identity in checked:
+            continue
+        checked.add(identity)
+        aliases = tuple(
+            existing
+            for existing in existing_by_key.get(planned_key, ())
+            if existing != planned_root
+        )
+        if aliases:
+            raise PlanError(
+                "FTP remote root aliases a managed path: "
+                f"{domain} {planned_root!r} conflicts with existing {aliases[0]!r} "
+                "under NFC plus casefold semantics"
+            )
 
 
 def local_manifest_hash(
@@ -981,4 +1025,5 @@ __all__ = [
     "serialize_pending",
     "validate_pending_resume",
     "validate_pending_ownership_phase",
+    "validate_remote_root_aliases",
 ]

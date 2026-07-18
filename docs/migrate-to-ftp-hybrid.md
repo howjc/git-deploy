@@ -33,7 +33,7 @@ FTP Target 不能配置 `after_deploy`。Hybrid 不能显式配置 `delete_remov
 git-deploy doctor prod --probe-ftp-hybrid
 ```
 
-此命令会明确提示并只在 `.git-deploy/ftp-probe/<随机 ID>` 创建、读取、Rename、删除临时文件，完成后清理本次 Probe Root。服务器必须广告 `UTF8`、接受 `OPTS UTF8 ON`，并证明中文文件名、NFC/NFD 两个精确名称、大小写变体可同时存在且能独立 MLSD/RETR/Delete/Rename，同时通过二进制零/非零回读、跨目录 Rename、Rename Replace、DELE 与 RMD。Profile 缺失、损坏、Target/Banner 变化、Schema 1/2 或运行期能力错误时重新执行；`--probe-ftp-hybrid` 本身会明确覆盖 Schema 3 Profile，不再需要 `--reprobe`。不要改用 LIST/NLST 或关闭校验。
+此命令先用 Root MLSD 检查 `.git-deploy` 的远端未知别名；通过后才会在 `.git-deploy/ftp-probe/<随机 ID>` 创建、读取、Rename、删除临时文件，并清理本次 Probe Root。服务器必须广告 `UTF8`、接受 `OPTS UTF8 ON`，并证明中文文件名、NFC/NFD 两个精确名称、大小写变体可同时存在且能独立 MLSD/RETR/Delete/Rename，同时通过二进制零/非零回读、跨目录 Rename、Rename Replace、DELE 与 RMD。Profile 缺失、损坏、Target/Banner 变化、Schema 1/2 或运行期能力错误时重新执行；`--probe-ftp-hybrid` 本身会明确覆盖 Schema 3 Profile，不再需要 `--reprobe`。不要改用 LIST/NLST 或关闭校验。
 
 ## 4. 首次审阅与 Adoption
 
@@ -52,7 +52,7 @@ git-deploy prod --remote-plan
 git-deploy prod --yes
 ```
 
-FTP backend 总是先发布当前文件，再删除受管孤儿；Ownership 最后提交，Local State 在 Ownership 之后保存。`PREPARED`、`FILES_PUBLISHED`、`PRUNED` 中断后继续运行普通 `--remote-plan` 和部署；Schema 2 Marker 会要求 Project、Mapping、Remote、Target Fingerprint、HEAD、Local Manifest、稳定的 Source/Incremental Operation 与配置策略、Previous State，以及阶段对应的 Ownership Hash 全部匹配。`FILES_PUBLISHED` 恢复不会再次执行普通 Source/Incremental 队列。进入 `OWNERSHIP_COMMITTED` 或 `STATE_COMPLETE` 后只运行 `git-deploy prod --recover`：普通部署会在 Build/Plan 前拒绝；恢复路径不 Build、不读取当前 State、不扫描当前 Hybrid，并始终把 Marker 中冻结的 State 写入当前 clone 后再清理。
+FTP backend 总是先发布当前文件，再删除受管孤儿；Ownership 最后提交，Local State 在 Ownership 之后保存。`PREPARED`、`FILES_PUBLISHED`、`PRUNED` 中断后继续运行普通 `--remote-plan` 和部署；Schema 2 Marker 会要求 Project、Mapping、Remote、Target Fingerprint、HEAD、Local Manifest、稳定的 Source/Incremental Operation 与配置策略、Previous State，以及阶段对应的 Ownership Hash 全部匹配。网络重试会在新 Session 的任何业务操作前重新完成 Banner/FEAT/`OPTS UTF8 ON`。`FILES_PUBLISHED` 恢复不会再次执行普通 Source/Incremental 队列。进入 `OWNERSHIP_COMMITTED` 或 `STATE_COMPLETE` 后只运行 `git-deploy prod --recover`：包括 `--remote-plan` 在内的非 Dry-run 会在 Build/Plan 前拒绝并提示 Recovery；恢复路径不 Build、不读取当前 State、不扫描当前 Hybrid，并始终把 Marker 中冻结的 State 写入当前 clone 后再清理。
 
 State 丢失不会丢失删除所有权；Remote Ownership 仍会清理历史受管内容。不要手工删除 `.git-deploy`。
 
@@ -61,5 +61,5 @@ State 丢失不会丢失删除所有权；Remote Ownership 仍会清理历史受
 - 只支持单发布器；部署期间不要并发手工 FTP、CI 或面板修改受管路径。
 - 无目录原子 Swap、旧目录树回滚和 FTP `after_deploy`。
 - File→Directory / Directory→File 必须拆成两次部署：先移除旧类型并确认删除，再添加新类型并用 `--full` 审阅。
-- Source、Incremental、Hybrid Direct、历史受管根与 `.git-deploy` 共用 NFC + casefold 根命名空间；本地和远端每个目录也拒绝冲突名称。Windows/IIS、Unicode normalization 或大小写语义不明的服务器会在 Probe 阶段 Fail Closed。
+- Source、Incremental、Hybrid Direct、历史受管根与 `.git-deploy` 共用 NFC + casefold 根命名空间；Remote Plan 会把这些根与远端所有 Direct Entries 比对。精确同名仍按 Adoption/Ownership 处理，`Assets`/`assets`、NFC/NFD 和 `.GIT-DEPLOY`/`.git-deploy` 等异形在写前拒绝；无关未知根不会递归或删除。
 - vsftpd、Pure-FTPd/ProFTPD 与实际目标服务器应在上线前人工执行 Doctor Probe；自动门禁使用本地 pyftpdlib fixture，不需要真实账号或生产凭据。

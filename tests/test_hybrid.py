@@ -1832,6 +1832,35 @@ def test_cli_remote_plan_is_read_only_and_dry_run_never_connects(
         )
 
 
+def test_ftp_remote_plan_checks_post_commit_pending_before_build(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovery-only FTP marker blocks remote-plan before local Build work."""
+
+    config_path = _hybrid_project(git_project)
+    text = config_path.read_text(encoding="utf-8")
+    text = text.replace(
+        'protocol = "sftp"\nhost = "example.invalid"\nusername = "deploy"',
+        'protocol = "ftp"\nhost = "example.invalid"\nusername = "deploy"\n'
+        'password_env = "FTP_PASS"',
+    ).replace('steps = []', 'steps = ["printf built > build-marker"]')
+    config_path.write_text(text, encoding="utf-8")
+
+    def reject(*_args: object) -> None:
+        """Model a post-commit Pending marker requiring explicit recovery."""
+
+        raise PlanError("run this target with --recover")
+
+    monkeypatch.setattr(
+        "git_deploy.prepared._reject_post_commit_ftp_pending",
+        reject,
+    )
+
+    assert cli.main(["--config", str(config_path), "--remote-plan"]) == 4
+    assert not (git_project / "build-marker").exists()
+
+
 def test_cli_adoption_requires_yes_when_input_is_noninteractive(
     git_project: Path,
     monkeypatch: pytest.MonkeyPatch,

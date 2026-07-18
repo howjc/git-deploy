@@ -262,7 +262,7 @@ def _deploy_project(
         requested_target,
         full=args.full,
         skip_build=args.skip_build,
-        check_post_commit_pending=not args.dry_run and not args.remote_plan,
+        check_post_commit_pending=not args.dry_run,
     )
     try:
         if not args.dry_run and (
@@ -362,7 +362,7 @@ def _deploy_workspace(
         requested_target,
         full=args.full,
         skip_build=args.skip_build,
-        check_post_commit_pending=not args.dry_run and not args.remote_plan,
+        check_post_commit_pending=not args.dry_run,
     )
     pool = SSHConnectionPool()
     try:

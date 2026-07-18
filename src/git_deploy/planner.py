@@ -29,6 +29,7 @@ from git_deploy.ftp_hybrid import (
     read_pending,
     scan_ftp_tree,
     validate_pending_resume,
+    validate_remote_root_aliases,
 )
 from git_deploy.git import GitEntry, GitRepository
 from git_deploy.hybrid import (
@@ -250,6 +251,7 @@ class DeploymentPlan:
     non_hybrid_owned: tuple[str, ...] = ()
     previous_state_hash: str = ""
     non_hybrid_plan_hash: str = ""
+    ftp_root_namespace: tuple[tuple[str, str], ...] = ()
 
     @property
     def upload_count(self) -> int:
@@ -408,7 +410,18 @@ def create_plan(
             source_owned,
             set(current_outputs) | previous_incremental,
         )
-    source_operations = _plan_source(repository, config, state, head, effective_full, entries)
+    requires_source_contract = (
+        resolved_target.protocol == "ftp" and hybrid_local is not None
+    )
+    source_operations = _plan_source(
+        repository,
+        config,
+        state,
+        head,
+        effective_full,
+        entries,
+        require_content_identity=requires_source_contract,
+    )
     if resolved_target.protocol == "ftp":
         executable_paths = [
             operation.remote_path
@@ -427,6 +440,7 @@ def create_plan(
     manifest = {path: item.entry for path, item in current_outputs.items()}
     if hybrid_local is not None:
         manifest.update({item.name: item.entry for item in hybrid_local.root_files})
+    ftp_root_namespace: tuple[tuple[str, str], ...] = ()
     if hybrid_local is not None and resolved_target.protocol == "ftp":
         historical_source: set[str] = set()
         if state is not None:
@@ -453,6 +467,7 @@ def create_plan(
             ("internal", ".git-deploy"),
         ]
         _validate_ftp_root_namespace(namespace_entries)
+        ftp_root_namespace = tuple(namespace_entries)
     plan = DeploymentPlan(
         target=resolved_target,
         target_fingerprint=target_fingerprint,
@@ -473,8 +488,11 @@ def create_plan(
         ),
         non_hybrid_owned=tuple(sorted((*source_owned, *current_outputs.keys()))),
         previous_state_hash=target_state_hash(state),
+        ftp_root_namespace=ftp_root_namespace,
     )
-    return replace(plan, non_hybrid_plan_hash=deployment_contract_hash(plan, config))
+    if requires_source_contract:
+        return replace(plan, non_hybrid_plan_hash=deployment_contract_hash(plan, config))
+    return plan
 
 
 def deployment_contract_hash(plan: DeploymentPlan, config: Config) -> str:
@@ -746,6 +764,7 @@ def _complete_ftp_remote_plan(
         plan.target,
         server_banner_hash=transport.server_banner_hash(),
     )
+    validate_remote_root_aliases(transport, plan.ftp_root_namespace)
     ownership, ownership_snapshot = read_ownership_snapshot(
         transport,
         project_id=config.project_id,
@@ -805,6 +824,13 @@ def _complete_ftp_remote_plan(
             *(("historical hybrid", name) for name in sorted(old)),
             ("internal", ".git-deploy"),
         ]
+    )
+    validate_remote_root_aliases(
+        transport,
+        (
+            *plan.ftp_root_namespace,
+            *(("historical hybrid", name) for name in sorted(old)),
+        ),
     )
     _reject_historical_transfer(plan, old - current)
     type_changes = sorted(
@@ -1061,6 +1087,7 @@ def create_recovery_plan(
             target,
             server_banner_hash=transport.server_banner_hash(),
         )
+        validate_remote_root_aliases(transport, (("internal", ".git-deploy"),))
         _, ownership_snapshot = read_ownership_snapshot(
             transport,
             project_id=config.project_id,
@@ -1479,6 +1506,13 @@ def _validate_ftp_remote_freshness(
     if plan.target.runtime_dir is None:
         raise PlanError("FTP Hybrid freshness lacks a Git runtime directory")
     transport.refresh_remote_metadata()
+    validate_remote_root_aliases(
+        transport,
+        (
+            *plan.ftp_root_namespace,
+            *(("historical hybrid", path) for path, _ in hybrid.expected_path_types),
+        ),
+    )
     profile = load_capability_profile(
         plan.target.runtime_dir,
         plan.target,
@@ -1548,6 +1582,7 @@ def validate_recovery_freshness(
                 "FTP Hybrid recovery freshness lacks a Git runtime directory"
             )
         transport.enable_utf8()
+        validate_remote_root_aliases(transport, (("internal", ".git-deploy"),))
         load_capability_profile(
             plan.target.runtime_dir,
             plan.target,
@@ -1619,47 +1654,82 @@ def _plan_source(
     head: str,
     full: bool,
     entries: dict[str, GitEntry],
+    *,
+    require_content_identity: bool,
 ) -> tuple[Operation, ...]:
-    """Plan exact HEAD source blobs and Git-derived deletions."""
+    """Plan exact HEAD source blobs and optional stable content identities.
+
+    Args:
+        repository: Validated Git object reader.
+        config: Source include, exclude, and protection policy.
+        state: Previous successful deployment state when incremental.
+        head: Frozen commit used as the incremental diff endpoint.
+        full: Whether every current managed source path must upload.
+        entries: Current file-like Git entries keyed by path.
+        require_content_identity: Hash source only for FTP Hybrid resume binding.
+
+    Returns:
+        Deterministic source upload and deletion operations.
+    """
 
     operations: list[Operation] = []
     if full:
-        for path, entry in entries.items():
-            if is_source_managed(path, config.source):
-                _require_regular_git_entry(entry)
-                content = repository.blob_manifest(head, path)
-                operations.append(
-                    UploadOperation(
-                        path,
-                        "source",
-                        git_path=path,
-                        size=content.size,
-                        executable=entry.mode == "100755",
-                        sha256=content.sha256,
-                    )
+        selected = tuple(
+            entry
+            for path, entry in entries.items()
+            if is_source_managed(path, config.source)
+        )
+        for entry in selected:
+            _require_regular_git_entry(entry)
+        manifests = repository.blob_manifests(selected) if require_content_identity else {}
+        for entry in selected:
+            content = manifests.get(entry.path)
+            operations.append(
+                UploadOperation(
+                    entry.path,
+                    "source",
+                    git_path=entry.path,
+                    size=content.size if content is not None else entry.size,
+                    executable=entry.mode == "100755",
+                    sha256=content.sha256 if content is not None else None,
                 )
+            )
         return tuple(operations)
     if state is None:
         raise PlanError("internal planner error: incremental source plan has no state")
-    for change in repository.diff(state.last_commit, head):
-        if not is_source_managed(change.path, config.source):
-            continue
-        if change.status == "D":
-            operations.append(DeleteOperation(change.path, "source"))
-        else:
+    changes = tuple(
+        change
+        for change in repository.diff(state.last_commit, head)
+        if is_source_managed(change.path, config.source)
+    )
+    upload_entries: list[GitEntry] = []
+    for change in changes:
+        if change.status != "D":
             entry = entries.get(change.path)
             if entry is None:
                 raise PlanError(f"changed source is missing from HEAD: {change.path}")
             _require_regular_git_entry(entry)
-            content = repository.blob_manifest(head, change.path)
+            upload_entries.append(entry)
+    manifests = (
+        repository.blob_manifests(tuple(upload_entries))
+        if require_content_identity
+        else {}
+    )
+    for change in changes:
+        if change.status == "D":
+            operations.append(DeleteOperation(change.path, "source"))
+        else:
+            entry = entries.get(change.path)
+            assert entry is not None
+            content = manifests.get(change.path)
             operations.append(
                 UploadOperation(
                     change.path,
                     "source",
                     git_path=change.path,
-                    size=content.size,
+                    size=content.size if content is not None else entry.size,
                     executable=entry.mode == "100755",
-                    sha256=content.sha256,
+                    sha256=content.sha256 if content is not None else None,
                 )
             )
     return tuple(operations)

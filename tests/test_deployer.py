@@ -357,7 +357,33 @@ def test_source_freeze_verifies_planned_sha_and_size_before_connect(
 ) -> None:
     """A corrupted Git export cannot enter the frozen upload set or reach transport."""
 
-    config = load_config(write_config(git_project))
+    aggregation = git_project / "dist"
+    aggregation.mkdir()
+    (aggregation / "index.html").write_text("hybrid", encoding="utf-8")
+    config = load_config(
+        write_config(
+            git_project,
+            """
+project_id = "github.com/acme/project"
+
+[source]
+include = ["**"]
+
+[[outputs]]
+name = "frontend-root"
+local = "dist"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+""",
+        )
+    )
     repository = GitRepository(git_project)
     store = StateStore(repository.git_dir())
     plan = create_plan(config, config.target(None), repository, None, full=False)

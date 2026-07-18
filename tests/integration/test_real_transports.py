@@ -287,6 +287,18 @@ remote_root = "/public_html/ftp-hybrid"
             prepare_remote_plan(missing_profile)
     finally:
         missing_profile.close()
+    internal_alias = remote_root / ".GIT-DEPLOY"
+    internal_alias.mkdir()
+    alias_transport = FTPTransport(target)
+    try:
+        alias_transport.connect()
+        with pytest.raises(PlanError, match="remote root aliases"):
+            probe_ftp_hybrid_capabilities(alias_transport, target, now=99)
+    finally:
+        alias_transport.close()
+    assert internal_alias.is_dir()
+    assert not (remote_root / ".git-deploy").exists()
+    internal_alias.rmdir()
     probe_transport = FTPTransport(target)
     try:
         probe_transport.connect()
@@ -296,6 +308,21 @@ remote_root = "/public_html/ftp-hybrid"
     finally:
         probe_transport.close()
     assert not (remote_root / ".git-deploy/ftp-probe").exists()
+
+    conflicting_file = remote_root / "Index.html"
+    conflicting_file.write_text("unknown alias", encoding="utf-8")
+    aliased = prepare_project(
+        "ftp-hybrid", config_path, None, full=True, skip_build=True
+    )
+    try:
+        with pytest.raises(PlanError, match="remote root aliases"):
+            prepare_remote_plan(aliased)
+    finally:
+        aliased.close()
+    assert conflicting_file.read_text(encoding="utf-8") == "unknown alias"
+    assert not (remote_root / "index.html").exists()
+    assert not (remote_root / ".git-deploy/ftp-hybrid/pending").exists()
+    conflicting_file.unlink()
 
     blocked = prepare_project("ftp-hybrid", config_path, None, full=False, skip_build=True)
     try:
