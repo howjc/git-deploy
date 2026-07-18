@@ -63,7 +63,11 @@ class FTPTransport(Transport):
         self._directory_entries: dict[str, set[str]] = {}
         self._missing_directories: set[str] = set()
         self._typed_entries: dict[str, tuple[FTPRemoteEntry, ...]] = {}
+        self._root_names: tuple[str, ...] | None = None
+        self._root_types: dict[str, RemotePathType | None] = {}
         self._features: frozenset[str] | None = None
+        self._require_utf8 = False
+        self._required_server_banner_hash: str | None = None
 
     def connect(self) -> None:
         """Connect and authenticate with a password from the environment."""
@@ -71,6 +75,8 @@ class FTPTransport(Transport):
         self._directory_entries.clear()
         self._missing_directories.clear()
         self._typed_entries.clear()
+        self._root_names = None
+        self._root_types.clear()
         self._features = None
         if not self.target.password_env:
             raise DeployError("FTP target is missing password_env")
@@ -83,11 +89,14 @@ class FTPTransport(Transport):
             ftp.login(self.target.username or "", password)
             ftp.set_pasv(self.target.passive)
             self.ftp = ftp
+            if self._require_utf8:
+                self._activate_required_utf8()
         except Exception as exc:
             try:
                 ftp.close()
             except Exception:
                 pass
+            self.ftp = None
             raise DeployError(f"FTP connection failed for target {self.target.name}: {exc}") from exc
 
     def ensure_root(self) -> None:
@@ -218,12 +227,34 @@ class FTPTransport(Transport):
         return self._features
 
     def enable_utf8(self) -> None:
-        """Require and activate RFC-style UTF-8 filename handling.
+        """Require UTF-8 for this and every later connection of the transport.
 
         Returns:
-            ``None`` after the server accepts ``OPTS UTF8 ON``.
+            ``None`` after the server advertises and accepts UTF-8.
         """
 
+        self._activate_required_utf8()
+        self._require_utf8 = True
+        if self._required_server_banner_hash is None:
+            self._required_server_banner_hash = self.server_banner_hash()
+
+    def _activate_required_utf8(self) -> None:
+        """Validate server identity and activate UTF-8 on the current session.
+
+        Returns:
+            ``None`` after FEAT and OPTS prove the per-session contract.
+        """
+
+        actual_banner_hash = self.server_banner_hash()
+        if (
+            self._required_server_banner_hash is not None
+            and actual_banner_hash != self._required_server_banner_hash
+        ):
+            raise DeployError(
+                "FTP server banner changed while reconnecting; aborting before remote work"
+            )
+        if "UTF8" not in self.features():
+            raise DeployError("FTP server does not advertise mandatory UTF8 support")
         try:
             response = self._require_ftp().sendcmd("OPTS UTF8 ON")
         except ftplib.Error as exc:
@@ -258,20 +289,33 @@ class FTPTransport(Transport):
         for index, component in enumerate(path.parts):
             if component == ".":
                 continue
-            entries = {
-                item.path: item
-                for item in self.list_directory_typed(
-                    current,
-                    allow_case_collisions=allow_case_collisions,
-                )
-            }
-            entry = entries.get(component)
-            if entry is None:
-                return RemotePathType.MISSING
-            if index < len(path.parts) - 1 and entry.kind is not RemotePathType.DIRECTORY:
+            if current == ".":
+                # Root may contain unrelated types and name collisions owned by
+                # other systems. Planned aliases are gated before managed work.
+                self.list_root_names()
+                if component not in self._root_types:
+                    return RemotePathType.MISSING
+                kind = self._root_types[component]
+                if kind is None:
+                    raise DeployError(
+                        f"FTP MLSD returned an unsupported type for {component!r}"
+                    )
+            else:
+                entries = {
+                    item.path: item
+                    for item in self.list_directory_typed(
+                        current,
+                        allow_case_collisions=allow_case_collisions,
+                    )
+                }
+                entry = entries.get(component)
+                if entry is None:
+                    return RemotePathType.MISSING
+                kind = entry.kind
+            if index < len(path.parts) - 1 and kind is not RemotePathType.DIRECTORY:
                 raise DeployError(f"FTP path parent is not a directory: {remote_path}")
             current = component if current == "." else f"{current}/{component}"
-        return entry.kind
+        return kind
 
     def list_directory_typed(
         self,
@@ -330,6 +374,39 @@ class FTPTransport(Transport):
             _reject_ftp_name_collisions(result, remote_path)
         self._typed_entries[absolute] = result
         return result
+
+    def list_root_names(self) -> tuple[str, ...]:
+        """Return stable root child names without interpreting unrelated types.
+
+        Returns:
+            Sorted exact MLSD names, including types not managed by git-deploy.
+        """
+
+        if self._root_names is not None:
+            return self._root_names
+        try:
+            raw_entries = tuple(self._require_ftp().mlsd(self._absolute(".")))
+        except ftplib.Error as exc:
+            raise DeployError(f"FTP MLSD failed for .: {exc}") from exc
+        names: list[str] = []
+        types: dict[str, RemotePathType | None] = {}
+        for name, raw_facts in raw_entries:
+            facts = {key.casefold(): value for key, value in raw_facts.items()}
+            kind_text = facts.get("type", "").casefold()
+            if kind_text in {"cdir", "pdir"}:
+                continue
+            if not is_stable_remote_component(name):
+                raise DeployError(f"FTP MLSD returned an unsafe name: {name!r}")
+            names.append(name)
+            if kind_text == "file":
+                types[name] = RemotePathType.FILE
+            elif kind_text == "dir":
+                types[name] = RemotePathType.DIRECTORY
+            else:
+                types[name] = None
+        self._root_names = tuple(sorted(names))
+        self._root_types = types
+        return self._root_names
 
     def refresh_remote_metadata(self) -> None:
         """Discard every cached remote listing before a freshness gate.
@@ -505,6 +582,8 @@ class FTPTransport(Transport):
         self._directory_entries.clear()
         self._missing_directories.clear()
         self._typed_entries.clear()
+        self._root_names = None
+        self._root_types.clear()
         self._features = None
         if self.ftp is None:
             return
@@ -639,6 +718,8 @@ class FTPTransport(Transport):
         self._directory_entries.clear()
         self._missing_directories.clear()
         self._typed_entries.clear()
+        self._root_names = None
+        self._root_types.clear()
 
     def _absolute(self, relative: str) -> str:
         """Join a normalized relative path below the configured root."""

@@ -1139,19 +1139,17 @@ def freeze_uploads(
                     f"source upload lacks a Git path: {operation.remote_path}"
                 )
             repository.export_file(plan.head, operation.git_path, destination)
-            actual = hash_file(destination)
-            if (
-                operation.sha256 is None
-                or operation.size is None
-                or actual
-                != ManifestEntry(
-                    operation.sha256,
-                    operation.size,
-                )
-            ):
-                raise PlanError(
-                    f"source content does not match the frozen plan: {operation.git_path}"
-                )
+            if operation.sha256 is not None:
+                if operation.size is None:
+                    raise PlanError(
+                        f"source content identity is incomplete: {operation.git_path}"
+                    )
+                actual = hash_file(destination)
+                if actual != ManifestEntry(operation.sha256, operation.size):
+                    raise PlanError(
+                        "source content does not match the frozen plan: "
+                        f"{operation.git_path}"
+                    )
         else:
             if operation.local_path is None:
                 raise PlanError(
@@ -1204,7 +1202,11 @@ def estimate_frozen_bytes(plan: DeploymentPlan, repository: GitRepository) -> in
         if operation.origin == "source":
             if not operation.git_path:
                 raise PlanError(f"source upload lacks a Git path: {operation.remote_path}")
-            total += repository.blob_size(plan.head, operation.git_path)
+            total += (
+                operation.size
+                if operation.size is not None
+                else repository.blob_size(plan.head, operation.git_path)
+            )
         elif operation.size is not None:
             total += operation.size
         elif operation.local_path is not None:

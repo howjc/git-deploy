@@ -21,6 +21,7 @@ from git_deploy.ftp_hybrid import (
     FTPPendingPhase,
     load_capability_profile,
     read_pending,
+    validate_remote_root_aliases,
 )
 from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
@@ -250,6 +251,7 @@ def _reject_post_commit_ftp_pending(config: Config, target: TargetConfig) -> Non
                 "FTP Hybrid pending preflight requires FTPTransport semantics"
             )
         transport.enable_utf8()
+        validate_remote_root_aliases(transport, (("internal", ".git-deploy"),))
         load_capability_profile(
             target.runtime_dir,
             target,

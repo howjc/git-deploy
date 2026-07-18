@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.5.2/git_deploy-1.5.2-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.5.3/git_deploy-1.5.3-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -146,9 +146,9 @@ git-deploy doctor prod --probe-ftp-hybrid
 git-deploy doctor prod --probe-ftp-hybrid --yes
 ```
 
-Probe 只在 `.git-deploy/ftp-probe/<随机 ID>` 写入并清理本次临时内容，本地 Capability Profile Schema 3 绑定 Target Fingerprint 与 Server Banner。服务器必须广告 UTF8、接受 `OPTS UTF8 ON`，并可靠支持中文名、NFC/NFD 精确名称、大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；缺少任一能力时 Fail Closed，不回退 LIST/NLST 类型猜测或直接覆盖上传。旧 Profile Schema 1/2 必须重新 Probe，不能无证据迁移。
+Probe 在创建 `.git-deploy/ftp-probe/<随机 ID>` 前先以单层 MLSD 拒绝 `.GIT-DEPLOY` 等未知别名；本地 Capability Profile Schema 3 绑定 Target Fingerprint 与 Server Banner。服务器必须广告 UTF8、接受 `OPTS UTF8 ON`，并可靠支持中文名、NFC/NFD 精确名称、大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；一旦启用 UTF-8，同一 Transport 的每次重连都重新核对 Banner、FEAT 并发送 `OPTS UTF8 ON`，任何失败都在业务命令前关闭连接。旧 Profile Schema 1/2 必须重新 Probe，不能无证据迁移。
 
-无 Ownership Manifest 且当前同名路径已存在时，普通部署会拒绝。先人工审阅，再用 `--full` 只接管当前本地存在的同名路径；未知路径不会被 Adoption。Hybrid 固定要求 `remote = "."`、单 Mapping，并禁止显式 `delete_removed`、本地 Local Root 等于项目根目录、本地/远端符号链接和隐式所有权转移。路径组件必须可稳定枚举：拒绝首尾空格、Tab、控制字符和不可见空白；直接 `.git`、`.deploy`、`.git-deploy` 永远拒绝。FTP Hybrid 还会在连接前统一检查 Source、Incremental、Hybrid Direct、历史受管根和内部 `.git-deploy`，拒绝任何 NFC + casefold 根名称冲突。
+无 Ownership Manifest 且当前同名路径已存在时，普通部署会拒绝。先人工审阅，再用 `--full` 只接管当前本地存在的同名路径；未知路径不会被 Adoption。Hybrid 固定要求 `remote = "."`、单 Mapping，并禁止显式 `delete_removed`、本地 Local Root 等于项目根目录、本地/远端符号链接和隐式所有权转移。路径组件必须可稳定枚举：拒绝首尾空格、Tab、控制字符和不可见空白；直接 `.git`、`.deploy`、`.git-deploy` 永远拒绝。FTP Hybrid 会在本地及远端写前统一检查 Source、Incremental、Hybrid Direct、历史受管根和内部 `.git-deploy`。远端仅枚举 Root Direct Entries：精确同名继续既有 Adoption/Ownership 规则，与受管根 NFC + casefold 等价但拼写不同的未知项 Fail Closed，无关未知根保持不读、不改、不删。
 
 FTP In-place Hybrid 还要求单发布器：部署期间不得由 CI、另一台机器、面板或手工 FTP 修改受管路径。FTP Rename Replace 无法保证 Planned-Missing 路径最后一刻不覆盖。受管直接路径的 File→Directory / Directory→File 会被拒绝；先从聚合视图移除旧类型并完成一次删除部署，再添加新类型并用 `--full` 审阅。
 

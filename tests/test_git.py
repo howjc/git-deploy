@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from git_deploy.git import GitRepository
@@ -44,3 +45,28 @@ def test_export_uses_committed_head_not_dirty_worktree(git_project: Path, tmp_pa
 
     assert destination.read_text(encoding="utf-8") == "print('v1')\n"
     assert repository.is_dirty()
+
+
+def test_batch_blob_manifests_stream_large_and_duplicate_content(
+    git_project: Path,
+) -> None:
+    """One batch reader hashes large blobs and reuses duplicate object identities."""
+
+    payload = (b"0123456789abcdef" * (1024 * 320)) + b"tail"
+    (git_project / "large.bin").write_bytes(payload)
+    (git_project / "duplicate.bin").write_bytes(payload)
+    commit_all(git_project, "add large duplicate blobs")
+    repository = GitRepository(git_project)
+    entries = tuple(
+        entry
+        for entry in repository.list_head_entries()
+        if entry.path in {"large.bin", "duplicate.bin"}
+    )
+
+    manifests = repository.blob_manifests(entries)
+
+    expected = hashlib.sha256(payload).hexdigest()
+    assert {entry.oid for entry in entries} == {entries[0].oid}
+    assert manifests["large.bin"].sha256 == expected
+    assert manifests["large.bin"].size == len(payload)
+    assert manifests["duplicate.bin"] == manifests["large.bin"]

@@ -348,12 +348,38 @@ remote_root = "/public_html"
         create_plan(ftp_config, ftp_config.target(None), repository, None, full=False)
 
 
-def test_plan_contract_hash_binds_content_policy_full_and_previous_state(
+def test_ftp_hybrid_plan_contract_binds_content_policy_full_and_previous_state(
     git_project: Path,
 ) -> None:
     """Stable resume identity covers exact bytes and every drift-sensitive policy."""
 
-    config = load_config(write_config(git_project))
+    dist = git_project / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("hybrid", encoding="utf-8")
+    config = load_config(
+        write_config(
+            git_project,
+            """
+project_id = "github.com/acme/project"
+
+[source]
+include = ["**"]
+
+[[outputs]]
+name = "frontend-root"
+local = "dist"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+""",
+        )
+    )
     repository = GitRepository(git_project)
     plan = create_plan(config, config.target(None), repository, None, full=False)
     source = next(item for item in plan.operations if item.remote_path == "app.py")
@@ -369,6 +395,90 @@ def test_plan_contract_hash_binds_content_policy_full_and_previous_state(
         deployment_contract_hash(replace(plan, full=not plan.full), config)
         != plan.non_hybrid_plan_hash
     )
+
+
+def test_non_ftp_hybrid_plans_skip_source_content_contract(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary SFTP planning performs no extra source content hashing."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+
+    def forbidden(entries: object) -> object:
+        """Fail if a non-FTP-Hybrid plan requests batch content identities."""
+
+        del entries
+        raise AssertionError("source content contract must be conditional")
+
+    monkeypatch.setattr(repository, "blob_manifests", forbidden)
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    source = next(item for item in plan.operations if item.remote_path == "app.py")
+
+    assert isinstance(source, UploadOperation)
+    assert source.sha256 is None
+    assert source.size == len(b"print('v1')\n")
+    assert plan.non_hybrid_plan_hash == ""
+
+
+@pytest.mark.parametrize(
+    "protocol,output_mode",
+    (("ftp", "incremental"), ("sftp", "hybrid")),
+)
+def test_source_contract_requires_both_ftp_and_hybrid(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    output_mode: str,
+) -> None:
+    """FTP Incremental and SFTP Hybrid both avoid the resume-only source hash."""
+
+    dist = git_project / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("output", encoding="utf-8")
+    password = 'password_env = "FTP_PASSWORD"' if protocol == "ftp" else ""
+    strict = "strict_host_key_checking = true" if protocol == "sftp" else ""
+    project_id = 'project_id = "github.com/acme/project"' if output_mode == "hybrid" else ""
+    name = 'name = "frontend-root"' if output_mode == "hybrid" else ""
+    remote = "." if output_mode == "hybrid" else "public/dist"
+    config = load_config(
+        write_config(
+            git_project,
+            f"""
+{project_id}
+
+[source]
+include = ["**"]
+
+[[outputs]]
+{name}
+local = "dist"
+remote = "{remote}"
+mode = "{output_mode}"
+
+[targets.dev]
+protocol = "{protocol}"
+host = "example.invalid"
+username = "deploy"
+{password}
+remote_root = "/srv/app"
+{strict}
+""",
+        )
+    )
+    repository = GitRepository(git_project)
+
+    def forbidden(entries: object) -> object:
+        """Fail if either half of the required protocol/mode pair is absent."""
+
+        del entries
+        raise AssertionError("source content contract must require FTP Hybrid")
+
+    monkeypatch.setattr(repository, "blob_manifests", forbidden)
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+
+    assert plan.non_hybrid_plan_hash == ""
 
 
 def test_ftp_hybrid_rejects_cross_owner_casefold_root_before_connection(

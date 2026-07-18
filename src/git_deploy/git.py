@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,10 +23,12 @@ class GitChange:
 
 @dataclass(frozen=True, slots=True)
 class GitEntry:
-    """Represent one committed tree entry and its Git mode."""
+    """Represent one committed tree entry with mode, object ID, and blob size."""
 
     path: str
     mode: str
+    oid: str = ""
+    size: int | None = None
 
 
 class GitRepository:
@@ -136,18 +139,23 @@ class GitRepository:
             Deterministically sorted file-like Git entries.
         """
 
-        raw = self._run("ls-tree", "-r", "-z", commit)
+        raw = self._run("ls-tree", "-r", "-l", "-z", commit)
         entries: list[GitEntry] = []
         for record in raw.split(b"\0"):
             if not record:
                 continue
             try:
                 metadata, path_raw = record.split(b"\t", 1)
-                mode = metadata.split(b" ", 1)[0].decode("ascii")
+                mode_raw, object_type, oid_raw, size_raw = metadata.split()
+                mode = mode_raw.decode("ascii")
+                oid = oid_raw.decode("ascii")
+                size = int(size_raw) if object_type == b"blob" else None
                 path = os.fsdecode(path_raw)
             except (ValueError, UnicodeDecodeError) as exc:
                 raise PlanError("Git returned an invalid tree record") from exc
-            entries.append(GitEntry(path, mode))
+            if size is not None and size < 0:
+                raise PlanError("Git returned an invalid tree record")
+            entries.append(GitEntry(path, mode, oid, size))
         return tuple(sorted(entries, key=lambda item: item.path))
 
     def diff(self, old_commit: str, new_commit: str) -> tuple[GitChange, ...]:
@@ -240,8 +248,97 @@ class GitRepository:
             Content identity used by the stable non-Hybrid plan contract.
         """
 
-        data = self._run("cat-file", "blob", f"{commit}:{path}")
-        return ManifestEntry(hashlib.sha256(data).hexdigest(), len(data))
+        oid = self._run("rev-parse", "--verify", f"{commit}:{path}").decode().strip()
+        return self.blob_manifests((GitEntry(path, "100644", oid),))[path]
+
+    def blob_manifests(
+        self,
+        entries: tuple[GitEntry, ...],
+    ) -> dict[str, ManifestEntry]:
+        """Stream SHA256 and size for many blobs through one Git batch process.
+
+        Args:
+            entries: File-like tree entries with full, safe object IDs.
+
+        Returns:
+            Manifest identity keyed by each requested Git path.
+        """
+
+        if not entries:
+            return {}
+        oid_paths: dict[str, list[str]] = {}
+        oid_sizes: dict[str, set[int]] = {}
+        for entry in entries:
+            if not entry.oid or any(
+                character not in "0123456789abcdef" for character in entry.oid
+            ):
+                raise PlanError(f"Git entry lacks a valid blob object ID: {entry.path!r}")
+            oid_paths.setdefault(entry.oid, []).append(entry.path)
+            if entry.size is not None:
+                oid_sizes.setdefault(entry.oid, set()).add(entry.size)
+        oid_manifests: dict[str, ManifestEntry] = {}
+        with tempfile.TemporaryFile() as requests, tempfile.TemporaryFile() as errors:
+            for oid in oid_paths:
+                requests.write(f"{oid}\n".encode("ascii"))
+            requests.seek(0)
+            try:
+                process = subprocess.Popen(
+                    ["git", "cat-file", "--batch"],
+                    cwd=self.root,
+                    stdin=requests,
+                    stdout=subprocess.PIPE,
+                    stderr=errors,
+                )
+            except OSError as exc:
+                raise PlanError(f"cannot execute Git: {exc}") from exc
+            assert process.stdout is not None
+            try:
+                for requested_oid in oid_paths:
+                    header = process.stdout.readline()
+                    parts = header.rstrip(b"\n").split(b" ")
+                    if len(parts) != 3 or parts[1] != b"blob":
+                        raise PlanError(
+                            f"Git batch returned an invalid blob header for {requested_oid}"
+                        )
+                    try:
+                        actual_oid = parts[0].decode("ascii")
+                        size = int(parts[2])
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise PlanError("Git batch returned an invalid blob header") from exc
+                    if actual_oid != requested_oid or size < 0:
+                        raise PlanError(
+                            f"Git batch returned the wrong blob for {requested_oid}"
+                        )
+                    expected_sizes = oid_sizes.get(requested_oid, set())
+                    if expected_sizes and expected_sizes != {size}:
+                        raise PlanError(
+                            f"Git batch size changed for blob {requested_oid}"
+                        )
+                    digest = hashlib.sha256()
+                    remaining = size
+                    while remaining:
+                        block = process.stdout.read(min(1024 * 1024, remaining))
+                        if not block:
+                            raise PlanError("Git batch returned a truncated blob")
+                        digest.update(block)
+                        remaining -= len(block)
+                    if process.stdout.read(1) != b"\n":
+                        raise PlanError("Git batch returned a malformed blob delimiter")
+                    oid_manifests[requested_oid] = ManifestEntry(digest.hexdigest(), size)
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            returncode = process.wait()
+            if returncode != 0:
+                errors.seek(0)
+                detail = errors.read().decode(errors="replace").strip()
+                raise PlanError(f"Git cat-file --batch failed: {detail}")
+        return {
+            path: oid_manifests[oid]
+            for oid, paths in oid_paths.items()
+            for path in paths
+        }
 
     def _run(self, *arguments: str) -> bytes:
         """Run Git with byte-safe output and convert failures to plan errors."""

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import ftplib
 import errno
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
 import subprocess
 
 from git_deploy.config import TargetConfig
+from git_deploy.deployer import _execute_with_retry, _retry_ftp_mutation
 from git_deploy.errors import DeployError
+from git_deploy.planner import DeleteOperation, UploadOperation
+from git_deploy.progress import ProgressReporter
 from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.base import RemotePathType
 from git_deploy.transports.sftp import SFTPTransport, _resolve_ssh_settings
@@ -271,6 +275,254 @@ def ftp_target() -> TargetConfig:
         21,
         password_env="PASSWORD",
     )
+
+
+class ConnectableFTPSession:
+    """Record login, UTF-8 negotiation, and cleanup across reconnects."""
+
+    def __init__(self, *, banner: str = "220 stable", opts_error: bool = False) -> None:
+        """Configure server identity and optional OPTS rejection."""
+
+        self.banner = banner
+        self.opts_error = opts_error
+        self.commands: list[str] = []
+        self.passive: bool | None = None
+        self.encoding = "latin-1"
+        self.closed = False
+
+    def connect(self, host: str, port: int, *, timeout: float) -> None:
+        """Accept the configured endpoint without opening a socket."""
+
+        del host, port, timeout
+
+    def login(self, username: str, password: str) -> None:
+        """Accept synthetic credentials."""
+
+        del username, password
+
+    def set_pasv(self, passive: bool) -> None:
+        """Record active/passive mode selection."""
+
+        self.passive = passive
+
+    def getwelcome(self) -> str:
+        """Return the configured reconnect identity."""
+
+        return self.banner
+
+    def sendcmd(self, command: str) -> str:
+        """Advertise UTF-8 and optionally reject its per-session activation."""
+
+        self.commands.append(command)
+        if command == "FEAT":
+            return "211-Features\n UTF8\n MLSD\n211 End"
+        if self.opts_error:
+            raise ftplib.error_perm("500 OPTS rejected")
+        return "200 UTF8 enabled"
+
+    def quit(self) -> None:
+        """Record normal session cleanup."""
+
+        self.closed = True
+
+    def close(self) -> None:
+        """Record forced session cleanup."""
+
+        self.closed = True
+
+
+class RetryingUnicodeFTPTransport(FTPTransport):
+    """Fail one Unicode business operation, then require a UTF-8 reconnect."""
+
+    def __init__(self, target: TargetConfig) -> None:
+        """Initialize per-operation failure and success counters."""
+
+        super().__init__(target)
+        self.upload_attempts = 0
+        self.delete_attempts = 0
+
+    def ensure_root(self) -> None:
+        """Accept the synthetic root during the retry reconnect helper."""
+
+    def upload(
+        self,
+        local_path: Path,
+        remote_path: str,
+        callback,  # noqa: ANN001
+        *,
+        executable: bool = False,
+    ) -> None:
+        """Fail once and then accept a Unicode upload only under UTF-8."""
+
+        del executable
+        assert "部署" in remote_path
+        assert self._require_ftp().encoding == "utf-8"
+        self.upload_attempts += 1
+        if self.upload_attempts == 1:
+            raise OSError("transient upload failure")
+        size = local_path.stat().st_size
+        callback(size, size)
+
+    def delete(self, remote_path: str) -> None:
+        """Fail once and then accept a Unicode delete only under UTF-8."""
+
+        assert "部署" in remote_path
+        assert self._require_ftp().encoding == "utf-8"
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise OSError("transient delete failure")
+
+
+@pytest.mark.parametrize("passive", (True, False))
+def test_ftp_utf8_requirement_is_restored_on_every_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    passive: bool,
+) -> None:
+    """Sticky UTF-8 sends FEAT and OPTS on new passive and active sessions."""
+
+    sessions = [ConnectableFTPSession(), ConnectableFTPSession()]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = FTPTransport(replace(ftp_target(), passive=passive))
+
+    transport.connect()
+    first = transport.ftp
+    assert isinstance(first, ConnectableFTPSession)
+    transport.enable_utf8()
+    transport.close()
+    transport.connect()
+    second = transport.ftp
+
+    assert isinstance(second, ConnectableFTPSession)
+    assert first.commands == ["FEAT", "OPTS UTF8 ON"]
+    assert second.commands == ["FEAT", "OPTS UTF8 ON"]
+    assert second.encoding == "utf-8"
+    assert second.passive is passive
+
+
+def test_ftp_reconnect_opts_failure_stops_before_business_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect that cannot restore UTF-8 fails closed during connect."""
+
+    first = ConnectableFTPSession()
+    second = ConnectableFTPSession(opts_error=True)
+    sessions = [first, second]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+    transport.enable_utf8()
+    transport.close()
+
+    with pytest.raises(DeployError, match="OPTS UTF8 ON failed"):
+        transport.connect()
+
+    assert second.commands == ["FEAT", "OPTS UTF8 ON"]
+    assert second.closed
+    assert transport.ftp is None
+
+
+def test_ftp_reconnect_banner_drift_fails_before_utf8_or_business_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed banner prevents negotiation and all later remote operations."""
+
+    first = ConnectableFTPSession()
+    second = ConnectableFTPSession(banner="220 changed")
+    sessions = [first, second]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+    transport.enable_utf8()
+    transport.close()
+
+    with pytest.raises(DeployError, match="banner changed"):
+        transport.connect()
+
+    assert second.commands == []
+    assert second.closed
+
+
+@pytest.mark.parametrize("kind", ("source-upload", "output-upload", "delete"))
+def test_unicode_business_retry_restores_utf8_before_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """Unicode source upload and delete retries run only after fresh OPTS."""
+
+    first = ConnectableFTPSession()
+    second = ConnectableFTPSession()
+    sessions = [first, second]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = RetryingUnicodeFTPTransport(ftp_target())
+    transport.connect()
+    transport.enable_utf8()
+    path = "部署/文件.txt"
+    frozen: dict[str, Path] = {}
+    if kind.endswith("upload"):
+        local = tmp_path / "payload"
+        local.write_bytes(b"payload")
+        frozen[path] = local
+        origin = "source" if kind == "source-upload" else "output"
+        operation = UploadOperation(path, origin, local_path=local)
+    else:
+        operation = DeleteOperation(path, "source")
+
+    _execute_with_retry(
+        operation,
+        frozen,
+        transport,
+        ProgressReporter(False),
+        attempts=2,
+        delay=0,
+    )
+
+    assert second.commands == ["FEAT", "OPTS UTF8 ON"]
+    assert (
+        transport.upload_attempts if kind.endswith("upload") else transport.delete_attempts
+    ) == 2
+
+
+@pytest.mark.parametrize("label", ("Hybrid Stage", "Hybrid Publish", "Unicode RMD"))
+def test_ftp_hybrid_mutation_retry_restores_utf8_before_action(
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
+    """Stage, Publish, and RMD retry paths inherit the sticky UTF-8 session."""
+
+    first = ConnectableFTPSession()
+    second = ConnectableFTPSession()
+    sessions = [first, second]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = RetryingUnicodeFTPTransport(ftp_target())
+    transport.connect()
+    transport.enable_utf8()
+    attempts = 0
+
+    def action() -> None:
+        """Fail once and prove each attempt observes an activated UTF-8 session."""
+
+        nonlocal attempts
+        assert transport._require_ftp().encoding == "utf-8"
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient Hybrid mutation failure")
+
+    _retry_ftp_mutation(
+        label,
+        action,
+        transport,
+        attempts=2,
+        delay=0,
+    )
+
+    assert attempts == 2
+    assert second.commands == ["FEAT", "OPTS UTF8 ON"]
 
 
 def test_sftp_fallback_preserves_target_before_publish() -> None:

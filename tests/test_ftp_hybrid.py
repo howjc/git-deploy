@@ -29,6 +29,7 @@ from git_deploy.ftp_hybrid import (
     serialize_capabilities,
     serialize_pending,
     validate_pending_resume,
+    validate_remote_root_aliases,
 )
 from git_deploy.hybrid import scan_hybrid_output
 from git_deploy.manifest import ManifestEntry, TargetState
@@ -172,6 +173,75 @@ def test_capability_probe_requires_advertised_utf8() -> None:
 
     with pytest.raises(DeployError, match="mandatory UTF8"):
         probe_ftp_hybrid_capabilities(cast(Any, MissingUTF8Transport()), _target())
+
+
+@pytest.mark.parametrize(
+    "existing,planned",
+    (
+        ("Assets", "assets"),
+        ("Index.html", "index.html"),
+        ("cafe\u0301", "caf\u00e9"),
+        (".GIT-DEPLOY", ".git-deploy"),
+    ),
+)
+def test_remote_root_alias_gate_rejects_unknown_equivalent_spellings(
+    existing: str,
+    planned: str,
+) -> None:
+    """Case and normalization aliases fail before a managed root is touched."""
+
+    transport = FTPTransport(_target())
+    session = FakeMLSDSession()
+    session.listings["/root"] = [(existing, {"type": "dir"})]
+    transport.ftp = cast(Any, session)
+
+    with pytest.raises(PlanError, match="remote root aliases"):
+        validate_remote_root_aliases(transport, (("planned", planned),))
+
+
+def test_remote_root_alias_gate_allows_exact_and_unrelated_unknown_names() -> None:
+    """Exact adoption candidates pass while unrelated unknown aliases stay untouched."""
+
+    transport = FTPTransport(_target())
+    session = FakeMLSDSession()
+    session.listings["/root"] = [
+        ("assets", {"type": "dir"}),
+        ("Other", {"type": "OS.unix=symlink"}),
+        ("other", {"type": "dir"}),
+    ]
+    transport.ftp = cast(Any, session)
+
+    validate_remote_root_aliases(transport, (("hybrid", "assets"),))
+    assert transport.lstat("assets") is RemotePathType.DIRECTORY
+
+
+def test_capability_probe_alias_gate_is_zero_mutation() -> None:
+    """An internal-root alias aborts before the first probe directory mutation."""
+
+    class AliasedInternalTransport:
+        """Expose only a conflicting internal root and forbid every mutation."""
+
+        def features(self) -> frozenset[str]:
+            """Advertise mandatory features so aliasing is decisive."""
+
+            return frozenset({"MLSD", "UTF8"})
+
+        def enable_utf8(self) -> None:
+            """Accept session UTF-8 activation."""
+
+        def list_root_names(self) -> tuple[str, ...]:
+            """Return the conflicting unknown root without recursion."""
+
+            return (".GIT-DEPLOY",)
+
+        def make_directory(self, path: str, *, mode: int = 0o755) -> None:
+            """Fail if the gate permits any probe mutation."""
+
+            del path, mode
+            raise AssertionError("probe mutated before alias rejection")
+
+    with pytest.raises(PlanError, match="remote root aliases"):
+        probe_ftp_hybrid_capabilities(cast(Any, AliasedInternalTransport()), _target())
 
 
 def test_local_hybrid_rejects_root_and_nested_casefold_collisions(
@@ -553,6 +623,11 @@ def test_case_insensitive_capability_probe_fails_closed() -> None:
 
         def enable_utf8(self) -> None:
             """Accept UTF-8 so case aliasing remains the decisive failure."""
+
+        def list_root_names(self) -> tuple[str, ...]:
+            """Report no pre-existing root entries before the probe mutates."""
+
+            return ()
 
         def make_directory(self, path: str, *, mode: int = 0o755) -> None:
             """Record one directory using case-insensitive identity."""
