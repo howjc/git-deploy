@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from git_deploy.config import OutputConfig
+from git_deploy.config import OutputConfig, TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.manifest import ManifestEntry, ScannedOutput, hash_file
 from git_deploy.transports.base import (
@@ -23,6 +23,30 @@ from git_deploy.transports.base import (
 OWNERSHIP_SCHEMA = 1
 RECOVERY_SCHEMA = 2
 MAX_REMOTE_RECORD_BYTES = 64 * 1024
+
+
+class HybridBackend(str, Enum):
+    """Select the protocol-specific Hybrid safety and execution contract."""
+
+    SFTP_STAGED = "sftp-staged"
+    FTP_IN_PLACE = "ftp-in-place"
+
+
+def resolve_hybrid_backend(target: TargetConfig) -> HybridBackend:
+    """Resolve one target protocol to its explicit Hybrid backend.
+
+    Args:
+        target: Validated deployment target.
+
+    Returns:
+        Backend whose guarantees must be used by planning and execution.
+    """
+
+    if target.protocol == "sftp":
+        return HybridBackend.SFTP_STAGED
+    if target.protocol == "ftp":
+        return HybridBackend.FTP_IN_PLACE
+    raise PlanError(f"unsupported protocol for Hybrid output: {target.protocol!r}")
 
 
 @dataclass(frozen=True, slots=True)

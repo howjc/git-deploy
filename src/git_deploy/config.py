@@ -392,8 +392,6 @@ def load_config(path: Path) -> Config:
         raise ConfigError(f"default_target {default_target!r} is not present in [targets]")
     hybrid = next((output for output in outputs if output.mode == "hybrid"), None)
     project_id = _resolve_project_id(raw.get("project_id"), root, required=hybrid is not None)
-    if hybrid is not None and any(target.protocol != "sftp" for target in targets.values()):
-        raise ConfigError("hybrid outputs are SFTP-only; remove FTP targets from this configuration")
     return Config(path, root, project_id, default_target, source, build, outputs, targets, deploy)
 
 

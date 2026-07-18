@@ -1,6 +1,6 @@
 # ADR：单 Hybrid Output 与远端所有权
 
-状态：Accepted；v1.4.3 Native OpenSSH No-overwrite 收口
+状态：Accepted for SFTP；FTP 限制由 v1.5.0 [FTP Hybrid ADR](adr-ftp-hybrid.md) 扩展
 
 日期：2026-07-17
 
@@ -18,7 +18,7 @@ v1.4.0 只增加一个受控模型：项目 Build 先把明确来源聚合到一
 - 无 Manifest 时，已存在的同名路径必须通过显式 `--full` Adoption；只接管当前本地存在的同名路径。
 - Local State 记录最后完整成功的部署和 Root File Hash；Remote Ownership 记录可删除的远端直接子项。两者职责不可互换。
 - 同一配置最多一个 Hybrid；Workspace 继续拒绝同一物理 Endpoint 上相同或嵌套的 Remote Root。
-- Hybrid 仅支持 SFTP。FTP 缺少本版本所需的可靠递归 Stage/Swap 与路径类型契约。
+- v1.4.x Hybrid 仅支持 SFTP；v1.5.0 通过独立 FTP In-place backend、MLSD Capability Profile 与 Forward Resume 扩展 FTP，不把 FTP 伪装为目录 Stage/Swap。
 
 ## 为何不做 Root Mirror / Full Root Reconcile
 
@@ -48,4 +48,4 @@ SFTP 没有标准目录交换操作，Rename 之间存在短暂切换窗口；�
 
 ## 明确不做
 
-Root Mirror、完整远端扫描、多 Hybrid 同根协调、Hybrid 所有权自动转移、FTP Hybrid、自动回滚、Workspace 全局 Hook、发布事务和通用远端运维框架均不属于 v1.4.0。
+Root Mirror、完整远端扫描、多 Hybrid 同根协调、Hybrid 所有权自动转移、自动回滚、Workspace 全局 Hook、发布事务和通用远端运维框架均不属于 v1.4.0。FTP Hybrid 后续由 v1.5.0 的独立 ADR 定义，不改变本 ADR 的 SFTP 契约。

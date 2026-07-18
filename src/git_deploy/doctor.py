@@ -6,6 +6,13 @@ import shlex
 import shutil
 from dataclasses import dataclass
 from git_deploy.config import Config, TargetConfig, resolve_target_for_plan
+from git_deploy.ftp_hybrid import (
+    load_capability_profile,
+    probe_ftp_hybrid_capabilities,
+    read_pending,
+    save_capability_profile,
+    scan_ftp_tree,
+)
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
     HybridLocalManifest,
@@ -18,6 +25,7 @@ from git_deploy.manifest import StateStore
 from git_deploy.transports import create_transport
 from git_deploy.transports.base import RemotePathType, Transport
 from git_deploy.transports.openssh_sftp import OpenSSHSFTPTransport
+from git_deploy.transports.ftp import FTPTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +44,7 @@ def run_doctor(
     state_store: StateStore,
     *,
     create_root: bool = False,
+    probe_ftp_hybrid: bool = False,
     transport_factory=create_transport,  # noqa: ANN001
     pre_resolved_target: TargetConfig | None = None,
     resolution_error: str | None = None,
@@ -48,6 +57,8 @@ def run_doctor(
         target: Selected deployment target.
         repository: Git worktree reader.
         state_store: Lightweight target-state reader.
+        create_root: Whether Doctor may create a missing configured root.
+        probe_ftp_hybrid: Whether the user explicitly confirmed a mutating FTP probe.
         transport_factory: Injectable adapter factory for tests.
         pre_resolved_target: Workspace-frozen target resolved before any connection.
         resolution_error: Preflight failure that must short-circuit remote checks.
@@ -189,20 +200,161 @@ def run_doctor(
             )
         )
         if exists and hybrid_output is not None and config.project_id is not None:
-            _append_hybrid_remote_results(
-                results,
-                transport,
-                resolved_target,
-                config.project_id,
-                hybrid_output.name or "<missing>",
-                local_hybrid,
-            )
+            if resolved_target.protocol == "ftp":
+                if not isinstance(transport, FTPTransport):
+                    raise TypeError("FTP Hybrid Doctor requires FTPTransport semantics")
+                if probe_ftp_hybrid:
+                    profile = probe_ftp_hybrid_capabilities(transport, resolved_target)
+                    profile_path = save_capability_profile(state_store.base, profile)
+                    results.append(
+                        DoctorResult(
+                            "FTP Hybrid Capability Probe",
+                            True,
+                            f"supported; profile saved: {profile_path}",
+                        )
+                    )
+                profile = load_capability_profile(
+                    state_store.base,
+                    resolved_target,
+                    server_banner_hash=transport.server_banner_hash(),
+                )
+                results.append(
+                    DoctorResult(
+                        "FTP Hybrid Capability Profile",
+                        True,
+                        f"valid; probed_at={profile.probed_at}",
+                    )
+                )
+                results.append(
+                    DoctorResult(
+                        "FTP Server Features",
+                        profile.mlsd,
+                        "MLSD, RETR, cross-directory rename, rename replace, DELE, RMD",
+                    )
+                )
+                _append_ftp_hybrid_remote_results(
+                    results,
+                    transport,
+                    resolved_target,
+                    config.project_id,
+                    hybrid_output.name or "<missing>",
+                    local_hybrid,
+                )
+            else:
+                _append_hybrid_remote_results(
+                    results,
+                    transport,
+                    resolved_target,
+                    config.project_id,
+                    hybrid_output.name or "<missing>",
+                    local_hybrid,
+                )
     except Exception as exc:
         results.append(DoctorResult("target", False, str(exc)))
     finally:
         if "transport" in locals():
             transport.close()
     return tuple(results)
+
+
+def _append_ftp_hybrid_remote_results(
+    results: list[DoctorResult],
+    transport: FTPTransport,
+    target: TargetConfig,
+    project_id: str,
+    mapping: str,
+    local_hybrid: HybridLocalManifest | None,
+) -> None:
+    """Append read-only FTP Ownership, Pending, types, and scan-boundary checks."""
+
+    try:
+        internal_type = transport.lstat(".git-deploy")
+        internal_ok = internal_type in {RemotePathType.MISSING, RemotePathType.DIRECTORY}
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Remote Internal Paths",
+                internal_ok,
+                internal_type.value,
+            )
+        )
+        if not internal_ok:
+            return
+        ownership = read_ownership(
+            transport,
+            project_id=project_id,
+            mapping=mapping,
+            remote=".",
+        )
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Ownership",
+                True,
+                "first deployment" if ownership is None else ownership.last_commit,
+            )
+        )
+        pending = read_pending(
+            transport,
+            project_id=project_id,
+            mapping=mapping,
+            remote=".",
+            target=target,
+        )
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Pending Resume",
+                pending is None,
+                "none" if pending is None else f"pending: {pending.phase.value}",
+            )
+        )
+        if local_hybrid is None:
+            return
+        old_files = set(ownership.root_files if ownership else ())
+        old_directories = set(ownership.directories if ownership else ())
+        current_files = set(local_hybrid.root_file_names)
+        current_directories = set(local_hybrid.directory_names)
+        unsafe: list[str] = []
+        adoption: list[str] = []
+        for name in sorted(old_files | old_directories | current_files | current_directories):
+            kind = transport.lstat(name)
+            if name in current_files and kind not in {RemotePathType.MISSING, RemotePathType.FILE}:
+                unsafe.append(f"{name} ({kind.value}, expected file)")
+            if name in current_directories and kind not in {
+                RemotePathType.MISSING,
+                RemotePathType.DIRECTORY,
+            }:
+                unsafe.append(f"{name} ({kind.value}, expected directory)")
+            if name in (current_files | current_directories) - (old_files | old_directories):
+                if kind is not RemotePathType.MISSING:
+                    adoption.append(name)
+        scan_entries = 0
+        for name in sorted(current_directories | old_directories):
+            if transport.lstat(name) is RemotePathType.DIRECTORY:
+                tree = scan_ftp_tree(transport, name)
+                scan_entries += len(tree.files) + len(tree.directories)
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Remote Types",
+                not unsafe,
+                "safe" if not unsafe else ", ".join(unsafe),
+            )
+        )
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Adoption",
+                not adoption,
+                "not required" if not adoption else "--full required: " + ", ".join(adoption),
+            )
+        )
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Remote Scan Boundary",
+                True,
+                f"{len(current_directories | old_directories)} managed root(s), "
+                f"{scan_entries} descendant(s)",
+            )
+        )
+    except Exception as exc:
+        results.append(DoctorResult("FTP Hybrid Remote", False, str(exc)))
 
 
 def _append_hybrid_remote_results(

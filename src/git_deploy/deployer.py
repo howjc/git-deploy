@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import sys
 import tempfile
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 from git_deploy.config import Config, TargetConfig
 from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
+from git_deploy.ftp_hybrid import (
+    FTP_HYBRID_SCHEMA,
+    FTPHybridPending,
+    FTPPendingPhase,
+    local_manifest_hash,
+    pending_path,
+    publish_verified_bytes,
+    serialize_pending,
+)
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
+    MAX_REMOTE_RECORD_BYTES,
     RECOVERY_SCHEMA,
+    HybridBackend,
     HybridRecoveryRecord,
     RecoveryPhase,
     cleanup_committed_recovery,
@@ -30,6 +43,7 @@ from git_deploy.hybrid import (
 from git_deploy.manifest import ManifestEntry, StateStore, hash_file, new_state
 from git_deploy.planner import (
     DeploymentPlan,
+    FTPHybridFileUpload,
     HybridDirectoryDelete,
     HybridDirectoryMirror,
     HybridOwnershipUpdate,
@@ -45,6 +59,7 @@ from git_deploy.planner import (
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
 from git_deploy.transports.base import RemotePathType, Transport
+from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
 
 TransportFactory = Callable[[TargetConfig], Transport]
@@ -209,6 +224,18 @@ def _execute_hybrid_plan(
     hybrid = plan.hybrid
     if hybrid is None or not hybrid.remote_complete or config.project_id is None:
         raise PlanError("hybrid deployment requires a complete remote ownership plan")
+    if hybrid.backend is HybridBackend.FTP_IN_PLACE:
+        if not isinstance(transport, FTPTransport):
+            raise PlanError("FTP Hybrid execution requires FTPTransport semantics")
+        _execute_ftp_hybrid_plan(
+            plan,
+            config,
+            state_store,
+            frozen,
+            transport,
+            progress,
+        )
+        return
     validate_remote_freshness(plan, config, transport)
     if hybrid.recovery_records:
         raise PlanError(
@@ -433,6 +460,328 @@ def _execute_hybrid_plan(
             file=sys.stderr,
             flush=True,
         )
+
+
+def _execute_ftp_hybrid_plan(
+    plan: DeploymentPlan,
+    config: Config,
+    state_store: StateStore,
+    frozen: dict[str, Path],
+    transport: FTPTransport,
+    progress: ProgressReporter,
+) -> None:
+    """Execute one FTP in-place plan with monotonic remote Pending phases.
+
+    Args:
+        plan: Remote-complete FTP Hybrid plan approved by the user.
+        config: Retry policy and stable project identity.
+        state_store: Local State committed only after Remote Ownership.
+        frozen: Immutable bytes captured before any remote connection.
+        transport: Connected FTP adapter with a valid Capability Profile.
+        progress: Shared upload progress reporter.
+
+    Returns:
+        ``None`` after State commit and best-effort internal cleanup.
+    """
+
+    hybrid = plan.hybrid
+    if hybrid is None or hybrid.ftp is None or config.project_id is None:
+        raise PlanError("FTP Hybrid execution requires a remote-complete FTP plan")
+    ftp_plan = hybrid.ftp
+    validate_remote_freshness(plan, config, transport)
+    transport.ensure_root()
+    if not plan.has_remote_work:
+        state_store.save(
+            new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
+        )
+        print("No file changes; deployment state advanced to HEAD.")
+        return
+
+    pending = ftp_plan.pending
+    if pending is None:
+        next_state = new_state(
+            plan.target.name,
+            plan.target_fingerprint,
+            plan.head,
+            plan.output_manifest,
+        )
+        deployment_id = uuid.uuid4().hex
+        pending = FTPHybridPending(
+            FTP_HYBRID_SCHEMA,
+            config.project_id,
+            hybrid.local.mapping,
+            hybrid.local.remote,
+            plan.target_fingerprint,
+            deployment_id,
+            FTPPendingPhase.PREPARED,
+            hybrid.expected_ownership_hash or ownership_hash(hybrid.ownership),
+            ownership_hash(ftp_plan.next_ownership),
+            local_manifest_hash(hybrid.local, plan.output_manifest),
+            plan.head,
+            next_state,
+            ftp_plan.next_ownership.updated_at,
+        )
+        _ensure_ftp_internal_directories(transport, deployment_id)
+        _write_ftp_pending(transport, pending)
+    else:
+        _ensure_ftp_internal_directories(transport, pending.deployment_id)
+
+    stage_root = f".git-deploy/ftp-hybrid/stage/{pending.deployment_id}"
+    phase = pending.phase
+    if phase in {FTPPendingPhase.PREPARED, FTPPendingPhase.FILES_PUBLISHED}:
+        for operation in plan.operations:
+            _execute_with_retry(
+                operation,
+                frozen,
+                transport,
+                progress,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+        for upload in ftp_plan.uploads:
+            _stage_ftp_hybrid_file(
+                upload,
+                frozen[upload.path],
+                stage_root,
+                transport,
+                progress,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+        reviewed = replace(
+            plan,
+            hybrid=replace(hybrid, ftp=replace(ftp_plan, pending=pending)),
+        )
+        validate_remote_freshness(reviewed, config, transport)
+        for directory in ftp_plan.create_directories:
+            transport.make_directory(directory)
+        for upload in ftp_plan.uploads:
+            _publish_ftp_hybrid_file(
+                upload,
+                frozen[upload.path],
+                stage_root,
+                transport,
+                progress,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+        pending = pending.with_phase(FTPPendingPhase.FILES_PUBLISHED)
+        _write_ftp_pending(transport, pending)
+        phase = pending.phase
+
+    if phase is FTPPendingPhase.FILES_PUBLISHED:
+        for path in ftp_plan.delete_files:
+            _retry_ftp_mutation(
+                path,
+                lambda path=path: transport.delete_typed(path),
+                transport,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+            print(f"DELETE {path}")
+        for path in ftp_plan.remove_directories:
+            _retry_ftp_mutation(
+                path,
+                lambda path=path: transport.remove_directory(path),
+                transport,
+                attempts=config.deploy.retries,
+                delay=config.deploy.retry_delay,
+            )
+            print(f"RMD {path}/")
+        pending = pending.with_phase(FTPPendingPhase.PRUNED)
+        _write_ftp_pending(transport, pending)
+        phase = pending.phase
+
+    if phase is FTPPendingPhase.PRUNED:
+        ownership_data = serialize_ownership(ftp_plan.next_ownership)
+        current_hash = _ftp_remote_record_hash(
+            transport,
+            ownership_path(hybrid.local.mapping),
+            max_bytes=MAX_REMOTE_RECORD_BYTES,
+        )
+        expected_hash = ownership_hash(ftp_plan.next_ownership)
+        if current_hash != expected_hash:
+            publish_verified_bytes(
+                transport,
+                stage_path=f"{stage_root}/.ownership.json",
+                final_path=ownership_path(hybrid.local.mapping),
+                data=ownership_data,
+            )
+        pending = pending.with_phase(FTPPendingPhase.OWNERSHIP_COMMITTED)
+        _write_ftp_pending(transport, pending)
+        phase = pending.phase
+
+    if phase is FTPPendingPhase.OWNERSHIP_COMMITTED:
+        # The marker's frozen State is authoritative after Ownership commit;
+        # current HEAD/build may only be used after this resume has completed.
+        state_store.save(pending.next_state)
+        pending = pending.with_phase(FTPPendingPhase.STATE_COMPLETE)
+        _write_ftp_pending(transport, pending)
+        phase = pending.phase
+
+    if phase is FTPPendingPhase.STATE_COMPLETE:
+        try:
+            transport.remove_tree(stage_root)
+            transport.remove_directory(".git-deploy/ftp-hybrid/stage")
+            transport.delete_typed(pending_path(hybrid.local.mapping))
+        except Exception as exc:
+            print(
+                "WARNING: FTP Hybrid cleanup is pending; run Doctor and rerun the "
+                f"deployment: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _ensure_ftp_internal_directories(
+    transport: FTPTransport,
+    deployment_id: str,
+) -> None:
+    """Create only protected FTP Hybrid metadata and Stage directories."""
+
+    for path in (
+        ".git-deploy",
+        ".git-deploy/hybrid",
+        ".git-deploy/ftp-hybrid",
+        ".git-deploy/ftp-hybrid/stage",
+        f".git-deploy/ftp-hybrid/stage/{deployment_id}",
+        ".git-deploy/ftp-hybrid/pending",
+    ):
+        transport.make_directory(path, mode=0o700)
+
+
+def _write_ftp_pending(transport: FTPTransport, pending: FTPHybridPending) -> None:
+    """Publish and re-read one Pending phase through its deployment Stage."""
+
+    publish_verified_bytes(
+        transport,
+        stage_path=(
+            f".git-deploy/ftp-hybrid/stage/{pending.deployment_id}/.pending.json"
+        ),
+        final_path=pending_path(pending.mapping),
+        data=serialize_pending(pending),
+    )
+
+
+def _stage_ftp_hybrid_file(
+    operation: FTPHybridFileUpload,
+    local_path: Path,
+    stage_root: str,
+    transport: FTPTransport,
+    progress: ProgressReporter,
+    *,
+    attempts: int,
+    delay: float,
+) -> None:
+    """Upload and SHA256-verify one frozen file in the protected FTP Stage."""
+
+    staged_path = f"{stage_root}/files/{operation.path}"
+
+    def action() -> None:
+        """Perform one complete idempotent STOR and RETR verification attempt."""
+
+        transport.upload(
+            local_path,
+            staged_path,
+            progress.callback(operation.path, operation.size),
+        )
+        actual = transport.read_file(staged_path, max_bytes=operation.size)
+        if len(actual) != operation.size or hashlib.sha256(actual).hexdigest() != operation.sha256:
+            raise DeployError(f"FTP staged verification mismatch for {operation.path}")
+
+    _retry_ftp_mutation(
+        operation.path,
+        action,
+        transport,
+        attempts=attempts,
+        delay=delay,
+    )
+
+
+def _publish_ftp_hybrid_file(
+    operation: FTPHybridFileUpload,
+    local_path: Path,
+    stage_root: str,
+    transport: FTPTransport,
+    progress: ProgressReporter,
+    *,
+    attempts: int,
+    delay: float,
+) -> None:
+    """Rename-replace and final-verify one file, restaging before a retry."""
+
+    staged_path = f"{stage_root}/files/{operation.path}"
+
+    def action() -> None:
+        """Publish one staged file and prove final content and source consumption."""
+
+        if transport.lstat(staged_path) is RemotePathType.MISSING:
+            transport.upload(
+                local_path,
+                staged_path,
+                progress.callback(operation.path, operation.size),
+            )
+            staged = transport.read_file(staged_path, max_bytes=operation.size)
+            if hashlib.sha256(staged).hexdigest() != operation.sha256:
+                raise DeployError(f"FTP restaged verification mismatch for {operation.path}")
+        transport.rename_replace(staged_path, operation.path)
+        final = transport.read_file(operation.path, max_bytes=operation.size)
+        if len(final) != operation.size or hashlib.sha256(final).hexdigest() != operation.sha256:
+            raise DeployError(f"FTP final verification mismatch for {operation.path}")
+        if transport.lstat(staged_path) is not RemotePathType.MISSING:
+            raise DeployError(f"FTP Stage was not consumed for {operation.path}")
+
+    _retry_ftp_mutation(
+        operation.path,
+        action,
+        transport,
+        attempts=attempts,
+        delay=delay,
+    )
+
+
+def _retry_ftp_mutation(
+    label: str,
+    action: Callable[[], None],
+    transport: FTPTransport,
+    *,
+    attempts: int,
+    delay: float,
+) -> None:
+    """Retry one idempotent FTP Hybrid action with a clean listing cache."""
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if attempt > 1:
+                transport.invalidate_connection()
+                _connect_with_retry(transport, attempts=1, delay=0, ensure_root=False)
+            action()
+            return
+        except Exception as exc:
+            if attempt >= attempts:
+                raise DeployError(f"{label} failed after {attempts} attempt(s): {exc}") from exc
+            print(
+                f"Retry {attempt}/{attempts - 1} for {label} after error: {exc}",
+                flush=True,
+            )
+            if delay:
+                time.sleep(delay)
+
+
+def _ftp_remote_record_hash(
+    transport: FTPTransport,
+    path: str,
+    *,
+    max_bytes: int,
+) -> str | None:
+    """Return SHA256 for one optional typed FTP record without mutating it."""
+
+    kind = transport.lstat(path)
+    if kind is RemotePathType.MISSING:
+        return None
+    if kind is not RemotePathType.FILE:
+        raise DeployError(f"FTP Hybrid metadata path is not a file: {path}")
+    return hashlib.sha256(transport.read_file(path, max_bytes=max_bytes)).hexdigest()
 
 
 def execute_recovery_plan(

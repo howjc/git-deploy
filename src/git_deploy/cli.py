@@ -80,6 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow doctor to create a missing remote root",
     )
+    parser.add_argument(
+        "--probe-ftp-hybrid",
+        action="store_true",
+        help="allow doctor to create and remove FTP Hybrid capability probe files",
+    )
+    parser.add_argument(
+        "--reprobe",
+        action="store_true",
+        help="replace an existing FTP Hybrid capability profile during an explicit probe",
+    )
     parser.add_argument("--version", action="version", version=f"git-deploy {__version__}")
     return parser
 
@@ -195,7 +205,7 @@ def _run_workspace(
         return 0
     if args.action == "doctor":
         _validate_doctor_args(args)
-        return _doctor_workspace(workspace, args.doctor_target, create_root=args.create_root)
+        return _doctor_workspace(workspace, args.doctor_target, args)
     if args.doctor_target is not None:
         parser.error("deployment accepts at most one TARGET positional argument")
     return _deploy_workspace(workspace, args.action, args)
@@ -219,6 +229,8 @@ def _deploy_project(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
+    if args.probe_ftp_hybrid or args.reprobe:
+        raise ConfigError("--probe-ftp-hybrid and --reprobe are only valid with doctor")
     if args.recover and args.full:
         raise ConfigError("--recover does not accept --full")
     if args.recover:
@@ -308,6 +320,8 @@ def _deploy_workspace(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
+    if args.probe_ftp_hybrid or args.reprobe:
+        raise ConfigError("--probe-ftp-hybrid and --reprobe are only valid with doctor")
     if args.recover and args.full:
         raise ConfigError("--recover does not accept --full")
     if args.recover:
@@ -420,12 +434,22 @@ def _doctor(
 ) -> int:
     """Render focused diagnostics and return failure when any check fails."""
 
+    if args.probe_ftp_hybrid:
+        target = config.target(requested_target)
+        has_hybrid = any(output.mode == "hybrid" for output in config.outputs)
+        if target.protocol != "ftp" or not has_hybrid:
+            raise ConfigError("--probe-ftp-hybrid requires an FTP target with one Hybrid output")
+        print("This probe creates and removes temporary files under .git-deploy/ftp-probe.")
+        if not args.yes:
+            _confirm_ftp_probe(target.name)
+
     results = run_doctor(
         config,
         config.target(requested_target),
         repository,
         state_store,
         create_root=args.create_root,
+        probe_ftp_hybrid=args.probe_ftp_hybrid,
     )
     _print_doctor_results(results)
     return 0 if all(item.ok for item in results) else 1
@@ -434,12 +458,28 @@ def _doctor(
 def _doctor_workspace(
     workspace: WorkspaceConfig,
     requested_target: str | None,
-    *,
-    create_root: bool,
+    args: argparse.Namespace,
 ) -> int:
     """Render per-project workspace diagnostics and aggregate their status."""
 
-    grouped = run_workspace_doctor(workspace, requested_target, create_root=create_root)
+    target = workspace.target(requested_target)
+    if args.probe_ftp_hybrid:
+        print("This probe creates and removes temporary files under .git-deploy/ftp-probe.")
+        if not args.yes:
+            _confirm_ftp_probe(target)
+    if args.probe_ftp_hybrid:
+        grouped = run_workspace_doctor(
+            workspace,
+            requested_target,
+            create_root=args.create_root,
+            probe_ftp_hybrid=True,
+        )
+    else:
+        grouped = run_workspace_doctor(
+            workspace,
+            requested_target,
+            create_root=args.create_root,
+        )
     for name, results in grouped:
         print(f"[{name}]")
         _print_doctor_results(results)
@@ -516,6 +556,16 @@ def _confirm_recovery(
         raise ConfigError("recovery cancelled")
 
 
+def _confirm_ftp_probe(target: str) -> None:
+    """Require confirmation before Doctor writes protected FTP probe files."""
+
+    if not sys.stdin.isatty():
+        raise ConfigError("FTP Hybrid capability probe requires --yes when stdin is not interactive")
+    answer = input(f"Probe FTP Hybrid capabilities for {target}? [y/N] ")
+    if answer.strip().lower() not in {"y", "yes"}:
+        raise ConfigError("FTP Hybrid capability probe cancelled")
+
+
 def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> None:
     """Reject deploy-only options accidentally passed to the build command."""
 
@@ -529,6 +579,8 @@ def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> Non
         or args.full
         or args.yes
         or args.create_root
+        or args.probe_ftp_hybrid
+        or args.reprobe
     ):
         raise ConfigError("build does not accept deploy-only flags")
 
@@ -542,9 +594,11 @@ def _validate_doctor_args(args: argparse.Namespace) -> None:
         or args.recover
         or args.skip_build
         or args.full
-        or args.yes
+        or (args.yes and not args.probe_ftp_hybrid)
     ):
         raise ConfigError("doctor does not accept deploy-only flags")
+    if args.reprobe and not args.probe_ftp_hybrid:
+        raise ConfigError("--reprobe requires --probe-ftp-hybrid")
 
 
 def _validate_init_args(args: argparse.Namespace) -> None:
@@ -561,6 +615,8 @@ def _validate_init_args(args: argparse.Namespace) -> None:
         or args.yes
         or args.verbose
         or args.create_root
+        or args.probe_ftp_hybrid
+        or args.reprobe
     ):
         raise ConfigError("init does not accept deploy or doctor flags")
 
