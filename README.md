@@ -8,7 +8,7 @@
 git-deploy
 ```
 
-v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、History、Verify、通用 Recover 或 Rollback。v1.4.1 的 `--recover` 只处理一个已审阅的 Hybrid 中断记录，不是历史恢复接口。旧实现冻结在 `legacy/v0.3` 分支和 v0.3.x tags；v1 配置和 state 与旧版不兼容。
+v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、History、Verify、通用 Recover 或 Rollback。v1.4.2 的 `--recover` 只处理一个已审阅的 Hybrid 中断记录，不是历史恢复接口。旧实现冻结在 `legacy/v0.3` 分支和 v0.3.x tags；v1 配置和 state 与旧版不兼容。
 
 ## 安装
 
@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.4.1/git_deploy-1.4.1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.4.2/git_deploy-1.4.2-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -174,7 +174,7 @@ git-deploy prod --skip-build --yes
 git-deploy prod --full --yes
 ```
 
-`--dry-run` 默认仍执行构建，但不连接服务器、不写 State。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读远端 Ownership、Recovery 和当前受管路径类型，完整显示 Adoption/Delete/Mirror Plan，绝不上传、删除、执行命令或写远端 Manifest/本地 State。`--recover` 只执行已显示并确认的一个 Hybrid 恢复动作，完成后退出；随后必须重新运行普通部署，以重新读取远端事实、生成计划并再次确认。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
+`--dry-run` 默认仍执行构建，但不连接服务器、不写 State。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读远端 Ownership、Recovery 和当前受管路径类型，完整显示 Adoption/Delete/Mirror Plan，绝不上传、删除、执行命令或写远端 Manifest/本地 State。`--recover` 使用独立的 Recovery-only Prepare，只读取配置、目标契约、远端 Ownership/Recovery 和 Git Common Dir 中的锁/State 路径；它不运行 Build、不读取既有 State 内容、不扫描本地 Hybrid、不生成或冻结当前部署操作。恢复只执行已显示并确认的动作，完成后退出；随后必须重新运行普通部署，以重新读取远端事实、生成计划并再次确认。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
 
 只构建或诊断：
 
@@ -271,7 +271,8 @@ Incremental Outputs 在构建后扫描并计算 SHA256。只有上次 State 已�
 - Hybrid Local Root 在连接前完整扫描/冻结；Build、聚合、冲突或符号链接失败时远端连接数为零。
 - Hybrid 只触碰当前/历史 Ownership 明确声明的直接子项和受保护的 `.git-deploy` 内部路径；未知远端内容不进入候选集合。
 - Hybrid 确认后的任何写入前会复核 Ownership 原始字节 Hash 和当前/历史受管路径类型；确认窗口发生漂移会以 Stale Plan 失败，远端写入为零。Workspace 会先复核全部选中仓库，后一仓 Stale 也不会让前一仓先写入。
-- Mirror Directory 完整上传到 Stage 后才替换线上目录；SFTP Rename 之间仍有短暂切换窗口，不宣称零停机或发布事务。
+- 所有 Root File 和 Mirror Directory 完整上传到 Stage 后、开始线上 Swap 前，会再次复核 Ownership、Recovery 和路径类型；上传重试/重连也必须先通过这道门禁。每条路径在 Backup 前还会核对计划类型，计划时 Missing 的目标以 No-overwrite Rename 发布；最后一刻出现同名路径会 Stale 并保留外部内容。
+- 写入新 Ownership 前会再次核对旧 Ownership Hash。SFTP Rename 之间仍有短暂切换窗口，不宣称零停机、远端租约或发布事务。
 - SFTP 先上传临时文件再替换；兼容回退先备份旧目标，替换失败会恢复旧文件。
 - Git `100755` 文件通过 SFTP 发布为 `0755`；FTP 无法保证可执行位，因此会在连接前拒绝。
 - FTP 只承诺二进制上传、目录创建和幂等文件操作，不声称原子替换或 POSIX 权限语义；同一连接会缓存完整父目录列表，批量删除不会为每个文件重复 `NLST`。
@@ -294,7 +295,7 @@ git-deploy prod --yes
 
 State 损坏或目标需要覆盖时，审阅计划后使用 `--full`。Hybrid 仅丢失本地 State 时仍以 Remote Ownership 为删除事实来源，不需要为了恢复所有权而接管未知路径。不要让多个发布器同时管理同一远端路径。
 
-Hybrid Swap 中断时保留 `.git-deploy/recovery/<id>.json`：Ownership Commit 前恢复 Backup，Commit 后按阶段继续待执行命令、保存保守 State 或清理；必要 Backup 缺失、新旧 Ownership Hash 无法证明时 Fail Closed 并保留现场，Doctor 报告需要人工检查。普通部署和 `--remote-plan` 都只报告 Recovery，不会暗中修复。
+Hybrid Swap 中断时保留 `.git-deploy/recovery/<id>.json`：Ownership Commit 前恢复 Backup，Commit 后按阶段继续待执行命令、保存保守 State 或清理；必要 Backup 缺失、新旧 Ownership Hash 无法证明时 Fail Closed 并保留现场，Doctor 报告需要人工检查。普通部署和 `--remote-plan` 都只报告 Recovery，不会暗中修复。v1.4.0 写入的 schema-1 记录若尚未提交 Ownership，仍可保守恢复；若 Ownership 已提交且命令待执行，因为无法证明原命令契约，会 Fail Closed 并由 Doctor 提示 `Legacy Command Contract Unknown`，不得自动执行当前配置命令。
 
 先只读审阅，再显式恢复；恢复完成后重新生成普通计划：
 
@@ -321,7 +322,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.4.1-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.4.2-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

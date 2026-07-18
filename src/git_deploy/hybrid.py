@@ -147,6 +147,15 @@ class HybridRecoveryRecord:
             completed = tuple(sorted((*completed, self.active_name)))
         return replace(self, completed_names=completed, active_name=name)
 
+    def without_active(self) -> HybridRecoveryRecord:
+        """Return a record proving the active path was not mutated.
+
+        Returns:
+            Copy retaining completed paths and clearing only the active path.
+        """
+
+        return replace(self, active_name=None)
+
 @dataclass(frozen=True, slots=True)
 class HybridRecoveryOutcome:
     """Describe read-only recovery work still required after interruption."""
@@ -676,6 +685,11 @@ def inspect_recovery(
         RecoveryPhase.SWAPPING,
         RecoveryPhase.OWNERSHIP_COMMITTED,
     }
+    if record.schema == 1 and commands_pending:
+        raise DeployError(
+            "legacy command contract unknown: schema-1 Recovery cannot prove "
+            "the interrupted after_deploy commands or timeout"
+        )
     state_pending = committed and record.phase in {
         RecoveryPhase.SWAPPING,
         RecoveryPhase.OWNERSHIP_COMMITTED,
@@ -711,6 +725,14 @@ def reconcile_recovery(
         for name in affected_names:
             backup = f"{record.backup_root}/{name}"
             if transport.lstat(backup) is RemotePathType.MISSING:
+                staged = f"{record.stage_root}/{name}"
+                if (
+                    name not in record.old_existing_names
+                    and transport.lstat(staged) is not RemotePathType.MISSING
+                ):
+                    # A no-overwrite publication did not consume Stage, so a
+                    # same-name online path belongs to the external writer.
+                    continue
                 if transport.lstat(name) is not RemotePathType.MISSING:
                     transport.remove_tree(name)
                 continue
@@ -723,6 +745,27 @@ def reconcile_recovery(
     transport.remove_tree(record.backup_root)
     transport.remove_tree(recovery_path(record.deployment_id))
     return outcome
+
+
+def discard_staged_recovery(
+    transport: Transport,
+    record: HybridRecoveryRecord,
+) -> None:
+    """Discard only pre-swap internal artifacts after a secondary stale check.
+
+    Args:
+        transport: Connected SFTP transport allowed to remove internal paths.
+        record: Current Recovery record that has not started online mutation.
+
+    Returns:
+        ``None`` after Stage, empty Backup, and Recovery metadata are removed.
+    """
+
+    if record.phase not in {RecoveryPhase.PREPARED, RecoveryPhase.STAGED}:
+        raise DeployError("only a pre-swap Recovery may be discarded")
+    transport.remove_tree(record.stage_root)
+    transport.remove_tree(record.backup_root)
+    transport.remove_tree(recovery_path(record.deployment_id))
 
 
 def cleanup_committed_recovery(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
+import json
 from pathlib import Path, PurePosixPath
 import shutil
 
@@ -30,12 +32,20 @@ from git_deploy.planner import (
     create_plan,
     render_plan,
 )
-from git_deploy.prepared import execute_prepared, prepare_project, prepare_remote_plan
+from git_deploy.prepared import (
+    execute_prepared,
+    execute_prepared_recovery,
+    prepare_project,
+    prepare_recovery,
+    prepare_remote_plan,
+)
 from git_deploy.transports.base import ProgressCallback, RemotePathType, Transport
 from git_deploy.workspace import (
     execute_workspace,
+    execute_workspace_recovery,
     load_workspace,
     prepare_workspace,
+    prepare_workspace_recovery,
     render_workspace_plan,
 )
 
@@ -58,14 +68,23 @@ class MemoryHybridTransport(Transport):
         self.fail_command = False
         self.fail_stage_publish_once = False
         self.fail_stage_upload = False
+        self.fail_stage_upload_once = False
         self.fail_ownership_write_once = False
         self.fail_cleanup_once = False
         self.interrupt_stage_publish_once = False
+        self.after_reconnect: Callable[[], None] | None = None
+        self.after_staged_record: Callable[[], None] | None = None
+        self.after_swapping_record: Callable[[], None] | None = None
+        self.after_stage_publish: Callable[[], None] | None = None
 
     def connect(self) -> None:
         """Record one synthetic authentication."""
 
         self.connects += 1
+        if self.connects > 1 and self.after_reconnect is not None:
+            callback = self.after_reconnect
+            self.after_reconnect = None
+            callback()
 
     def ensure_root(self) -> None:
         """Keep the already-present synthetic target root."""
@@ -88,6 +107,9 @@ class MemoryHybridTransport(Transport):
         path = self._normalize(remote_path)
         if self.fail_stage_upload and path.startswith(".git-deploy/stage/"):
             raise OSError("synthetic stage upload failure")
+        if self.fail_stage_upload_once and path.startswith(".git-deploy/stage/"):
+            self.fail_stage_upload_once = False
+            raise OSError("synthetic one-shot stage upload failure")
         self.make_directory(self._parent(path))
         data = local_path.read_bytes()
         self.files[path] = data
@@ -150,6 +172,16 @@ class MemoryHybridTransport(Transport):
         self.make_directory(self._parent(path))
         self.files[path] = data
         self.mutations += 1
+        if path.startswith(".git-deploy/recovery/"):
+            phase = json.loads(data.decode("utf-8"))["phase"]
+            if phase == "STAGED" and self.after_staged_record is not None:
+                callback = self.after_staged_record
+                self.after_staged_record = None
+                callback()
+            elif phase == "SWAPPING" and self.after_swapping_record is not None:
+                callback = self.after_swapping_record
+                self.after_swapping_record = None
+                callback()
 
     def list_directory(self, remote_path: str) -> tuple[str, ...]:
         """Return stable direct child names."""
@@ -237,6 +269,13 @@ class MemoryHybridTransport(Transport):
                 self.symlinks.remove(item)
                 self.symlinks.add(f"{destination_path}/{suffix}")
         self.mutations += 1
+        if (
+            ".git-deploy/stage/" in source_path
+            and self.after_stage_publish is not None
+        ):
+            callback = self.after_stage_publish
+            self.after_stage_publish = None
+            callback()
 
     def remove_tree(self, remote_path: str) -> None:
         """Remove one exact node and descendants without following symlinks."""
@@ -320,6 +359,31 @@ remote_root = "/srv/app"
 {command_config}
 ''',
     )
+
+
+def _recover_hybrid(config_path: Path, remote: MemoryHybridTransport) -> None:
+    """Prepare and execute only one synthetic remote Recovery."""
+
+    config = load_config(config_path)
+    prepared = prepare_recovery(
+        "project",
+        config,
+        None,
+        transport_factory=lambda target: remote,
+    )
+    assert prepared is not None
+    execute_prepared_recovery(prepared)
+
+
+def _downgrade_recovery_to_schema1(remote: MemoryHybridTransport) -> None:
+    """Rewrite one synthetic schema-2 record into its legacy field set."""
+
+    path = next(path for path in remote.files if path.startswith(".git-deploy/recovery/"))
+    payload = json.loads(remote.files[path].decode("utf-8"))
+    payload["schema"] = 1
+    for field in ("completed_names", "active_name", "command_hash"):
+        payload.pop(field)
+    remote.files[path] = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
 
 
 def _enable_workspace_hybrid(root: Path, name: str) -> None:
@@ -603,7 +667,7 @@ def test_hybrid_mirror_preserves_nested_empty_directories(git_project: Path) -> 
 
     remote = MemoryHybridTransport()
     prepared = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(prepared, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(prepared, transport_factory=lambda target: remote)
     execute_prepared(prepared)
     assert remote.lstat("assets/empty/nested") is RemotePathType.DIRECTORY
 
@@ -617,8 +681,7 @@ def test_remote_plan_reads_ownership_without_any_remote_mutation(git_project: Pa
 
     prepare_remote_plan(
         prepared,
-        allow_recovery=False,
-        transport_factory=lambda target: remote,
+         transport_factory=lambda target: remote,
     )
 
     assert prepared.plan.hybrid is not None
@@ -639,7 +702,7 @@ def test_freshness_gate_rejects_missing_path_created_after_remote_plan(
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     prepared = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(prepared, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(prepared, transport_factory=lambda target: remote)
     if new_type is RemotePathType.FILE:
         remote.files["index.html"] = b"unknown user content"
     else:
@@ -674,10 +737,10 @@ def test_freshness_gate_rejects_owned_file_directory_type_changes(
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(planned, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
 
     for item in tuple(remote.files):
         if item == path or item.startswith(path + "/"):
@@ -705,13 +768,13 @@ def test_freshness_gate_rejects_ownership_change_before_any_source_write(
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     old_source = remote.files["app.py"]
     (git_project / "app.py").write_text("print('new source')\n", encoding="utf-8")
     commit_all(git_project, "change source")
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(planned, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
     ownership_path = ".git-deploy/hybrid/frontend-root.json"
     ownership = read_ownership(
         remote,
@@ -732,6 +795,220 @@ def test_freshness_gate_rejects_ownership_change_before_any_source_write(
     assert remote.files["app.py"] == old_source
 
 
+def test_secondary_freshness_rejects_path_created_during_stage(
+    git_project: Path,
+) -> None:
+    """A path appearing during Stage never reaches the online swap boundary."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    first = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
+    execute_prepared(first)
+    store = StateStore(GitRepository(git_project).common_dir())
+    old_state = store.load("dev")
+    ownership_path = ".git-deploy/hybrid/frontend-root.json"
+    old_ownership = remote.files[ownership_path]
+    (git_project / ".deploy/frontend-root/race.txt").write_text(
+        "planned\n", encoding="utf-8"
+    )
+
+    remote.after_staged_record = lambda: remote.files.__setitem__(
+        "race.txt", b"external important data"
+    )
+    staged = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(staged, transport_factory=lambda target: remote)
+    with pytest.raises(StaleRemotePlanError, match="path type changed"):
+        execute_prepared(staged)
+
+    assert remote.files["race.txt"] == b"external important data"
+    assert remote.files[ownership_path] == old_ownership
+    assert store.load("dev") == old_state
+    assert not any(path.startswith(".git-deploy/stage/") for path in remote.directories)
+    assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
+
+
+def test_secondary_freshness_runs_after_stage_retry_and_reconnect(
+    git_project: Path,
+) -> None:
+    """A successful Stage retry still passes through the second freshness gate."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    first = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
+    execute_prepared(first)
+    (git_project / ".deploy/frontend-root/retry-race.txt").write_text(
+        "planned\n", encoding="utf-8"
+    )
+    planned = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
+    remote.fail_stage_upload_once = True
+    remote.after_reconnect = lambda: remote.files.__setitem__(
+        "retry-race.txt", b"external data created during reconnect"
+    )
+
+    with pytest.raises(StaleRemotePlanError, match="path type changed"):
+        execute_prepared(planned)
+
+    assert remote.connects >= 3
+    assert remote.files["retry-race.txt"] == b"external data created during reconnect"
+    assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
+
+
+def test_secondary_stale_cleanup_failure_keeps_recovery_without_touching_online_path(
+    git_project: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Failed internal cleanup leaves a safe STAGED Recovery for explicit retry."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    (git_project / ".deploy/frontend-root/cleanup-race.txt").write_text(
+        "planned\n", encoding="utf-8"
+    )
+    planned = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
+    remote.after_staged_record = lambda: remote.files.__setitem__(
+        "cleanup-race.txt", b"external data"
+    )
+    remote.fail_cleanup_once = True
+
+    with pytest.raises(StaleRemotePlanError, match="path type changed"):
+        execute_prepared(planned)
+
+    assert "run --recover" in capsys.readouterr().err
+    assert remote.files["cleanup-race.txt"] == b"external data"
+    assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
+    _recover_hybrid(config_path, remote)
+    assert remote.files["cleanup-race.txt"] == b"external data"
+    assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
+
+
+def test_missing_path_publish_is_no_overwrite_at_last_moment(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A destination appearing after the second gate survives failed publish and Recovery."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    first = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
+    execute_prepared(first)
+    (git_project / ".deploy/frontend-root/late.txt").write_text(
+        "planned\n", encoding="utf-8"
+    )
+    planned = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
+    original_rename = remote.rename_path
+    raced = False
+
+    def race_before_publish(source: str, destination: str) -> None:
+        """Create an unknown destination immediately before standard SFTP rename."""
+
+        nonlocal raced
+        if not raced and ".git-deploy/stage/" in source and destination == "late.txt":
+            raced = True
+            remote.files[destination] = b"last-moment external data"
+        original_rename(source, destination)
+
+    monkeypatch.setattr(remote, "rename_path", race_before_publish)
+    with pytest.raises(StaleRemotePlanError, match="appeared during no-overwrite"):
+        execute_prepared(planned)
+    assert remote.files["late.txt"] == b"last-moment external data"
+    monkeypatch.setattr(remote, "rename_path", original_rename)
+
+    _recover_hybrid(config_path, remote)
+    assert remote.files["late.txt"] == b"last-moment external data"
+    assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        ("index.html", RemotePathType.DIRECTORY),
+        ("assets", RemotePathType.FILE),
+    ],
+)
+def test_expected_type_is_rechecked_immediately_before_backup(
+    git_project: Path,
+    path: str,
+    replacement: RemotePathType,
+) -> None:
+    """A post-Stage type change is never moved into deployment-owned Backup."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    first = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
+    execute_prepared(first)
+
+    def replace_online_type() -> None:
+        """Replace one managed path out-of-band after the secondary gate."""
+
+        for item in tuple(remote.files):
+            if item == path or item.startswith(path + "/"):
+                remote.files.pop(item)
+        for item in tuple(remote.directories):
+            if item == path or item.startswith(path + "/"):
+                remote.directories.discard(item)
+        if replacement is RemotePathType.FILE:
+            remote.files[path] = b"external replacement"
+        else:
+            remote.directories.add(path)
+            remote.files[f"{path}/important"] = b"external replacement"
+
+    remote.after_swapping_record = replace_online_type
+    if path == "index.html":
+        (git_project / ".deploy/frontend-root/index.html").write_text(
+            "changed\n", encoding="utf-8"
+        )
+    planned = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
+    with pytest.raises(StaleRemotePlanError, match="before Hybrid swap"):
+        execute_prepared(planned)
+
+    if replacement is RemotePathType.FILE:
+        assert remote.files[path] == b"external replacement"
+    else:
+        assert remote.files[f"{path}/important"] == b"external replacement"
+    _recover_hybrid(config_path, remote)
+    assert remote.lstat(path) is replacement
+
+
+def test_ownership_is_rechecked_immediately_before_commit(git_project: Path) -> None:
+    """A concurrent Ownership edit is never overwritten after online swaps."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    first = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
+    execute_prepared(first)
+    ownership_path = ".git-deploy/hybrid/frontend-root.json"
+    approved = parse_ownership(
+        remote.files[ownership_path],
+        project_id="github.com/acme/hybrid-app",
+        mapping="frontend-root",
+        remote=".",
+    )
+    external = serialize_ownership(replace(approved, updated_at=approved.updated_at + 100))
+    remote.after_stage_publish = lambda: remote.files.__setitem__(
+        ownership_path, external
+    )
+    (git_project / ".deploy/frontend-root/assets/app.js").write_text(
+        "next\n", encoding="utf-8"
+    )
+    planned = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(planned, transport_factory=lambda target: remote)
+
+    with pytest.raises(StaleRemotePlanError, match="ownership changed"):
+        execute_prepared(planned)
+
+    assert remote.files[ownership_path] == external
+    assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
+
+
 def test_hybrid_upload_bytes_remain_frozen_across_remote_preflight(
     git_project: Path,
 ) -> None:
@@ -743,7 +1020,7 @@ def test_hybrid_upload_bytes_remain_frozen_across_remote_preflight(
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
         "changed after local plan\n", encoding="utf-8"
     )
-    prepare_remote_plan(prepared, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(prepared, transport_factory=lambda target: remote)
     execute_prepared(prepared)
 
     assert remote.files["assets/app.js"] == b"current app\n"
@@ -763,16 +1040,14 @@ def test_first_adoption_requires_explicit_full_and_only_adopts_current_names(
     with pytest.raises(PlanError, match="rerun with --full"):
         prepare_remote_plan(
             prepared,
-            allow_recovery=True,
-            transport_factory=lambda target: remote,
+             transport_factory=lambda target: remote,
         )
     prepared.close()
 
     adopted = prepare_project("project", config_path, None, full=True, skip_build=True)
     prepare_remote_plan(
         adopted,
-        allow_recovery=True,
-        transport_factory=lambda target: remote,
+         transport_factory=lambda target: remote,
     )
     assert adopted.plan.adoption_count == 1
     assert any(
@@ -794,7 +1069,7 @@ def test_hybrid_deploy_preserves_unknown_content_and_state_loss_still_deletes_ow
     remote.add_file(".env", b"secret")
     remote.add_file("manual-backup/snapshot", b"unknown")
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
 
     ownership = read_ownership(
@@ -821,7 +1096,7 @@ def test_hybrid_deploy_preserves_unknown_content_and_state_loss_still_deletes_ow
         "new css\n", encoding="utf-8"
     )
     second = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(second, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(second, transport_factory=lambda target: remote)
     assert any(
         isinstance(item, HybridRootFileDelete) and item.path == "index.html"
         for item in second.plan.hybrid.operations  # type: ignore[union-attr]
@@ -850,7 +1125,7 @@ def test_swap_failure_keeps_state_and_next_preflight_restores_then_converges(
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     store = StateStore(GitRepository(git_project).common_dir())
     old_state = store.load("dev")
@@ -861,7 +1136,7 @@ def test_swap_failure_keeps_state_and_next_preflight_restores_then_converges(
     )
     remote.fail_stage_publish_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="stage publish failure"):
         execute_prepared(failed)
 
@@ -871,21 +1146,18 @@ def test_swap_failure_keeps_state_and_next_preflight_restores_then_converges(
     mutations = remote.mutations
     prepare_remote_plan(
         read_only,
-        allow_recovery=False,
-        transport_factory=lambda target: remote,
+         transport_factory=lambda target: remote,
     )
     assert "RECOVER [swapping]" in render_plan(read_only.plan)
     assert remote.mutations == mutations
     read_only.close()
 
-    recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
-    execute_prepared(recovery, recover_only=True)
+    _recover_hybrid(config_path, remote)
     assert remote.files["assets/app.js"] == old_bytes
     assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
 
     resumed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(resumed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(resumed, transport_factory=lambda target: remote)
     execute_prepared(resumed)
     assert remote.files["assets/app.js"] == b"next app\n"
     assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
@@ -901,7 +1173,7 @@ def test_stage_failure_keeps_online_paths_and_recovery_rerun_converges(
     remote.add_file("index.php", b"backend")
     remote.fail_stage_upload = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="stage upload failure"):
         execute_prepared(failed)
     store = StateStore(GitRepository(git_project).common_dir())
@@ -917,11 +1189,9 @@ def test_stage_failure_keeps_online_paths_and_recovery_rerun_converges(
     ) is None
 
     remote.fail_stage_upload = False
-    recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
-    execute_prepared(recovery, recover_only=True)
+    _recover_hybrid(config_path, remote)
     resumed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(resumed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(resumed, transport_factory=lambda target: remote)
     execute_prepared(resumed)
     assert remote.files["assets/app.js"] == b"current app\n"
     assert remote.files["index.php"] == b"backend"
@@ -935,7 +1205,7 @@ def test_ownership_write_failure_restores_backup_before_next_plan(
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     store = StateStore(GitRepository(git_project).common_dir())
     old_state = store.load("dev")
@@ -945,17 +1215,15 @@ def test_ownership_write_failure_restores_backup_before_next_plan(
     )
     remote.fail_ownership_write_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="ownership write failure"):
         execute_prepared(failed)
 
     assert store.load("dev") == old_state
-    recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
-    execute_prepared(recovery, recover_only=True)
+    _recover_hybrid(config_path, remote)
     assert remote.files["assets/app.js"] == old_bytes
     resumed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(resumed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(resumed, transport_factory=lambda target: remote)
     execute_prepared(resumed)
     assert remote.files["assets/app.js"] == b"ownership next\n"
 
@@ -966,7 +1234,7 @@ def test_ctrl_c_leaves_recovery_and_next_run_restores_safely(git_project: Path) 
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     old = remote.files["assets/app.js"]
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
@@ -976,19 +1244,16 @@ def test_ctrl_c_leaves_recovery_and_next_run_restores_safely(git_project: Path) 
     interrupted = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(
         interrupted,
-        allow_recovery=True,
-        transport_factory=lambda target: remote,
+         transport_factory=lambda target: remote,
     )
     with pytest.raises(KeyboardInterrupt):
         execute_prepared(interrupted)
     assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
 
-    recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
-    execute_prepared(recovery, recover_only=True)
+    _recover_hybrid(config_path, remote)
     assert remote.files["assets/app.js"] == old
     resumed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(resumed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(resumed, transport_factory=lambda target: remote)
     execute_prepared(resumed)
     assert remote.files["assets/app.js"] == b"interrupt next\n"
 
@@ -1003,7 +1268,7 @@ def test_state_save_and_cleanup_failures_preserve_remote_facts_for_rerun(
     config_path = _hybrid_project(git_project, commands=("reload-app",))
     remote = MemoryHybridTransport()
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
 
     def fail_state(state) -> None:  # noqa: ANN001
         """Simulate a local atomic State failure after commands."""
@@ -1022,17 +1287,13 @@ def test_state_save_and_cleanup_failures_preserve_remote_facts_for_rerun(
     ) is not None
     assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
 
-    resumed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(resumed, allow_recovery=False, transport_factory=lambda target: remote)
     remote.fail_cleanup_once = True
-    execute_prepared(resumed, recover_only=True)
+    _recover_hybrid(config_path, remote)
     assert remote.commands == ["reload-app"]
     assert "cleanup is pending" in capsys.readouterr().err
     assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
 
-    cleanup = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(cleanup, allow_recovery=False, transport_factory=lambda target: remote)
-    execute_prepared(cleanup, recover_only=True)
+    _recover_hybrid(config_path, remote)
     assert remote.commands == ["reload-app"]
     assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
 
@@ -1046,7 +1307,7 @@ def test_command_failure_commits_ownership_not_local_state_and_rerun_repeats_com
     remote = MemoryHybridTransport()
     remote.fail_command = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="synthetic command failure"):
         execute_prepared(failed)
 
@@ -1062,9 +1323,10 @@ def test_command_failure_commits_ownership_not_local_state_and_rerun_repeats_com
 
     remote.fail_command = False
     resumed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(resumed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(resumed, transport_factory=lambda target: remote)
     assert "RESUME COMMANDS" in render_plan(resumed.plan)
-    execute_prepared(resumed, recover_only=True)
+    resumed.close()
+    _recover_hybrid(config_path, remote)
     assert remote.commands == ["reload-app", "reload-app"]
     assert store.load("dev") is not None
 
@@ -1076,7 +1338,7 @@ def test_recovery_rejects_after_deploy_configuration_drift(git_project: Path) ->
     remote = MemoryHybridTransport()
     remote.fail_command = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="synthetic command failure"):
         execute_prepared(failed)
 
@@ -1088,12 +1350,146 @@ def test_recovery_rejects_after_deploy_configuration_drift(git_project: Path) ->
     with pytest.raises(PlanError, match="commands or timeout changed"):
         prepare_remote_plan(
             changed,
-            allow_recovery=False,
-            transport_factory=lambda target: remote,
+             transport_factory=lambda target: remote,
         )
 
     assert remote.commands == ["reload-app"]
     assert remote.mutations == mutations
+
+
+def test_recovery_only_prepare_ignores_broken_local_deployment_inputs(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery works without Build, State parsing, local outputs, freeze, or clean Git."""
+
+    config_path = _hybrid_project(git_project, commands=("reload-app",))
+    remote = MemoryHybridTransport()
+    remote.fail_command = True
+    failed = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
+    with pytest.raises(DeployError, match="synthetic command failure"):
+        execute_prepared(failed)
+    remote.fail_command = False
+
+    config_text = config_path.read_text(encoding="utf-8")
+    config_text = config_text.replace("steps = []", 'steps = ["false"]')
+    config_text = config_text.replace(
+        '[source]\ninclude = ["**"]',
+        '[source]\ninclude = ["**"]\nrequire_clean_worktree = true',
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+    shutil.rmtree(git_project / ".deploy")
+    (git_project / "app.py").write_text("dirty and not deployed\n", encoding="utf-8")
+    store = StateStore(GitRepository(git_project).common_dir())
+    store.path_for("dev").write_text("not-json", encoding="utf-8")
+
+    def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Fail if the Recovery-only path invokes deployment preparation."""
+
+        raise AssertionError("deployment-only preparation was called")
+
+    monkeypatch.setattr("git_deploy.prepared.run_build", forbidden)
+    monkeypatch.setattr("git_deploy.prepared.freeze_uploads", forbidden)
+    monkeypatch.setattr("git_deploy.prepared.shutil.disk_usage", forbidden)
+    monkeypatch.setattr(
+        "git_deploy.prepared.create_transport", lambda target, pool=None: remote
+    )
+
+    assert cli.main(["--config", str(config_path), "--recover", "--yes"]) == 0
+    output = capsys.readouterr().out
+    assert "Mode: RECOVERY" in output
+    assert "UPLOAD " not in output
+    assert "DELETE " not in output
+    assert "1 pending command(s)" in output
+    assert remote.commands == ["reload-app", "reload-app"]
+    assert store.load("dev") is not None
+
+
+def test_schema1_pending_commands_fail_closed_and_doctor_explains(
+    git_project: Path,
+) -> None:
+    """Legacy committed records never execute an unknowable current command contract."""
+
+    config_path = _hybrid_project(git_project, commands=("reload-app",))
+    remote = MemoryHybridTransport()
+    remote.fail_command = True
+    failed = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
+    with pytest.raises(DeployError, match="synthetic command failure"):
+        execute_prepared(failed)
+    _downgrade_recovery_to_schema1(remote)
+    remote.fail_command = False
+
+    with pytest.raises(DeployError, match="legacy command contract unknown"):
+        prepare_recovery(
+            "project",
+            load_config(config_path),
+            None,
+            transport_factory=lambda target: remote,
+        )
+    config = load_config(config_path)
+    results = run_doctor(
+        config,
+        config.target(None),
+        GitRepository(git_project),
+        StateStore(GitRepository(git_project).common_dir()),
+        transport_factory=lambda target: remote,
+    )
+    recovery_result = next(item for item in results if item.name == "hybrid recovery")
+    assert not recovery_result.ok
+    assert "legacy command contract unknown" in recovery_result.detail
+    assert remote.commands == ["reload-app"]
+
+
+def test_schema1_precommit_restore_remains_supported(git_project: Path) -> None:
+    """Legacy records may still restore a provable pre-Ownership Backup."""
+
+    config_path = _hybrid_project(git_project)
+    remote = MemoryHybridTransport()
+    first = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
+    execute_prepared(first)
+    old = remote.files["assets/app.js"]
+    (git_project / ".deploy/frontend-root/assets/app.js").write_text(
+        "next\n", encoding="utf-8"
+    )
+    remote.fail_stage_publish_once = True
+    failed = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
+    with pytest.raises(DeployError, match="stage publish failure"):
+        execute_prepared(failed)
+    _downgrade_recovery_to_schema1(remote)
+
+    _recover_hybrid(config_path, remote)
+    assert remote.files["assets/app.js"] == old
+
+
+def test_pending_recovery_render_hides_current_deployment_operations(
+    git_project: Path,
+) -> None:
+    """Read-only Recovery display never promises unrelated current uploads."""
+
+    config_path = _hybrid_project(git_project, commands=("reload-app",))
+    remote = MemoryHybridTransport()
+    remote.fail_command = True
+    failed = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
+    with pytest.raises(DeployError, match="synthetic command failure"):
+        execute_prepared(failed)
+    (git_project / "app.py").write_text("print('later')\n", encoding="utf-8")
+    commit_all(git_project, "later source")
+
+    current = prepare_project("project", config_path, None, full=False, skip_build=True)
+    prepare_remote_plan(current, transport_factory=lambda target: remote)
+    rendered = render_plan(current.plan)
+    current.close()
+
+    assert "Mode: RECOVERY" in rendered
+    assert "UPLOAD [source] app.py" not in rendered
+    assert "1 recovery action(s)" in rendered
+    assert "1 pending command(s)" in rendered
 
 
 @pytest.mark.parametrize("owned_kind", ["root-file", "directory"])
@@ -1111,7 +1507,7 @@ def test_delete_only_command_failure_is_resumed_by_explicit_recovery(
         (root / "index.html").unlink()
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
 
     if owned_kind == "root-file":
@@ -1120,16 +1516,17 @@ def test_delete_only_command_failure_is_resumed_by_explicit_recovery(
         shutil.rmtree(root / "assets")
     remote.fail_command = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="synthetic command failure"):
         execute_prepared(failed)
     assert remote.commands == ["reload-app", "reload-app"]
 
     remote.fail_command = False
     recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(recovery, transport_factory=lambda target: remote)
     assert "RESUME COMMANDS" in render_plan(recovery.plan)
-    execute_prepared(recovery, recover_only=True)
+    recovery.close()
+    _recover_hybrid(config_path, remote)
 
     assert remote.commands == ["reload-app", "reload-app", "reload-app"]
     assert not any(path.startswith(".git-deploy/recovery/") for path in remote.files)
@@ -1143,13 +1540,13 @@ def test_ownership_only_command_failure_remains_pending(git_project: Path) -> No
     shutil.rmtree(git_project / ".deploy/frontend-root/assets")
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     (git_project / "app.py").write_text("print('ownership only')\n", encoding="utf-8")
     commit_all(git_project, "ownership-only source")
     remote.fail_command = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="synthetic command failure"):
         execute_prepared(failed)
     interrupted_commit = GitRepository(git_project).head()
@@ -1158,9 +1555,7 @@ def test_ownership_only_command_failure_remains_pending(git_project: Path) -> No
     assert GitRepository(git_project).head() != interrupted_commit
 
     remote.fail_command = False
-    recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
-    execute_prepared(recovery, recover_only=True)
+    _recover_hybrid(config_path, remote)
     assert remote.commands == ["reload-app", "reload-app", "reload-app"]
     state = StateStore(GitRepository(git_project).common_dir()).load("dev")
     assert state is not None
@@ -1175,14 +1570,14 @@ def test_recovery_missing_required_backup_fails_closed_and_doctor_reports_manual
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
         "next\n", encoding="utf-8"
     )
     remote.fail_stage_publish_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="stage publish failure"):
         execute_prepared(failed)
     backup = next(path for path in remote.directories if ".git-deploy/backup/" in path and path.endswith("/assets"))
@@ -1195,10 +1590,13 @@ def test_recovery_missing_required_backup_fails_closed_and_doctor_reports_manual
                     collection.discard(path)
     remote.mutations = 0
 
-    recovery = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(recovery, allow_recovery=False, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="manual inspection required"):
-        execute_prepared(recovery, recover_only=True)
+        prepare_recovery(
+            "project",
+            load_config(config_path),
+            None,
+            transport_factory=lambda target: remote,
+        )
     assert remote.mutations == 0
     assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
     assert any(path.startswith(".git-deploy/stage/") for path in remote.directories)
@@ -1225,7 +1623,7 @@ def test_hybrid_owned_path_can_change_between_file_and_directory(git_project: Pa
     switch.write_text("file v1", encoding="utf-8")
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     assert remote.lstat("switch") is RemotePathType.FILE
 
@@ -1233,7 +1631,7 @@ def test_hybrid_owned_path_can_change_between_file_and_directory(git_project: Pa
     switch.mkdir()
     (switch / "child.js").write_text("directory v2", encoding="utf-8")
     second = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(second, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(second, transport_factory=lambda target: remote)
     execute_prepared(second)
     assert remote.lstat("switch") is RemotePathType.DIRECTORY
     assert remote.files["switch/child.js"] == b"directory v2"
@@ -1241,7 +1639,7 @@ def test_hybrid_owned_path_can_change_between_file_and_directory(git_project: Pa
     shutil.rmtree(switch)
     switch.write_text("file v3", encoding="utf-8")
     third = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(third, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(third, transport_factory=lambda target: remote)
     execute_prepared(third)
     assert remote.lstat("switch") is RemotePathType.FILE
     assert remote.files["switch"] == b"file v3"
@@ -1256,19 +1654,19 @@ def test_hybrid_noop_skips_unchanged_root_file_but_any_directory_mirrors_each_ru
     shutil.rmtree(git_project / ".deploy/frontend-root/assets")
     remote = MemoryHybridTransport()
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(first, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     assert remote.commands == ["reload-app"]
 
     noop = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(noop, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(noop, transport_factory=lambda target: remote)
     assert not noop.plan.has_remote_work
     execute_prepared(noop)
     assert remote.commands == ["reload-app"]
 
     (git_project / ".deploy/frontend-root/fonts").mkdir()
     mirror = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(mirror, allow_recovery=True, transport_factory=lambda target: remote)
+    prepare_remote_plan(mirror, transport_factory=lambda target: remote)
     assert mirror.plan.has_remote_work
     execute_prepared(mirror)
     assert remote.lstat("fonts") is RemotePathType.DIRECTORY
@@ -1412,7 +1810,7 @@ def test_pending_recovery_remote_plan_and_cancel_are_strictly_read_only(
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(failed, allow_recovery=False, transport_factory=lambda target: remote)
+    prepare_remote_plan(failed, transport_factory=lambda target: remote)
     remote.fail_stage_upload = True
     with pytest.raises(DeployError, match="stage upload failure"):
         execute_prepared(failed)
@@ -1427,7 +1825,7 @@ def test_pending_recovery_remote_plan_and_cancel_are_strictly_read_only(
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: "no")
     assert cli.main(["--config", str(config_path), "--skip-build", "--recover"]) == 2
-    assert "deployment cancelled" in capsys.readouterr().err
+    assert "recovery cancelled" in capsys.readouterr().err
     assert remote.mutations == baseline
     assert any(path.startswith(".git-deploy/recovery/") for path in remote.files)
 
@@ -1464,8 +1862,7 @@ def test_workspace_hybrid_root_gate_precedes_build_and_combined_plan_shows_remot
     for item in prepared:
         prepare_remote_plan(
             item,
-            allow_recovery=True,
-            transport_factory=lambda target: remotes[target.remote_root.as_posix()],
+             transport_factory=lambda target: remotes[target.remote_root.as_posix()],
         )
     rendered = render_workspace_plan("dev", prepared)
     assert rendered.count("HYBRID Mapping") == 2
@@ -1507,8 +1904,7 @@ def test_workspace_hybrid_partial_failure_stops_then_rerun_converges(
     for item in first:
         prepare_remote_plan(
             item,
-            allow_recovery=True,
-            transport_factory=lambda target: remotes[target.remote_root.as_posix()],
+             transport_factory=lambda target: remotes[target.remote_root.as_posix()],
         )
     remotes["/srv/web"].fail_stage_publish_once = True
     with pytest.raises(DeployError, match="stage publish failure"):
@@ -1524,21 +1920,34 @@ def test_workspace_hybrid_partial_failure_stops_then_rerun_converges(
     )
     assert remotes["/srv/admin"].mutations == 0
 
-    _, recovery = prepare_workspace(workspace, None, full=False, skip_build=True)
-    for item in recovery:
+    _, blocked_view = prepare_workspace(workspace, None, full=False, skip_build=True)
+    for item in blocked_view:
         prepare_remote_plan(
             item,
-            allow_recovery=False,
             transport_factory=lambda target: remotes[target.remote_root.as_posix()],
         )
-    assert execute_workspace(recovery, recover_only=True) == ("web",)
+    rendered = render_workspace_plan("dev", blocked_view)
+    assert "Mode: RECOVERY" in rendered
+    assert "[web]" in rendered
+    assert "[api]" not in rendered
+    assert "[admin]" not in rendered
+    assert "UPLOAD [source]" not in rendered
+    for item in blocked_view:
+        item.close()
+
+    _, recovery = prepare_workspace_recovery(
+        workspace,
+        None,
+        transport_factory=lambda target: remotes[target.remote_root.as_posix()],
+    )
+    assert tuple(item.name for item in recovery) == ("web",)
+    assert execute_workspace_recovery(recovery) == ("web",)
 
     _, resumed = prepare_workspace(workspace, None, full=False, skip_build=True)
     for item in resumed:
         prepare_remote_plan(
             item,
-            allow_recovery=False,
-            transport_factory=lambda target: remotes[target.remote_root.as_posix()],
+             transport_factory=lambda target: remotes[target.remote_root.as_posix()],
         )
     assert execute_workspace(resumed) == ("api", "web", "admin")
     assert remotes["/srv/web"].files["assets/app.js"] == b"web"
@@ -1564,8 +1973,7 @@ def test_workspace_freshness_gate_checks_later_repositories_before_any_write(
     for item in prepared:
         prepare_remote_plan(
             item,
-            allow_recovery=False,
-            transport_factory=lambda target: remotes[target.remote_root.as_posix()],
+             transport_factory=lambda target: remotes[target.remote_root.as_posix()],
         )
     remotes["/srv/web"].directories.add("assets")
     remotes["/srv/web"].files["assets/out-of-band"] = b"unknown"
