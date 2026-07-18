@@ -8,18 +8,21 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from git_deploy.config import Config, TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
+    RECOVERY_SCHEMA,
     HybridRecoveryRecord,
     RecoveryPhase,
+    cleanup_committed_recovery,
     make_ownership,
     ownership_hash,
     ownership_path,
-    recovery_path,
+    reconcile_recovery,
+    recovery_command_hash,
     serialize_ownership,
     write_recovery,
 )
@@ -34,6 +37,7 @@ from git_deploy.planner import (
     Operation,
     UploadOperation,
     complete_remote_plan,
+    validate_remote_freshness,
 )
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
@@ -94,6 +98,7 @@ def execute_frozen_plan(
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
     prepared_transport: Transport | None = None,
+    recover_only: bool = False,
 ) -> None:
     """Execute already frozen bytes and commit only this project's successful state.
 
@@ -105,6 +110,7 @@ def execute_frozen_plan(
         verbose: Enable more frequent progress output.
         transport_factory: Optional fake/custom transport factory.
         connection_pool: Command-scoped Native OpenSSH connection pool.
+        recover_only: Execute only a reviewed pending Hybrid Recovery action.
 
     Returns:
         ``None`` after this project's remote operations and state commit succeed.
@@ -128,8 +134,9 @@ def execute_frozen_plan(
                 transport,
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
+                ensure_root=plan.hybrid is None,
             )
-        else:
+        elif plan.hybrid is None:
             # Remote planning is read-only; root creation remains a confirmed
             # execution mutation and therefore happens only at this point.
             transport.ensure_root()
@@ -144,6 +151,7 @@ def execute_frozen_plan(
                 transport,
                 progress,
                 verbose=verbose,
+                recover_only=recover_only,
             )
             return
         if not plan.operations:
@@ -182,6 +190,7 @@ def _execute_hybrid_plan(
     progress: ProgressReporter,
     *,
     verbose: bool,
+    recover_only: bool,
 ) -> None:
     """Execute one remote-complete Hybrid Plan with durable recovery phases.
 
@@ -193,6 +202,7 @@ def _execute_hybrid_plan(
         transport: Connected SFTP adapter reused for preflight and mutation.
         progress: Shared upload progress reporter.
         verbose: Whether to print command execution context.
+        recover_only: Whether this confirmed execution is restricted to Recovery.
 
     Returns:
         ``None`` after State commit and best-effort recovery cleanup.
@@ -201,6 +211,22 @@ def _execute_hybrid_plan(
     hybrid = plan.hybrid
     if hybrid is None or not hybrid.remote_complete or config.project_id is None:
         raise PlanError("hybrid deployment requires a complete remote ownership plan")
+    validate_remote_freshness(plan, config, transport)
+    if hybrid.recovery_records:
+        if not recover_only:
+            raise PlanError(
+                "pending Hybrid Recovery requires an explicit reviewed --recover run"
+            )
+        _execute_recovery_plan(
+            plan,
+            state_store,
+            transport,
+            verbose=verbose,
+        )
+        return
+    if recover_only:
+        raise PlanError("no pending Hybrid Recovery exists for this target")
+    transport.ensure_root()
     if not plan.has_remote_work:
         state_store.save(
             new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
@@ -253,17 +279,21 @@ def _execute_hybrid_plan(
         if transport.lstat(name) is not RemotePathType.MISSING
     )
     record = HybridRecoveryRecord(
-        1,
+        RECOVERY_SCHEMA,
         deployment_id,
         hybrid.local.mapping,
         plan.target_fingerprint,
         stage_root,
         backup_root,
         RecoveryPhase.PREPARED,
-        ownership_hash(hybrid.ownership),
+        hybrid.expected_ownership_hash or ownership_hash(hybrid.ownership),
         ownership_hash(next_ownership),
         mutation_names,
         old_existing_names,
+        command_hash=recovery_command_hash(
+            plan.target.after_deploy,
+            plan.target.command_timeout,
+        ),
     )
     for internal in (
         ".git-deploy",
@@ -283,6 +313,11 @@ def _execute_hybrid_plan(
         directory = directories[operation.name]
         staged_directory = f"{stage_root}/{operation.name}"
         transport.make_directory(staged_directory)
+        for relative in sorted(
+            directory.directories,
+            key=lambda path: (len(PurePosixPath(path).parts), path),
+        ):
+            transport.make_directory(f"{staged_directory}/{relative}")
         for relative in directory.files:
             final_path = f"{operation.name}/{relative}"
             staged_path = f"{staged_directory}/{relative}"
@@ -300,6 +335,8 @@ def _execute_hybrid_plan(
     write_recovery(transport, record)
     for operation in hybrid.operations:
         if isinstance(operation, HybridRootFileUpload):
+            record = record.starting(operation.path)
+            write_recovery(transport, record)
             _backup_current(transport, operation.path, backup_root)
             _upload_with_retry(
                 frozen[operation.path],
@@ -310,10 +347,14 @@ def _execute_hybrid_plan(
                 delay=config.deploy.retry_delay,
             )
         elif isinstance(operation, HybridDirectoryMirror):
+            record = record.starting(operation.name)
+            write_recovery(transport, record)
             _backup_current(transport, operation.name, backup_root)
             transport.rename_path(f"{stage_root}/{operation.name}", operation.name)
         elif isinstance(operation, (HybridRootFileDelete, HybridDirectoryDelete)):
             name = operation.path if isinstance(operation, HybridRootFileDelete) else operation.name
+            record = record.starting(name)
+            write_recovery(transport, record)
             _backup_current(transport, name, backup_root)
     if any(isinstance(item, HybridOwnershipUpdate) for item in hybrid.operations):
         transport.write_file_atomic(
@@ -331,14 +372,70 @@ def _execute_hybrid_plan(
     record = record.with_phase(RecoveryPhase.STATE_COMPLETE)
     write_recovery(transport, record)
     try:
-        transport.remove_tree(stage_root)
-        transport.remove_tree(backup_root)
-        record = record.with_phase(RecoveryPhase.CLEANUP_COMPLETE)
-        write_recovery(transport, record)
-        transport.remove_tree(recovery_path(deployment_id))
+        cleanup_committed_recovery(transport, record)
     except Exception as exc:
         print(
             f"WARNING: hybrid cleanup is pending and will resume next deployment: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _execute_recovery_plan(
+    plan: DeploymentPlan,
+    state_store: StateStore,
+    transport: Transport,
+    *,
+    verbose: bool,
+) -> None:
+    """Execute one explicitly reviewed Recovery without new deployment writes.
+
+    Args:
+        plan: Frozen recovery-only plan.
+        state_store: Local State store for conservative post-command advancement.
+        transport: Connected transport whose facts just passed freshness checks.
+        verbose: Whether to print remote command execution context.
+
+    Returns:
+        ``None`` after restore or committed command/state/cleanup continuation.
+    """
+
+    hybrid = plan.hybrid
+    if hybrid is None or len(hybrid.recovery_records) != 1:
+        raise PlanError("recovery execution requires exactly one reviewed record")
+    record = hybrid.recovery_records[0]
+    outcome = reconcile_recovery(transport, record)
+    if not outcome.ownership_committed:
+        print("Hybrid Recovery restored the pre-deployment remote state.")
+        return
+    current = record
+    if outcome.commands_pending:
+        _execute_after_deploy(plan, transport, verbose=verbose)
+        current = current.with_phase(RecoveryPhase.COMMANDS_COMPLETE)
+        write_recovery(transport, current)
+    if outcome.state_pending:
+        # Recovery records from v1.4.0 do not contain the original output hashes.
+        # Advancing with an empty output manifest is conservative: the next normal
+        # deployment re-uploads current outputs instead of trusting unknown hashes.
+        # The commit must come from committed Remote Ownership rather than today's
+        # HEAD, otherwise commits created after the interruption could be skipped.
+        if hybrid.ownership is None:
+            raise PlanError("committed hybrid recovery lacks Remote Ownership")
+        state_store.save(
+            new_state(
+                plan.target.name,
+                plan.target_fingerprint,
+                hybrid.ownership.last_commit,
+                {},
+            )
+        )
+        current = current.with_phase(RecoveryPhase.STATE_COMPLETE)
+        write_recovery(transport, current)
+    try:
+        cleanup_committed_recovery(transport, current)
+    except Exception as exc:
+        print(
+            f"WARNING: hybrid cleanup is pending and requires another --recover: {exc}",
             file=sys.stderr,
             flush=True,
         )
@@ -436,13 +533,30 @@ def _execute_after_deploy(
         print(f"REMOTE OK {marker}", flush=True)
 
 
-def _connect_with_retry(transport: Transport, *, attempts: int, delay: float) -> None:
-    """Connect and ensure the remote root with the configured retry policy."""
+def _connect_with_retry(
+    transport: Transport,
+    *,
+    attempts: int,
+    delay: float,
+    ensure_root: bool = True,
+) -> None:
+    """Connect and optionally ensure the remote root with retry policy.
+
+    Args:
+        transport: Adapter to connect or reconnect.
+        attempts: Maximum connection attempts.
+        delay: Delay between failed attempts in seconds.
+        ensure_root: Whether this post-confirmation call may create the root.
+
+    Returns:
+        ``None`` after connection and any requested root creation succeeds.
+    """
 
     for attempt in range(1, attempts + 1):
         try:
             transport.connect()
-            transport.ensure_root()
+            if ensure_root:
+                transport.ensure_root()
             return
         except Exception as exc:
             transport.invalidate_connection()

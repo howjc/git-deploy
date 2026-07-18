@@ -142,11 +142,24 @@ def _inside_project(path: Path, project: Path, label: str) -> Path:
 
 
 def _validate_relative(value: str) -> None:
-    """Reject traversal or control characters in one source-relative path."""
+    """Reject protected or unstable paths before they enter the Hybrid view."""
 
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or any(
-        ord(character) < 32 or character == "\x7f" for character in value
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or path.parts[0] in {".git", ".deploy", ".git-deploy"}
+        or any(
+            not part
+            or part != part.strip()
+            or any(
+                ord(character) < 32
+                or character == "\x7f"
+                or (character.isspace() and character != " ")
+                for character in part
+            )
+            for part in path.parts
+        )
     ):
         raise AggregationError(f"unsafe aggregate path: {value!r}")
 

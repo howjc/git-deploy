@@ -17,7 +17,12 @@ from git_deploy.git import GitRepository
 from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
 from git_deploy.planner import UploadOperation, render_hybrid_plan
-from git_deploy.prepared import PreparedDeployment, execute_prepared, prepare_project
+from git_deploy.prepared import (
+    PreparedDeployment,
+    execute_prepared,
+    prepare_project,
+    validate_prepared_freshness,
+)
 from git_deploy.transports import create_transport
 from git_deploy.transports.openssh_sftp import OpenSSHMaster, SSHConnectionPool
 
@@ -248,20 +253,34 @@ def execute_workspace(
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
+    recover_only: bool = False,
 ) -> tuple[str, ...]:
-    """Deploy repositories sequentially, sharing Native OpenSSH connections."""
+    """Deploy repositories sequentially after one all-project freshness gate."""
 
     pool = connection_pool or SSHConnectionPool()
     owns_pool = connection_pool is None
     completed: list[str] = []
     try:
-        for item in prepared:
+        selected = tuple(
+            item
+            for item in prepared
+            if not recover_only
+            or (item.plan.hybrid is not None and item.plan.hybrid.recovery_records)
+        )
+        if recover_only and not selected:
+            raise PlanError("no pending Hybrid Recovery exists in this workspace")
+        # Validate every selected repository before the first workspace write so
+        # a stale later repository cannot partially deploy earlier repositories.
+        for item in selected:
+            validate_prepared_freshness(item)
+        for item in selected:
             print(f"Deploying {item.name}...")
             execute_prepared(
                 item,
                 verbose=verbose,
                 transport_factory=transport_factory,
                 connection_pool=pool,
+                recover_only=recover_only,
             )
             completed.append(item.name)
         return tuple(completed)

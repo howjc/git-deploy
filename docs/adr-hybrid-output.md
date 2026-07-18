@@ -1,6 +1,6 @@
 # ADR：单 Hybrid Output 与远端所有权
 
-状态：Accepted for v1.4.0
+状态：Accepted；v1.4.1 安全边界修订
 
 日期：2026-07-17
 
@@ -28,7 +28,9 @@ v1.4.0 只增加一个受控模型：项目 Build 先把明确来源聚合到一
 
 Mirror Directory 先完整上传到 `.git-deploy/stage/<id>`，现有路径移动到 `.git-deploy/backup/<id>` 后再发布。`.git-deploy/recovery/<id>.json` 记录 Deployment ID、Mapping、Target Fingerprint、Stage/Backup、阶段和新旧 Ownership Hash。
 
-中断发生在 Ownership Commit 前时，下次普通部署恢复 Backup；Commit 后则保留新所有权并完成清理。无法证明新旧所有权 Hash 时 Fail Closed。它只恢复当前 Hybrid Swap，不是历史、回滚或发布事务系统。
+中断记录的发现与执行严格分离。普通部署、`--remote-plan` 和 Doctor 都只读报告；只有用户确认后的 `--recover` 才执行恢复，并在完成后退出，要求下一次普通部署重新读取事实和确认计划。
+
+中断发生在 Ownership Commit 前时恢复 Backup；Commit 后按持久阶段继续 `after_deploy`、Local State 和清理。命令采用至少一次语义；已记录完成的命令不会因 State/Cleanup 失败而重复。必要 Backup 缺失或无法证明新旧 Ownership Hash 时 Fail Closed 并保留 Recovery、Stage 和 Backup 现场。它只恢复当前 Hybrid Swap，不是历史、回滚或发布事务系统。
 
 SFTP 没有标准目录交换操作，Rename 之间存在短暂切换窗口；本方案不宣称严格零停机或跨多个目录的全局事务。
 
@@ -37,6 +39,8 @@ SFTP 没有标准目录交换操作，Rename 之间存在短暂切换窗口；�
 - `--dry-run`：执行 Build、扫描并冻结本地视图；远端连接、远端读写、命令和 State 写入均为零。
 - `--remote-plan`：在冻结后建立只读连接，读取 Ownership/Recovery 和路径类型，显示 Adoption/Delete/Stage 计划；上传、删除、Recovery 修复、Manifest/State 写入和 `after_deploy` 均为零。
 - 普通部署：远端 Preflight 后显示完整计划并确认，才创建 Root、Stage、Backup 与 Recovery。
+
+确认后的首个写操作前，执行端重新读取 Ownership 的原始字节 Hash，并重新 `lstat` 当前与历史全部受管直接路径。任一事实变化抛出 Stale Plan，且不得创建 Root、Stage、Backup、Recovery 或执行普通上传。Workspace 在任一仓写入前先复核全部选中仓库。
 
 ## 明确不做
 

@@ -12,6 +12,31 @@ from git_deploy.errors import DeployError
 ProgressCallback = Callable[[int, int | None], None]
 
 
+def is_stable_remote_component(value: str) -> bool:
+    """Return whether one name is stable across supported SFTP adapters.
+
+    Args:
+        value: One direct POSIX path component.
+
+    Returns:
+        ``True`` for visible names without traversal, separators, or edge spaces.
+    """
+
+    return bool(
+        value
+        and value not in {".", ".."}
+        and value == value.strip()
+        and "/" not in value
+        and "\\" not in value
+        and all(
+            ord(character) >= 32
+            and character != "\x7f"
+            and (character == " " or not character.isspace())
+            for character in value
+        )
+    )
+
+
 class RemotePathType(str, Enum):
     """Classify one remote path without following symbolic links."""
 

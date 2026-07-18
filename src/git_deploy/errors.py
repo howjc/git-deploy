@@ -35,3 +35,7 @@ class DeployError(GitDeployError):
     """Report a remote connection or file-operation failure."""
 
     exit_code = 5
+
+
+class StaleRemotePlanError(DeployError):
+    """Refuse writes when remote facts changed after the reviewed plan."""

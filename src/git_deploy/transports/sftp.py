@@ -17,7 +17,12 @@ import paramiko
 
 from git_deploy.config import TargetConfig, resolve_ssh_target
 from git_deploy.errors import ConfigError, DeployError
-from git_deploy.transports.base import ProgressCallback, RemotePathType, Transport
+from git_deploy.transports.base import (
+    ProgressCallback,
+    RemotePathType,
+    Transport,
+    is_stable_remote_component,
+)
 
 
 class SFTPTransport(Transport):
@@ -265,9 +270,12 @@ class SFTPTransport(Transport):
         if path_type is not RemotePathType.DIRECTORY:
             raise DeployError(f"remote path is not a directory: {remote_path}")
         try:
-            return tuple(sorted(self._require_sftp().listdir(self._absolute(remote_path))))
+            names = tuple(sorted(self._require_sftp().listdir(self._absolute(remote_path))))
         except OSError as exc:
             raise DeployError(f"cannot list remote directory {remote_path}: {exc}") from exc
+        if any(not is_stable_remote_component(name) for name in names):
+            raise DeployError(f"remote directory contains an unsafe name: {remote_path}")
+        return names
 
     def make_directory(self, remote_path: str, *, mode: int = 0o755) -> None:
         """Create a safe relative remote directory recursively."""

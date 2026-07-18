@@ -12,6 +12,7 @@ import subprocess
 from git_deploy.config import TargetConfig
 from git_deploy.errors import DeployError
 from git_deploy.transports.ftp import FTPTransport
+from git_deploy.transports.base import RemotePathType
 from git_deploy.transports.sftp import SFTPTransport, _resolve_ssh_settings
 
 
@@ -297,6 +298,26 @@ def test_sftp_failed_publish_attempts_backup_restore() -> None:
         transport._publish_temporary("/root/temp", "/root/file")
 
     assert any(call[1].endswith(".bak") and call[2] == "/root/file" for call in fake.calls)
+
+
+@pytest.mark.parametrize("unsafe_name", [" leading", "trailing ", "tab\tname"])
+def test_paramiko_listing_rejects_unstable_remote_names(unsafe_name: str) -> None:
+    """Paramiko listings use the same fail-closed component boundary as Native."""
+
+    class ListingSFTP:
+        """Expose one unsafe name through Paramiko's listdir API."""
+
+        def listdir(self, path: str) -> list[str]:
+            """Return the configured unsafe direct child."""
+
+            return [unsafe_name]
+
+    transport = SFTPTransport(sftp_target())
+    transport.sftp = ListingSFTP()  # type: ignore[assignment]
+    transport.lstat = lambda remote_path: RemotePathType.DIRECTORY  # type: ignore[method-assign]
+
+    with pytest.raises(DeployError, match="unsafe name"):
+        transport.list_directory("assets")
 
 
 def test_ftp_missing_delete_is_idempotent() -> None:
