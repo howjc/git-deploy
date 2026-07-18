@@ -22,7 +22,7 @@ from git_deploy.lock import TargetLock
 from git_deploy.manifest import StateStore
 from git_deploy.planner import (
     DeploymentPlan,
-    RecoveryPlan,
+    ExplicitRecoveryPlan,
     complete_remote_plan,
     create_recovery_plan,
     create_plan,
@@ -72,7 +72,7 @@ class PreparedRecovery:
     name: str
     config: Config
     state_store: StateStore
-    plan: RecoveryPlan
+    plan: ExplicitRecoveryPlan
     transport: Transport
     _lock: TargetLock
     _closed: bool = False

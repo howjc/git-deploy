@@ -43,14 +43,15 @@ from git_deploy.hybrid import (
 from git_deploy.manifest import ManifestEntry, StateStore, hash_file, new_state
 from git_deploy.planner import (
     DeploymentPlan,
+    ExplicitRecoveryPlan,
     FTPHybridFileUpload,
+    FTPRecoveryPlan,
     HybridDirectoryDelete,
     HybridDirectoryMirror,
     HybridOwnershipUpdate,
     HybridRootFileDelete,
     HybridRootFileUpload,
     Operation,
-    RecoveryPlan,
     UploadOperation,
     complete_remote_plan,
     validate_recovery_freshness,
@@ -521,8 +522,23 @@ def _execute_ftp_hybrid_plan(
             next_state,
             ftp_plan.next_ownership.updated_at,
         )
-        _ensure_ftp_internal_directories(transport, deployment_id)
-        _write_ftp_pending(transport, pending)
+        try:
+            _ensure_ftp_internal_directories(transport, deployment_id)
+            _write_ftp_pending(transport, pending)
+        except BaseException as exc:
+            stage_root = f".git-deploy/ftp-hybrid/stage/{deployment_id}"
+            try:
+                transport.remove_tree(stage_root)
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "FTP Hybrid could not clean the Stage created before the initial "
+                    f"Pending write for deployment {deployment_id}: {cleanup_error}"
+                )
+            try:
+                transport.remove_directory(".git-deploy/ftp-hybrid/stage")
+            except BaseException:
+                pass
+            raise
     else:
         _ensure_ftp_internal_directories(transport, pending.deployment_id)
 
@@ -621,9 +637,7 @@ def _execute_ftp_hybrid_plan(
 
     if phase is FTPPendingPhase.STATE_COMPLETE:
         try:
-            transport.remove_tree(stage_root)
-            transport.remove_directory(".git-deploy/ftp-hybrid/stage")
-            transport.delete_typed(pending_path(hybrid.local.mapping))
+            _cleanup_ftp_hybrid_pending(transport, pending)
         except Exception as exc:
             print(
                 "WARNING: FTP Hybrid cleanup is pending; run Doctor and rerun the "
@@ -661,6 +675,31 @@ def _write_ftp_pending(transport: FTPTransport, pending: FTPHybridPending) -> No
         final_path=pending_path(pending.mapping),
         data=serialize_pending(pending),
     )
+
+
+def _cleanup_ftp_hybrid_pending(
+    transport: FTPTransport,
+    pending: FTPHybridPending,
+) -> None:
+    """Remove only the current Stage and marker, then best-effort the shared parent.
+
+    Args:
+        transport: Connected FTP adapter.
+        pending: Frozen marker identifying the deployment-owned Stage and mapping.
+
+    Returns:
+        ``None`` after current protected state is gone. Sibling Stages are preserved.
+    """
+
+    stage_root = f".git-deploy/ftp-hybrid/stage/{pending.deployment_id}"
+    transport.remove_tree(stage_root)
+    transport.delete_typed(pending_path(pending.mapping))
+    try:
+        transport.remove_directory(".git-deploy/ftp-hybrid/stage")
+    except Exception:
+        # A sibling Stage belongs to another or interrupted deployment. Its
+        # presence must not resurrect the marker that just completed.
+        pass
 
 
 def _stage_ftp_hybrid_file(
@@ -785,7 +824,7 @@ def _ftp_remote_record_hash(
 
 
 def execute_recovery_plan(
-    plan: RecoveryPlan,
+    plan: ExplicitRecoveryPlan,
     state_store: StateStore,
     transport: Transport,
     *,
@@ -803,6 +842,25 @@ def execute_recovery_plan(
         ``None`` after restore or committed command/state/cleanup continuation.
     """
 
+    if isinstance(plan, FTPRecoveryPlan):
+        if not isinstance(transport, FTPTransport):
+            raise PlanError("FTP Hybrid recovery requires FTPTransport semantics")
+        validate_recovery_freshness(plan, transport)
+        pending = plan.pending
+        if pending.phase is FTPPendingPhase.OWNERSHIP_COMMITTED:
+            state_store.save(pending.next_state)
+            pending = pending.with_phase(FTPPendingPhase.STATE_COMPLETE)
+            _write_ftp_pending(transport, pending)
+        try:
+            _cleanup_ftp_hybrid_pending(transport, pending)
+        except Exception as exc:
+            print(
+                "WARNING: FTP Hybrid cleanup is pending and requires another "
+                f"--recover: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return
     validate_recovery_freshness(plan, transport)
     record = plan.record
     outcome = reconcile_recovery(transport, record)

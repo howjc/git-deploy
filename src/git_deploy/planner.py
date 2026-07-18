@@ -192,6 +192,39 @@ class RecoveryPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class FTPRecoveryPlan:
+    """Contain only frozen post-commit FTP Pending facts required by ``--recover``."""
+
+    target: TargetConfig
+    target_fingerprint: str
+    project_id: str
+    mapping: str
+    remote: str
+    expected_ownership_hash: str
+    pending: FTPHybridPending
+
+    @property
+    def record(self) -> FTPHybridPending:
+        """Return the Pending marker through the shared recovery-plan interface."""
+
+        return self.pending
+
+    @property
+    def outcome(self) -> HybridRecoveryOutcome:
+        """Describe frozen-State and cleanup work for generic CLI summaries."""
+
+        return HybridRecoveryOutcome(
+            ownership_committed=True,
+            commands_pending=False,
+            state_pending=self.pending.phase is FTPPendingPhase.OWNERSHIP_COMMITTED,
+            cleanup_pending=True,
+        )
+
+
+ExplicitRecoveryPlan = RecoveryPlan | FTPRecoveryPlan
+
+
+@dataclass(frozen=True, slots=True)
 class DeploymentPlan:
     """Contain deterministic operations and the next complete local state inputs."""
 
@@ -839,7 +872,7 @@ def create_recovery_plan(
     config: Config,
     target: TargetConfig,
     transport: Transport,
-) -> RecoveryPlan | None:
+) -> ExplicitRecoveryPlan | None:
     """Read one Recovery without building, scanning outputs, or loading State.
 
     Args:
@@ -854,16 +887,57 @@ def create_recovery_plan(
     hybrid_outputs = tuple(output for output in config.outputs if output.mode == "hybrid")
     if not hybrid_outputs:
         return None
-    if target.protocol == "ftp":
-        raise PlanError(
-            "FTP Hybrid uses automatic Forward Resume during a normal reviewed deployment; "
-            "--recover is only for SFTP Staged Hybrid"
-        )
     if len(hybrid_outputs) != 1 or config.project_id is None:
         raise PlanError("Hybrid recovery requires one mapping and a resolved project_id")
     output = hybrid_outputs[0]
     if output.name is None:
         raise PlanError("Hybrid recovery mapping is missing its validated name")
+    if target.protocol == "ftp":
+        if not isinstance(transport, FTPTransport):
+            raise PlanError("FTP Hybrid recovery requires FTPTransport semantics")
+        if target.runtime_dir is None:
+            raise PlanError("FTP Hybrid recovery lacks a Git runtime directory")
+        load_capability_profile(
+            target.runtime_dir,
+            target,
+            server_banner_hash=transport.server_banner_hash(),
+        )
+        _, ownership_snapshot = read_ownership_snapshot(
+            transport,
+            project_id=config.project_id,
+            mapping=output.name,
+            remote=output.remote.as_posix(),
+        )
+        pending = read_pending(
+            transport,
+            project_id=config.project_id,
+            mapping=output.name,
+            remote=output.remote.as_posix(),
+            target=target,
+        )
+        if pending is None:
+            return None
+        if pending.phase not in {
+            FTPPendingPhase.OWNERSHIP_COMMITTED,
+            FTPPendingPhase.STATE_COMPLETE,
+        }:
+            raise PlanError(
+                "FTP Hybrid Pending still requires frozen local files; rerun the normal "
+                "deployment instead of --recover"
+            )
+        validate_pending_resume(
+            pending,
+            current_ownership_hash=ownership_snapshot,
+        )
+        return FTPRecoveryPlan(
+            target,
+            target.fingerprint,
+            config.project_id,
+            output.name,
+            output.remote.as_posix(),
+            ownership_snapshot,
+            pending,
+        )
     validate_internal_paths(transport)
     records = read_recovery_records(
         transport,
@@ -904,7 +978,7 @@ def create_recovery_plan(
     )
 
 
-def render_recovery_plan(plan: RecoveryPlan) -> str:
+def render_recovery_plan(plan: ExplicitRecoveryPlan) -> str:
     """Render only actions that explicit recovery will actually execute.
 
     Args:
@@ -914,6 +988,22 @@ def render_recovery_plan(plan: RecoveryPlan) -> str:
         Human-readable target, phase action, commands, and exact summary.
     """
 
+    if isinstance(plan, FTPRecoveryPlan):
+        action = (
+            "SAVE FROZEN STATE + CLEANUP"
+            if plan.pending.phase is FTPPendingPhase.OWNERSHIP_COMMITTED
+            else "CLEANUP"
+        )
+        lines = [
+            f"Target: {plan.target.name} "
+            f"({plan.target.protocol}://{plan.target.host}{plan.target.remote_root})",
+            "Mode: RECOVERY",
+            f"RECOVER [{plan.pending.phase.value.lower()}] "
+            f"{plan.pending.deployment_id} {action}",
+            "Summary: 1 recovery action(s), 0 pending command(s), "
+            f"state={'yes' if plan.outcome.state_pending else 'no'}, cleanup=yes",
+        ]
+        return "\n".join(lines)
     action = _recovery_action(plan.record, plan.outcome)
     lines = [
         f"Target: {plan.target.name} "
@@ -1229,6 +1319,7 @@ def _validate_ftp_remote_freshness(
         raise PlanError("FTP Hybrid freshness requires a remote-complete FTP plan")
     if plan.target.runtime_dir is None:
         raise PlanError("FTP Hybrid freshness lacks a Git runtime directory")
+    transport.refresh_remote_metadata()
     profile = load_capability_profile(
         plan.target.runtime_dir,
         plan.target,
@@ -1275,7 +1366,7 @@ def _validate_ftp_remote_freshness(
 
 
 def validate_recovery_freshness(
-    plan: RecoveryPlan,
+    plan: ExplicitRecoveryPlan,
     transport: Transport,
 ) -> HybridRecoveryOutcome:
     """Revalidate one Recovery-only plan immediately before mutation.
@@ -1288,6 +1379,47 @@ def validate_recovery_freshness(
         Current outcome when record, Ownership, and phase facts are unchanged.
     """
 
+    if isinstance(plan, FTPRecoveryPlan):
+        if not isinstance(transport, FTPTransport):
+            raise PlanError("FTP Hybrid recovery freshness requires FTPTransport semantics")
+        if plan.target.runtime_dir is None:
+            raise PlanError("FTP Hybrid recovery freshness lacks a Git runtime directory")
+        load_capability_profile(
+            plan.target.runtime_dir,
+            plan.target,
+            server_banner_hash=transport.server_banner_hash(),
+        )
+        transport.refresh_remote_metadata()
+        _, ownership_snapshot = read_ownership_snapshot(
+            transport,
+            project_id=plan.project_id,
+            mapping=plan.mapping,
+            remote=plan.remote,
+        )
+        if ownership_snapshot != plan.expected_ownership_hash:
+            raise StaleRemotePlanError(
+                "FTP Hybrid Ownership changed after recovery approval; rerun and review"
+            )
+        pending = read_pending(
+            transport,
+            project_id=plan.project_id,
+            mapping=plan.mapping,
+            remote=plan.remote,
+            target=plan.target,
+        )
+        if pending is None:
+            raise StaleRemotePlanError(
+                "FTP Hybrid Pending disappeared after recovery approval; rerun and review"
+            )
+        if pending != plan.pending:
+            raise StaleRemotePlanError(
+                "FTP Hybrid Pending changed after recovery approval; rerun and review"
+            )
+        validate_pending_resume(
+            pending,
+            current_ownership_hash=ownership_snapshot,
+        )
+        return plan.outcome
     validate_internal_paths(transport)
     records = read_recovery_records(
         transport,

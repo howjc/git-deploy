@@ -6,6 +6,7 @@ import hashlib
 import json
 import stat
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -213,6 +214,7 @@ def scan_hybrid_output(output: OutputConfig) -> HybridLocalManifest:
         children = sorted(root.iterdir(), key=lambda path: path.name)
     except OSError as exc:
         raise PlanError(f"cannot scan hybrid output {root}: {exc}") from exc
+    _reject_portable_name_collisions(children, root)
     for child in children:
         _validate_direct_name(child.name, root)
         kind = child.lstat().st_mode
@@ -859,6 +861,7 @@ def _scan_hybrid_directory(root: Path) -> HybridDirectoryManifest:
             children = sorted(directory.iterdir(), key=lambda path: path.name)
         except OSError as exc:
             raise PlanError(f"cannot scan hybrid directory {directory}: {exc}") from exc
+        _reject_portable_name_collisions(children, directory)
         for child in children:
             mode = child.lstat().st_mode
             if stat.S_ISLNK(mode):
@@ -899,6 +902,29 @@ def _validate_direct_name(name: str, root: Path) -> None:
 
     if name in {".git", ".deploy", ".git-deploy"} or not _safe_component(name):
         raise PlanError(f"hybrid output has an unsafe direct child below {root}: {name!r}")
+
+
+def _reject_portable_name_collisions(children: list[Path], directory: Path) -> None:
+    """Reject sibling names that collide after NFC normalization and case folding.
+
+    Args:
+        children: Direct filesystem entries already listed for one directory.
+        directory: Parent path used in the actionable error message.
+
+    Returns:
+        ``None`` when every sibling has a portable distinct name.
+    """
+
+    seen: dict[str, str] = {}
+    for child in children:
+        key = unicodedata.normalize("NFC", child.name).casefold()
+        previous = seen.get(key)
+        if previous is not None:
+            raise PlanError(
+                "hybrid output contains names that collide after NFC normalization "
+                f"and case folding below {directory}: {previous!r}, {child.name!r}"
+            )
+        seen[key] = child.name
 
 
 def _safe_component(value: str) -> bool:

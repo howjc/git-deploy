@@ -21,6 +21,7 @@ from git_deploy.transports.base import RemotePathType
 from git_deploy.transports.ftp import FTPTransport
 
 FTP_HYBRID_SCHEMA = 1
+FTP_CAPABILITY_SCHEMA = 2
 MAX_CAPABILITY_PROFILE_BYTES = 64 * 1024
 MAX_PENDING_BYTES = 1024 * 1024
 MAX_SCAN_DEPTH = 64
@@ -34,6 +35,7 @@ class FTPHybridCapabilities:
     schema: int
     target_fingerprint: str
     server_banner_hash: str
+    case_sensitive_paths: bool
     mlsd: bool
     rename_cross_directory: bool
     rename_replace_file: bool
@@ -109,6 +111,7 @@ def serialize_capabilities(profile: FTPHybridCapabilities) -> bytes:
         "server_banner_hash": profile.server_banner_hash,
         "features": {
             "mlsd": profile.mlsd,
+            "case_sensitive_paths": profile.case_sensitive_paths,
             "retr": profile.retr,
             "rename_cross_directory": profile.rename_cross_directory,
             "rename_replace_file": profile.rename_replace_file,
@@ -129,6 +132,7 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
     features = raw.get("features")
     expected_features = {
         "mlsd",
+        "case_sensitive_paths",
         "retr",
         "rename_cross_directory",
         "rename_replace_file",
@@ -143,11 +147,16 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
             "features",
             "probed_at",
         }
-        or raw.get("schema") != FTP_HYBRID_SCHEMA
+        or raw.get("schema") != FTP_CAPABILITY_SCHEMA
         or not isinstance(features, dict)
         or set(features) != expected_features
         or not all(isinstance(features[name], bool) for name in expected_features)
     ):
+        if raw.get("schema") == 1:
+            raise PlanError(
+                "FTP Hybrid Capability Profile schema 1 does not prove path case semantics; "
+                "run Doctor --probe-ftp-hybrid again"
+            )
         raise PlanError("FTP Hybrid Capability Profile has an invalid schema")
     fingerprint = raw.get("target_fingerprint")
     banner_hash = raw.get("server_banner_hash")
@@ -162,9 +171,10 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
     ):
         raise PlanError("FTP Hybrid Capability Profile contains invalid identity fields")
     return FTPHybridCapabilities(
-        FTP_HYBRID_SCHEMA,
+        FTP_CAPABILITY_SCHEMA,
         fingerprint,
         cast(str, banner_hash),
+        features["case_sensitive_paths"],
         features["mlsd"],
         features["rename_cross_directory"],
         features["rename_replace_file"],
@@ -226,6 +236,7 @@ def load_capability_profile(
     if not all(
         (
             profile.mlsd,
+            profile.case_sensitive_paths,
             profile.rename_cross_directory,
             profile.rename_replace_file,
             profile.retr,
@@ -277,6 +288,43 @@ def probe_ftp_hybrid_capabilities(
         if transport.list_directory_typed(f"{probe_root}/empty"):
             raise DeployError("FTP MLSD did not report an empty probe directory")
 
+        case_root = f"{probe_root}/case"
+        upper_case = f"{case_root}/CaseProbe.bin"
+        lower_case = f"{case_root}/caseprobe.bin"
+        renamed_case = f"{case_root}/CASEPROBE.bin"
+        transport.make_directory(case_root)
+        transport.write_bytes(upper_case, b"upper-case-path")
+        transport.write_bytes(lower_case, b"lower-case-path")
+        case_entries = transport.list_directory_typed(
+            case_root,
+            allow_case_collisions=True,
+        )
+        case_names = tuple(item.path for item in case_entries)
+        if len(case_names) != 2 or set(case_names) != {"CaseProbe.bin", "caseprobe.bin"}:
+            raise DeployError(
+                "FTP Hybrid unsupported: remote filesystem is case-insensitive"
+            )
+        if transport.read_file(
+            upper_case,
+            max_bytes=15,
+            allow_case_collisions=True,
+        ) != b"upper-case-path":
+            raise DeployError("FTP case-sensitive path probe aliased the uppercase file")
+        if transport.read_file(
+            lower_case,
+            max_bytes=15,
+            allow_case_collisions=True,
+        ) != b"lower-case-path":
+            raise DeployError("FTP case-sensitive path probe aliased the lowercase file")
+        transport.delete_typed(upper_case, allow_case_collisions=True)
+        if transport.read_file(lower_case, max_bytes=15) != b"lower-case-path":
+            raise DeployError("FTP deleting one case variant affected the other file")
+        transport.rename_replace(lower_case, renamed_case)
+        if transport.lstat(lower_case) is not RemotePathType.MISSING:
+            raise DeployError("FTP case-only rename left the source name behind")
+        if transport.read_file(renamed_case, max_bytes=15) != b"lower-case-path":
+            raise DeployError("FTP case-only rename did not preserve content")
+
         cross_source = f"{probe_root}/a/cross.bin"
         cross_final = f"{probe_root}/b/cross.bin"
         transport.write_bytes(cross_source, b"cross-directory")
@@ -301,7 +349,6 @@ def probe_ftp_hybrid_capabilities(
     finally:
         try:
             transport.remove_tree(probe_root)
-            transport.remove_directory(".git-deploy/ftp-probe")
         except BaseException as cleanup_error:
             if primary_error is None:
                 raise DeployError(f"FTP capability probe cleanup failed: {cleanup_error}") from cleanup_error
@@ -309,10 +356,17 @@ def probe_ftp_hybrid_capabilities(
                 "FTP capability probe also failed to clean its protected temporary root: "
                 f"{cleanup_error}"
             )
+        try:
+            transport.remove_directory(".git-deploy/ftp-probe")
+        except BaseException:
+            # Sibling probes are protected state owned by another/older run. The
+            # shared parent is cosmetic and must never invalidate this probe.
+            pass
     return FTPHybridCapabilities(
-        FTP_HYBRID_SCHEMA,
+        FTP_CAPABILITY_SCHEMA,
         target.fingerprint,
         transport.server_banner_hash(),
+        True,
         True,
         True,
         True,
@@ -544,21 +598,57 @@ def parse_pending(
 def validate_pending_resume(
     pending: FTPHybridPending,
     *,
-    manifest_hash: str,
-    head: str,
+    manifest_hash: str | None = None,
+    head: str | None = None,
     current_ownership_hash: str,
 ) -> None:
-    """Fail closed unless Pending, current build, HEAD, and Ownership still agree."""
+    """Validate phase-sensitive local facts and the exact Ownership hash matrix."""
 
-    if pending.local_manifest_hash != manifest_hash:
-        raise PlanError("Pending Manifest does not match current local deployment view")
-    if pending.head != head:
-        raise PlanError("Pending HEAD does not match the current local deployment view")
-    if current_ownership_hash not in {
-        pending.previous_ownership_hash,
-        pending.next_ownership_hash,
-    }:
-        raise PlanError("Pending Ownership hash does not match old or new Ownership")
+    local_required = pending.phase in {
+        FTPPendingPhase.PREPARED,
+        FTPPendingPhase.FILES_PUBLISHED,
+        FTPPendingPhase.PRUNED,
+    }
+    if local_required:
+        if pending.local_manifest_hash != manifest_hash:
+            raise PlanError("Pending Manifest does not match current local deployment view")
+        if pending.head != head:
+            raise PlanError("Pending HEAD does not match the current local deployment view")
+    validate_pending_ownership_phase(pending, current_ownership_hash)
+
+
+def validate_pending_ownership_phase(
+    pending: FTPHybridPending,
+    current_ownership_hash: str,
+) -> None:
+    """Require the exact Ownership hash class permitted by one Pending phase.
+
+    Args:
+        pending: Validated Forward Resume marker.
+        current_ownership_hash: Hash of the current remote Ownership bytes.
+
+    Returns:
+        ``None`` when the state-machine phase and Ownership agree.
+    """
+
+    expected_hashes = {
+        FTPPendingPhase.PREPARED: {pending.previous_ownership_hash},
+        FTPPendingPhase.FILES_PUBLISHED: {pending.previous_ownership_hash},
+        FTPPendingPhase.PRUNED: {
+            pending.previous_ownership_hash,
+            pending.next_ownership_hash,
+        },
+        FTPPendingPhase.OWNERSHIP_COMMITTED: {pending.next_ownership_hash},
+        FTPPendingPhase.STATE_COMPLETE: {pending.next_ownership_hash},
+    }[pending.phase]
+    if current_ownership_hash not in expected_hashes:
+        expected = "previous or next" if len(expected_hashes) == 2 else (
+            "next" if pending.next_ownership_hash in expected_hashes else "previous"
+        )
+        raise PlanError(
+            "FTP Hybrid Pending Ownership is inconsistent with phase "
+            f"{pending.phase.value}: expected {expected} hash; manual inspection required"
+        )
 
 
 def scan_ftp_tree(
@@ -727,6 +817,7 @@ def _valid_sha256(value: object) -> bool:
 
 __all__ = [
     "FTP_HYBRID_SCHEMA",
+    "FTP_CAPABILITY_SCHEMA",
     "MAX_CAPABILITY_PROFILE_BYTES",
     "MAX_PENDING_BYTES",
     "MAX_SCAN_DEPTH",
@@ -749,4 +840,5 @@ __all__ = [
     "serialize_capabilities",
     "serialize_pending",
     "validate_pending_resume",
+    "validate_pending_ownership_phase",
 ]

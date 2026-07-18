@@ -13,7 +13,7 @@ import pytest
 from git_deploy.config import OutputConfig, TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.ftp_hybrid import (
-    FTP_HYBRID_SCHEMA,
+    FTP_CAPABILITY_SCHEMA,
     FTPHybridCapabilities,
     FTPHybridPending,
     FTPPendingPhase,
@@ -22,6 +22,7 @@ from git_deploy.ftp_hybrid import (
     local_manifest_hash,
     parse_capabilities,
     parse_pending,
+    probe_ftp_hybrid_capabilities,
     save_capability_profile,
     scan_ftp_tree,
     serialize_capabilities,
@@ -30,7 +31,8 @@ from git_deploy.ftp_hybrid import (
 )
 from git_deploy.hybrid import scan_hybrid_output
 from git_deploy.manifest import ManifestEntry, TargetState
-from git_deploy.transports.ftp import FTPTransport
+from git_deploy.transports.base import RemotePathType
+from git_deploy.transports.ftp import FTPRemoteEntry, FTPTransport
 
 
 def _target() -> TargetConfig:
@@ -65,9 +67,10 @@ def test_capability_profile_round_trip_atomic_store_and_staleness(tmp_path: Path
     target = _target()
     banner = "a" * 64
     profile = FTPHybridCapabilities(
-        FTP_HYBRID_SCHEMA,
+        FTP_CAPABILITY_SCHEMA,
         target.fingerprint,
         banner,
+        True,
         True,
         True,
         True,
@@ -95,9 +98,10 @@ def test_capability_profile_rejects_missing_feature_and_target_change(tmp_path: 
 
     target = _target()
     partial = FTPHybridCapabilities(
-        1,
+        FTP_CAPABILITY_SCHEMA,
         target.fingerprint,
         "c" * 64,
+        True,
         True,
         True,
         False,
@@ -113,6 +117,48 @@ def test_capability_profile_rejects_missing_feature_and_target_change(tmp_path: 
     changed = replace(target, port=2121)
     with pytest.raises(PlanError, match="missing"):
         load_capability_profile(tmp_path, changed, server_banner_hash="c" * 64)
+
+
+def test_schema_one_capability_profile_requires_a_new_probe(tmp_path: Path) -> None:
+    """v1.5.0 profiles cannot migrate without proving remote path semantics."""
+
+    target = _target()
+    legacy = {
+        "schema": 1,
+        "target_fingerprint": target.fingerprint,
+        "server_banner_hash": "a" * 64,
+        "features": {
+            "mlsd": True,
+            "retr": True,
+            "rename_cross_directory": True,
+            "rename_replace_file": True,
+            "delete_file": True,
+            "remove_directory": True,
+        },
+        "probed_at": 1,
+    }
+    with pytest.raises(PlanError, match="schema 1.*probe"):
+        parse_capabilities(json.dumps(legacy).encode())
+
+
+def test_local_hybrid_rejects_root_and_nested_casefold_collisions(tmp_path: Path) -> None:
+    """Local sibling names must remain portable before any remote connection."""
+
+    root = tmp_path / "aggregation"
+    root.mkdir()
+    (root / "Index.html").write_text("upper", encoding="utf-8")
+    (root / "index.html").write_text("lower", encoding="utf-8")
+    output = OutputConfig(root, PurePosixPath("."), name="frontend-root", mode="hybrid")
+    with pytest.raises(PlanError, match="collide.*Index.html.*index.html"):
+        scan_hybrid_output(output)
+
+    (root / "Index.html").unlink()
+    (root / "index.html").unlink()
+    (root / "assets").mkdir()
+    (root / "assets/App.js").write_text("upper", encoding="utf-8")
+    (root / "assets/app.js").write_text("lower", encoding="utf-8")
+    with pytest.raises(PlanError, match="collide.*App.js.*app.js"):
+        scan_hybrid_output(output)
 
 
 def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) -> None:
@@ -159,11 +205,25 @@ def test_pending_round_trip_phases_identity_and_resume_guards(tmp_path: Path) ->
         current_ownership_hash="1" * 64,
     )
     validate_pending_resume(
-        parsed,
+        parsed.with_phase(FTPPendingPhase.PRUNED),
         manifest_hash=manifest_hash,
         head="head-1",
         current_ownership_hash="2" * 64,
     )
+    validate_pending_resume(
+        parsed.with_phase(FTPPendingPhase.OWNERSHIP_COMMITTED),
+        manifest_hash="changed-local-view",
+        head="new-head",
+        current_ownership_hash="2" * 64,
+    )
+
+    with pytest.raises(PlanError, match="expected previous hash"):
+        validate_pending_resume(
+            parsed,
+            manifest_hash=manifest_hash,
+            head="head-1",
+            current_ownership_hash="2" * 64,
+        )
 
     with pytest.raises(PlanError, match="Manifest"):
         validate_pending_resume(
@@ -318,3 +378,111 @@ def test_typed_mlsd_permission_failure_is_not_missing_or_empty() -> None:
     transport.ftp = cast(Any, DeniedSession())
     with pytest.raises(DeployError, match="MLSD failed.*Permission denied"):
         transport.list_directory_typed(".")
+
+
+def test_typed_mlsd_rejects_casefold_collisions_and_refreshes_cache() -> None:
+    """Managed scans reject ambiguous names and explicit refresh sends a new MLSD."""
+
+    transport = FTPTransport(_target())
+    session = FakeMLSDSession()
+    session.listings["/root"] = [
+        ("App.js", {"type": "file", "size": "1"}),
+        ("app.js", {"type": "file", "size": "1"}),
+    ]
+    transport.ftp = cast(Any, session)
+    with pytest.raises(DeployError, match="colliding sibling names.*App.js.*app.js"):
+        transport.list_directory_typed(".")
+
+    session.listings["/root"] = [("assets", {"type": "dir"})]
+    assert transport.lstat("assets") is RemotePathType.DIRECTORY
+    session.listings["/root"] = [("assets", {"type": "file", "size": "0"})]
+    assert transport.lstat("assets") is RemotePathType.DIRECTORY
+    transport.refresh_remote_metadata()
+    assert transport.lstat("assets") is RemotePathType.FILE
+
+
+def test_case_insensitive_capability_probe_fails_closed() -> None:
+    """A server that aliases case variants never produces a capability profile."""
+
+    class CaseInsensitiveTransport:
+        """Model only the probe operations needed to expose case aliasing."""
+
+        def __init__(self) -> None:
+            """Create case-folded file storage and explicit directory names."""
+
+            self.files: dict[str, tuple[str, bytes]] = {}
+            self.directories: set[str] = set()
+
+        def features(self) -> frozenset[str]:
+            """Advertise MLSD so path semantics become the decisive gate."""
+
+            return frozenset({"MLSD"})
+
+        def make_directory(self, path: str, *, mode: int = 0o755) -> None:
+            """Record one directory using case-insensitive identity."""
+
+            del mode
+            self.directories.add(path.casefold())
+
+        def write_bytes(self, path: str, data: bytes) -> None:
+            """Overwrite aliases exactly as a case-insensitive server would."""
+
+            self.files[path.casefold()] = (PurePosixPath(path).name, data)
+
+        def read_file(
+            self,
+            path: str,
+            *,
+            max_bytes: int,
+            allow_case_collisions: bool = False,
+        ) -> bytes:
+            """Return the aliased file bytes within the requested bound."""
+
+            del allow_case_collisions
+            data = self.files[path.casefold()][1]
+            assert len(data) <= max_bytes
+            return data
+
+        def list_directory_typed(
+            self,
+            path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> tuple[FTPRemoteEntry, ...]:
+            """Return direct children with the last spelling written."""
+
+            del allow_case_collisions
+            prefix = path.rstrip("/") + "/"
+            names: dict[str, FTPRemoteEntry] = {}
+            for directory in self.directories:
+                if directory.startswith(prefix.casefold()):
+                    relative = directory[len(prefix) :]
+                    if relative and "/" not in relative:
+                        names[relative] = FTPRemoteEntry(
+                            relative, RemotePathType.DIRECTORY, None, None
+                        )
+            for key, (name, data) in self.files.items():
+                if key.startswith(prefix.casefold()) and "/" not in key[len(prefix) :]:
+                    names[name.casefold()] = FTPRemoteEntry(
+                        name, RemotePathType.FILE, len(data), None
+                    )
+            return tuple(names.values())
+
+        def remove_tree(self, path: str) -> None:
+            """Remove the current random probe root during finally cleanup."""
+
+            prefix = path.casefold().rstrip("/")
+            self.files = {
+                key: value for key, value in self.files.items() if not key.startswith(prefix)
+            }
+            self.directories = {
+                value for value in self.directories if not value.startswith(prefix)
+            }
+
+        def remove_directory(self, path: str) -> None:
+            """Best-effort-remove one empty shared directory."""
+
+            self.directories.discard(path.casefold())
+
+    with pytest.raises(DeployError, match="case-insensitive"):
+        probe_ftp_hybrid_capabilities(cast(Any, CaseInsensitiveTransport()), _target())

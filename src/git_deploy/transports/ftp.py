@@ -6,6 +6,7 @@ import ftplib
 import hashlib
 import io
 import os
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -216,11 +217,18 @@ class FTPTransport(Transport):
         self._features = frozenset(features)
         return self._features
 
-    def lstat(self, remote_path: str) -> RemotePathType:
+    def lstat(
+        self,
+        remote_path: str,
+        *,
+        allow_case_collisions: bool = False,
+    ) -> RemotePathType:
         """Classify one FTP path only from MLSD facts without LIST/NLST guessing.
 
         Args:
             remote_path: Safe relative path below the configured root.
+            allow_case_collisions: Permit colliding siblings only during the
+                explicit path-semantics capability probe.
 
         Returns:
             Explicit file, directory, or confirmed missing type.
@@ -235,7 +243,13 @@ class FTPTransport(Transport):
         for index, component in enumerate(path.parts):
             if component == ".":
                 continue
-            entries = {item.path: item for item in self.list_directory_typed(current)}
+            entries = {
+                item.path: item
+                for item in self.list_directory_typed(
+                    current,
+                    allow_case_collisions=allow_case_collisions,
+                )
+            }
             entry = entries.get(component)
             if entry is None:
                 return RemotePathType.MISSING
@@ -244,11 +258,18 @@ class FTPTransport(Transport):
             current = component if current == "." else f"{current}/{component}"
         return entry.kind
 
-    def list_directory_typed(self, remote_path: str) -> tuple[FTPRemoteEntry, ...]:
+    def list_directory_typed(
+        self,
+        remote_path: str,
+        *,
+        allow_case_collisions: bool = False,
+    ) -> tuple[FTPRemoteEntry, ...]:
         """Return one MLSD directory listing with strict names and types.
 
         Args:
             remote_path: Safe relative directory below the configured root.
+            allow_case_collisions: Permit colliding names only for the explicit
+                filesystem-semantics capability probe.
 
         Returns:
             Stable direct children; cdir/pdir pseudo entries are omitted.
@@ -257,6 +278,8 @@ class FTPTransport(Transport):
         absolute = self._absolute(remote_path)
         cached = self._typed_entries.get(absolute)
         if cached is not None:
+            if not allow_case_collisions:
+                _reject_ftp_name_collisions(cached, remote_path)
             return cached
         try:
             raw_entries = tuple(self._require_ftp().mlsd(absolute))
@@ -288,15 +311,34 @@ class FTPTransport(Transport):
                 raise DeployError(f"FTP MLSD returned invalid size for {name!r}")
             entries.append(FTPRemoteEntry(name, kind, size, facts.get("modify")))
         result = tuple(sorted(entries, key=lambda item: item.path))
+        if not allow_case_collisions:
+            _reject_ftp_name_collisions(result, remote_path)
         self._typed_entries[absolute] = result
         return result
 
-    def read_file(self, remote_path: str, *, max_bytes: int) -> bytes:
+    def refresh_remote_metadata(self) -> None:
+        """Discard every cached remote listing before a freshness gate.
+
+        Returns:
+            ``None`` after typed MLSD, NLST, and confirmed-missing caches clear.
+        """
+
+        self._clear_remote_caches()
+
+    def read_file(
+        self,
+        remote_path: str,
+        *,
+        max_bytes: int,
+        allow_case_collisions: bool = False,
+    ) -> bytes:
         """Read a bounded FTP regular file in binary mode.
 
         Args:
             remote_path: Safe relative file below the configured root.
             max_bytes: Strict maximum accepted byte count.
+            allow_case_collisions: Permit the two deliberate case variants used
+                by the explicit path-semantics capability probe.
 
         Returns:
             Exact bytes when the MLSD type is File and the bound is respected.
@@ -304,7 +346,10 @@ class FTPTransport(Transport):
 
         if max_bytes < 0:
             raise DeployError("FTP read max_bytes must be non-negative")
-        kind = self.lstat(remote_path)
+        kind = self.lstat(
+            remote_path,
+            allow_case_collisions=allow_case_collisions,
+        )
         if kind is RemotePathType.MISSING:
             raise DeployError(f"FTP file is missing: {remote_path}")
         if kind is not RemotePathType.FILE:
@@ -362,10 +407,18 @@ class FTPTransport(Transport):
             raise DeployError(f"FTP rename replace failed for {source} -> {destination}: {exc}") from exc
         self._clear_remote_caches()
 
-    def delete_typed(self, remote_path: str) -> None:
+    def delete_typed(
+        self,
+        remote_path: str,
+        *,
+        allow_case_collisions: bool = False,
+    ) -> None:
         """Idempotently delete a path proven by MLSD to be a regular file."""
 
-        kind = self.lstat(remote_path)
+        kind = self.lstat(
+            remote_path,
+            allow_case_collisions=allow_case_collisions,
+        )
         if kind is RemotePathType.MISSING:
             return
         if kind is not RemotePathType.FILE:
@@ -580,6 +633,32 @@ def _looks_like_access_denied(detail: str) -> bool:
         marker in normalized
         for marker in ("permission", "access denied", "not allowed", "not permitted", "forbidden")
     )
+
+
+def _reject_ftp_name_collisions(
+    entries: tuple[FTPRemoteEntry, ...],
+    remote_path: str,
+) -> None:
+    """Reject duplicate or non-portable sibling names returned by MLSD.
+
+    Args:
+        entries: Parsed direct MLSD children.
+        remote_path: Relative parent rendered in the diagnostic.
+
+    Returns:
+        ``None`` when every child is unique after NFC normalization and case folding.
+    """
+
+    seen: dict[str, str] = {}
+    for entry in entries:
+        key = unicodedata.normalize("NFC", entry.path).casefold()
+        previous = seen.get(key)
+        if previous is not None:
+            raise DeployError(
+                "FTP MLSD returned colliding sibling names below "
+                f"{remote_path!r}: {previous!r}, {entry.path!r}"
+            )
+        seen[key] = entry.path
 
 
 __all__ = ["FTPDirectoryProbe", "FTPPathProbeResult", "FTPRemoteEntry", "FTPTransport"]
