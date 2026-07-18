@@ -24,6 +24,7 @@ from git_deploy.planner import (
     render_recovery_plan,
 )
 from git_deploy.prepared import (
+    _reject_post_commit_ftp_pending,
     PreparedDeployment,
     PreparedRecovery,
     execute_prepared,
@@ -150,8 +151,9 @@ def prepare_workspace(
     *,
     full: bool,
     skip_build: bool,
+    check_post_commit_pending: bool = False,
 ) -> tuple[str, tuple[PreparedDeployment, ...]]:
-    """Prepare every repository before any remote connection can occur."""
+    """Preflight every repository, then build and freeze the whole workspace."""
 
     target, preflight = preflight_workspace(workspace, requested_target)
     prepared: list[PreparedDeployment] = []
@@ -161,10 +163,17 @@ def prepare_workspace(
         # later busy repository cannot waste or invalidate earlier preparation.
         for item in preflight:
             if item.target.runtime_dir is None:
-                raise PlanError("workspace deployment preflight lacks a Git runtime directory")
+                raise PlanError(
+                    "workspace deployment preflight lacks a Git runtime directory"
+                )
             lock = TargetLock(item.target.runtime_dir, target)
             lock.acquire()
             locks.append(lock)
+        if check_post_commit_pending:
+            # Complete every recovery-only FTP metadata check before the first
+            # workspace Build so a later repository cannot invalidate earlier work.
+            for item in preflight:
+                _reject_post_commit_ftp_pending(item.config, item.target)
         for index, item in enumerate(preflight):
             print(f"Preparing {item.repository.name}...")
             prepared.append(
@@ -177,6 +186,7 @@ def prepare_workspace(
                     prepared_config=item.config,
                     prepared_target=item.target,
                     prepared_lock=locks[index],
+                    check_post_commit_pending=False,
                 )
             )
             locks[index] = None

@@ -217,6 +217,21 @@ class FTPTransport(Transport):
         self._features = frozenset(features)
         return self._features
 
+    def enable_utf8(self) -> None:
+        """Require and activate RFC-style UTF-8 filename handling.
+
+        Returns:
+            ``None`` after the server accepts ``OPTS UTF8 ON``.
+        """
+
+        try:
+            response = self._require_ftp().sendcmd("OPTS UTF8 ON")
+        except ftplib.Error as exc:
+            raise DeployError(f"FTP OPTS UTF8 ON failed: {exc}") from exc
+        if not response.startswith("2"):
+            raise DeployError(f"FTP OPTS UTF8 ON was not accepted: {response}")
+        self._require_ftp().encoding = "utf-8"
+
     def lstat(
         self,
         remote_path: str,
@@ -436,15 +451,23 @@ class FTPTransport(Transport):
         self._mkdirs(self._absolute(remote_path))
         self._clear_remote_caches()
 
-    def remove_directory(self, remote_path: str) -> None:
+    def remove_directory(
+        self,
+        remote_path: str,
+        *,
+        allow_name_collisions: bool = False,
+    ) -> None:
         """Idempotently remove one MLSD-proven empty FTP directory."""
 
-        kind = self.lstat(remote_path)
+        kind = self.lstat(remote_path, allow_case_collisions=allow_name_collisions)
         if kind is RemotePathType.MISSING:
             return
         if kind is not RemotePathType.DIRECTORY:
             raise DeployError(f"FTP RMD target is not a directory: {remote_path}")
-        if self.list_directory_typed(remote_path):
+        if self.list_directory_typed(
+            remote_path,
+            allow_case_collisions=allow_name_collisions,
+        ):
             raise DeployError(f"FTP RMD target is not empty: {remote_path}")
         try:
             self._require_ftp().rmd(self._absolute(remote_path))
@@ -452,21 +475,29 @@ class FTPTransport(Transport):
             raise DeployError(f"FTP RMD failed for {remote_path}: {exc}") from exc
         self._clear_remote_caches()
 
-    def remove_tree(self, remote_path: str) -> None:
+    def remove_tree(
+        self,
+        remote_path: str,
+        *,
+        allow_name_collisions: bool = False,
+    ) -> None:
         """Remove one internal FTP tree using only typed MLSD traversal."""
 
-        kind = self.lstat(remote_path)
+        kind = self.lstat(remote_path, allow_case_collisions=allow_name_collisions)
         if kind is RemotePathType.MISSING:
             return
         if kind is RemotePathType.FILE:
-            self.delete_typed(remote_path)
+            self.delete_typed(remote_path, allow_case_collisions=allow_name_collisions)
             return
         if kind is not RemotePathType.DIRECTORY:
             raise DeployError(f"FTP tree has unsupported type: {remote_path}")
-        for entry in self.list_directory_typed(remote_path):
+        for entry in self.list_directory_typed(
+            remote_path,
+            allow_case_collisions=allow_name_collisions,
+        ):
             child = f"{remote_path}/{entry.path}"
-            self.remove_tree(child)
-        self.remove_directory(remote_path)
+            self.remove_tree(child, allow_name_collisions=allow_name_collisions)
+        self.remove_directory(remote_path, allow_name_collisions=allow_name_collisions)
 
     def close(self) -> None:
         """Quit cleanly when possible, otherwise close the socket."""

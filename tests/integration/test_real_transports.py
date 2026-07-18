@@ -514,6 +514,52 @@ retry_delay = 0
         execute_prepared(interrupted)
     pending_file = remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json"
     assert '"phase":"PREPARED"' in pending_file.read_text(encoding="utf-8")
+
+    # PREPARED is bound to both the prior State and non-Hybrid policy. Each
+    # mismatch must fail during read-only planning and preserve all remote bytes.
+    remote_snapshot = {
+        path.relative_to(remote_root).as_posix(): path.read_bytes()
+        for path in remote_root.rglob("*")
+        if path.is_file()
+    }
+    state_path = store.path_for("dev")
+    saved_state = state_path.read_bytes()
+    state_path.unlink()
+    missing_state = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    try:
+        with pytest.raises(PlanError, match="Pending non-Hybrid plan|previous State"):
+            prepare_remote_plan(missing_state)
+    finally:
+        missing_state.close()
+        state_path.write_bytes(saved_state)
+    assert remote_snapshot == {
+        path.relative_to(remote_root).as_posix(): path.read_bytes()
+        for path in remote_root.rglob("*")
+        if path.is_file()
+    }
+
+    original_config = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        original_config + '\n[source]\ninclude = ["**"]\nexclude = ["docs/**"]\n',
+        encoding="utf-8",
+    )
+    drifted = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    try:
+        with pytest.raises(PlanError, match="Pending non-Hybrid plan"):
+            prepare_remote_plan(drifted)
+    finally:
+        drifted.close()
+        config_path.write_text(original_config, encoding="utf-8")
+    assert remote_snapshot == {
+        path.relative_to(remote_root).as_posix(): path.read_bytes()
+        for path in remote_root.rglob("*")
+        if path.is_file()
+    }
+
     resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
     try:
         prepare_remote_plan(resumed)
@@ -605,6 +651,14 @@ retry_delay = 0
     resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
     try:
         prepare_remote_plan(resumed)
+        assert isinstance(resumed.transport, FTPTransport)
+
+        def forbid_regular_replay(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            """FILES_PUBLISHED recovery must not upload ordinary Source again."""
+
+            raise AssertionError("FILES_PUBLISHED replayed an upload")
+
+        cast(Any, resumed.transport).upload = forbid_regular_replay
         execute_prepared(resumed)
     finally:
         resumed.close()
@@ -690,6 +744,16 @@ retry_delay = 0
     with config_path.open("a", encoding="utf-8") as handle:
         handle.write('\n[build]\nsteps = ["definitely-missing-build-command"]\n')
     broken_config = load_config(config_path)
+    store.path_for("dev").write_text("not-json", encoding="utf-8")
+    with pytest.raises(PlanError, match="--recover"):
+        prepare_project(
+            "ftp-resume",
+            config_path,
+            None,
+            full=False,
+            skip_build=False,
+            check_post_commit_pending=True,
+        )
     cleanup_failure = prepare_recovery("ftp-resume", broken_config, None)
     assert cleanup_failure is not None
     assert isinstance(cleanup_failure.transport, FTPTransport)
@@ -712,6 +776,7 @@ retry_delay = 0
 
     (git_project / "after-state.txt").write_text("newer head\n", encoding="utf-8")
     commit_all(git_project, "continue after FTP State commit")
+    store.path_for("dev").unlink()
     cleaned = prepare_recovery("ftp-resume", broken_config, None)
     assert cleaned is not None
     try:
@@ -719,6 +784,9 @@ retry_delay = 0
     finally:
         cleaned.close()
     assert not pending_file.exists()
+    restored = store.load("dev")
+    assert restored is not None
+    assert restored.last_commit == frozen_commit.last_commit
     assert (remote_root / "assets/state.js").read_text(encoding="utf-8") == "state\n"
 
 

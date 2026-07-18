@@ -7,12 +7,14 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from git_deploy.config import load_config
-from git_deploy.deployer import execute_plan
+from git_deploy.deployer import execute_plan, execute_recovery_plan
 from git_deploy.errors import DeployError, PlanError
+from git_deploy.ftp_hybrid import FTP_PENDING_SCHEMA, FTPHybridPending, FTPPendingPhase
 from git_deploy.git import GitRepository
 from git_deploy.manifest import ManifestEntry, StateStore, TargetState
-from git_deploy.planner import create_plan
+from git_deploy.planner import FTPRecoveryPlan, create_plan
 from git_deploy.transports.base import ProgressCallback, Transport
+from git_deploy.transports.ftp import FTPTransport
 from tests.conftest import commit_all, write_config
 
 
@@ -349,6 +351,37 @@ def test_output_change_before_connect_fails_without_remote_or_state(git_project:
     assert store.load("dev") is None
 
 
+def test_source_freeze_verifies_planned_sha_and_size_before_connect(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupted Git export cannot enter the frozen upload set or reach transport."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    transport = FakeTransport()
+
+    def corrupt_export(_commit: str, _path: str, destination: Path) -> None:
+        """Write bytes that disagree with the plan's committed blob identity."""
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"corrupt")
+
+    monkeypatch.setattr(repository, "export_file", corrupt_export)
+    with pytest.raises(PlanError, match="source content does not match"):
+        execute_plan(
+            plan,
+            config,
+            repository,
+            store,
+            transport_factory=lambda target: transport,
+        )
+    assert transport.connects == 0
+    assert store.load("dev") is None
+
+
 def test_partial_failure_then_rerun_converges(git_project: Path) -> None:
     """A remote with an earlier partial upload converges when the unchanged plan is rerun."""
 
@@ -404,3 +437,132 @@ def test_delete_probe_error_keeps_state_and_delete_intent(git_project: Path) -> 
     assert store.load("dev") == old
     rerun = create_plan(config, target, repository, store.load("dev"), full=False)
     assert [operation.remote_path for operation in rerun.operations] == ["public/dist/old.js"]
+
+
+def test_state_complete_ftp_recovery_restores_frozen_state_on_empty_clone(
+    git_project: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-commit recovery always writes Pending State, even after phase advancement."""
+
+    config = load_config(write_config(git_project))
+    target = config.target(None)
+    ftp_target = target.__class__(
+        target.name,
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        target.remote_root,
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    frozen_state = TargetState(1, "dev", ftp_target.fingerprint, "frozen-head", 9, {})
+    pending = FTPHybridPending(
+        FTP_PENDING_SCHEMA,
+        "github.com/acme/project",
+        "frontend-root",
+        ".",
+        ftp_target.fingerprint,
+        "deployment-1",
+        FTPPendingPhase.STATE_COMPLETE,
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        frozen_state.last_commit,
+        frozen_state,
+        10,
+        "4" * 64,
+        "5" * 64,
+    )
+    plan = FTPRecoveryPlan(
+        ftp_target,
+        ftp_target.fingerprint,
+        pending.project_id,
+        pending.mapping,
+        pending.remote,
+        pending.next_ownership_hash,
+        pending,
+    )
+    store = StateStore(tmp_path)
+    transport = FTPTransport(ftp_target)
+    cleanup: list[FTPHybridPending] = []
+    monkeypatch.setattr("git_deploy.deployer.validate_recovery_freshness", lambda *args: None)
+    monkeypatch.setattr(
+        "git_deploy.deployer._cleanup_ftp_hybrid_pending",
+        lambda _transport, record: cleanup.append(record),
+    )
+
+    execute_recovery_plan(plan, store, transport, verbose=False)
+
+    assert store.load("dev") == frozen_state
+    assert cleanup == [pending]
+
+
+def test_ftp_recovery_state_save_failure_does_not_cleanup_pending(
+    git_project: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local State write error leaves the remote Pending marker untouched."""
+
+    config = load_config(write_config(git_project))
+    base = config.target(None)
+    target = base.__class__(
+        base.name,
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        base.remote_root,
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    state = TargetState(1, "dev", target.fingerprint, "frozen-head", 9, {})
+    pending = FTPHybridPending(
+        FTP_PENDING_SCHEMA,
+        "github.com/acme/project",
+        "frontend-root",
+        ".",
+        target.fingerprint,
+        "deployment-1",
+        FTPPendingPhase.STATE_COMPLETE,
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        state.last_commit,
+        state,
+        10,
+        "4" * 64,
+        "5" * 64,
+    )
+    plan = FTPRecoveryPlan(
+        target,
+        target.fingerprint,
+        pending.project_id,
+        pending.mapping,
+        pending.remote,
+        pending.next_ownership_hash,
+        pending,
+    )
+    store = StateStore(tmp_path)
+    transport = FTPTransport(target)
+    cleaned = False
+    monkeypatch.setattr("git_deploy.deployer.validate_recovery_freshness", lambda *args: None)
+
+    def fail_save(_state: TargetState) -> None:
+        """Simulate an atomic local State persistence failure."""
+
+        raise OSError("disk full")
+
+    def mark_cleanup(*_args: object) -> None:
+        """Record any unsafe cleanup attempt after the failed State write."""
+
+        nonlocal cleaned
+        cleaned = True
+
+    monkeypatch.setattr(store, "save", fail_save)
+    monkeypatch.setattr("git_deploy.deployer._cleanup_ftp_hybrid_pending", mark_cleanup)
+
+    with pytest.raises(OSError, match="disk full"):
+        execute_recovery_plan(plan, store, transport, verbose=False)
+    assert not cleaned

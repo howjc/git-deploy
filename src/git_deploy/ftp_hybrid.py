@@ -8,6 +8,7 @@ import os
 import secrets
 import tempfile
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -21,7 +22,8 @@ from git_deploy.transports.base import RemotePathType
 from git_deploy.transports.ftp import FTPTransport
 
 FTP_HYBRID_SCHEMA = 1
-FTP_CAPABILITY_SCHEMA = 2
+FTP_PENDING_SCHEMA = 2
+FTP_CAPABILITY_SCHEMA = 3
 MAX_CAPABILITY_PROFILE_BYTES = 64 * 1024
 MAX_PENDING_BYTES = 1024 * 1024
 MAX_SCAN_DEPTH = 64
@@ -43,6 +45,9 @@ class FTPHybridCapabilities:
     delete_file: bool
     remove_directory: bool
     probed_at: int
+    utf8: bool = False
+    unicode_paths: bool = False
+    normalization_preserving: bool = False
 
 
 class FTPPendingPhase(str, Enum):
@@ -72,6 +77,8 @@ class FTPHybridPending:
     head: str
     next_state: TargetState
     created_at: int
+    non_hybrid_plan_hash: str | None = None
+    previous_state_hash: str | None = None
 
     def with_phase(self, phase: FTPPendingPhase) -> FTPHybridPending:
         """Return a copy advanced to one durable execution phase."""
@@ -117,6 +124,9 @@ def serialize_capabilities(profile: FTPHybridCapabilities) -> bytes:
             "rename_replace_file": profile.rename_replace_file,
             "delete_file": profile.delete_file,
             "remove_directory": profile.remove_directory,
+            "utf8": profile.utf8,
+            "unicode_paths": profile.unicode_paths,
+            "normalization_preserving": profile.normalization_preserving,
         },
         "probed_at": profile.probed_at,
     }
@@ -138,9 +148,13 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
         "rename_replace_file",
         "delete_file",
         "remove_directory",
+        "utf8",
+        "unicode_paths",
+        "normalization_preserving",
     }
     if (
-        set(raw) != {
+        set(raw)
+        != {
             "schema",
             "target_fingerprint",
             "server_banner_hash",
@@ -152,9 +166,10 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
         or set(features) != expected_features
         or not all(isinstance(features[name], bool) for name in expected_features)
     ):
-        if raw.get("schema") == 1:
+        if raw.get("schema") in {1, 2}:
             raise PlanError(
-                "FTP Hybrid Capability Profile schema 1 does not prove path case semantics; "
+                "FTP Hybrid Capability Profile is obsolete and does not prove UTF-8 "
+                "normalization-preserving path semantics; "
                 "run Doctor --probe-ftp-hybrid again"
             )
         raise PlanError("FTP Hybrid Capability Profile has an invalid schema")
@@ -182,6 +197,9 @@ def parse_capabilities(data: bytes) -> FTPHybridCapabilities:
         features["delete_file"],
         features["remove_directory"],
         probed_at,
+        features["utf8"],
+        features["unicode_paths"],
+        features["normalization_preserving"],
     )
 
 
@@ -242,9 +260,14 @@ def load_capability_profile(
             profile.retr,
             profile.delete_file,
             profile.remove_directory,
+            profile.utf8,
+            profile.unicode_paths,
+            profile.normalization_preserving,
         )
     ):
-        raise PlanError("FTP Hybrid Capability Profile does not satisfy required capabilities")
+        raise PlanError(
+            "FTP Hybrid Capability Profile does not satisfy required capabilities"
+        )
     return profile
 
 
@@ -267,8 +290,12 @@ def probe_ftp_hybrid_capabilities(
 
     if target.protocol != "ftp":
         raise PlanError("FTP Hybrid capability probing requires an FTP target")
-    if "MLSD" not in transport.features():
+    features = transport.features()
+    if "MLSD" not in features:
         raise DeployError("FTP server does not advertise mandatory MLSD support")
+    if "UTF8" not in features:
+        raise DeployError("FTP server does not advertise mandatory UTF8 support")
+    transport.enable_utf8()
     probe_root = f".git-deploy/ftp-probe/{secrets.token_hex(16)}"
     primary_error: BaseException | None = None
     try:
@@ -325,6 +352,69 @@ def probe_ftp_hybrid_capabilities(
         if transport.read_file(renamed_case, max_bytes=15) != b"lower-case-path":
             raise DeployError("FTP case-only rename did not preserve content")
 
+        unicode_root = f"{probe_root}/unicode"
+        chinese_name = "部署-文件.txt"
+        renamed_chinese = "已发布-文件.txt"
+        nfc_name = "caf\u00e9.txt"
+        nfd_name = unicodedata.normalize("NFD", nfc_name)
+        transport.make_directory(unicode_root)
+        transport.write_bytes(f"{unicode_root}/{chinese_name}", b"chinese-name")
+        transport.write_bytes(f"{unicode_root}/{nfc_name}", b"nfc-name")
+        transport.write_bytes(f"{unicode_root}/{nfd_name}", b"nfd-name")
+        unicode_entries = transport.list_directory_typed(
+            unicode_root,
+            allow_case_collisions=True,
+        )
+        unicode_names = {item.path for item in unicode_entries}
+        if unicode_names != {chinese_name, nfc_name, nfd_name}:
+            raise DeployError(
+                "FTP Hybrid unsupported: MLSD did not preserve exact UTF-8 NFC/NFD names"
+            )
+        if (
+            transport.read_file(
+                f"{unicode_root}/{nfc_name}",
+                max_bytes=8,
+                allow_case_collisions=True,
+            )
+            != b"nfc-name"
+        ):
+            raise DeployError("FTP NFC path probe returned the wrong file")
+        if (
+            transport.read_file(
+                f"{unicode_root}/{nfd_name}",
+                max_bytes=8,
+                allow_case_collisions=True,
+            )
+            != b"nfd-name"
+        ):
+            raise DeployError("FTP NFD path probe returned the wrong file")
+        transport.delete_typed(
+            f"{unicode_root}/{nfd_name}",
+            allow_case_collisions=True,
+        )
+        if (
+            transport.read_file(f"{unicode_root}/{nfc_name}", max_bytes=8)
+            != b"nfc-name"
+        ):
+            raise DeployError("FTP deleting NFD path affected the NFC path")
+        transport.rename_replace(
+            f"{unicode_root}/{chinese_name}",
+            f"{unicode_root}/{renamed_chinese}",
+        )
+        if (
+            transport.lstat(f"{unicode_root}/{chinese_name}")
+            is not RemotePathType.MISSING
+        ):
+            raise DeployError("FTP Unicode rename left the source name behind")
+        if (
+            transport.read_file(
+                f"{unicode_root}/{renamed_chinese}",
+                max_bytes=12,
+            )
+            != b"chinese-name"
+        ):
+            raise DeployError("FTP Unicode rename did not preserve content")
+
         cross_source = f"{probe_root}/a/cross.bin"
         cross_final = f"{probe_root}/b/cross.bin"
         transport.write_bytes(cross_source, b"cross-directory")
@@ -348,10 +438,12 @@ def probe_ftp_hybrid_capabilities(
         raise
     finally:
         try:
-            transport.remove_tree(probe_root)
+            transport.remove_tree(probe_root, allow_name_collisions=True)
         except BaseException as cleanup_error:
             if primary_error is None:
-                raise DeployError(f"FTP capability probe cleanup failed: {cleanup_error}") from cleanup_error
+                raise DeployError(
+                    f"FTP capability probe cleanup failed: {cleanup_error}"
+                ) from cleanup_error
             primary_error.add_note(
                 "FTP capability probe also failed to clean its protected temporary root: "
                 f"{cleanup_error}"
@@ -374,6 +466,9 @@ def probe_ftp_hybrid_capabilities(
         True,
         True,
         int(time.time()) if now is None else now,
+        True,
+        True,
+        True,
     )
 
 
@@ -441,6 +536,9 @@ def serialize_pending(record: FTPHybridPending) -> bytes:
         },
         "created_at": record.created_at,
     }
+    if record.schema >= FTP_PENDING_SCHEMA:
+        payload["non_hybrid_plan_hash"] = record.non_hybrid_plan_hash
+        payload["previous_state_hash"] = record.previous_state_hash
     data = _json_bytes(payload)
     if len(data) > MAX_PENDING_BYTES:
         raise PlanError("FTP Hybrid Pending Marker exceeds its size limit")
@@ -528,7 +626,7 @@ def parse_pending(
     if len(data) > MAX_PENDING_BYTES:
         raise PlanError("FTP Hybrid Pending Marker exceeds its size limit")
     raw = _parse_json_object(data, "FTP Hybrid Pending Marker")
-    required = {
+    legacy_required = {
         "schema",
         "project_id",
         "mapping",
@@ -543,7 +641,13 @@ def parse_pending(
         "next_state",
         "created_at",
     }
-    if set(raw) != required or raw.get("schema") != FTP_HYBRID_SCHEMA:
+    schema = raw.get("schema")
+    required = (
+        legacy_required
+        if schema == FTP_HYBRID_SCHEMA
+        else legacy_required | {"non_hybrid_plan_hash", "previous_state_hash"}
+    )
+    if schema not in {FTP_HYBRID_SCHEMA, FTP_PENDING_SCHEMA} or set(raw) != required:
         raise PlanError("FTP Hybrid Pending Marker has an invalid schema")
     if (
         raw.get("project_id") != project_id
@@ -564,6 +668,10 @@ def parse_pending(
         raw.get("next_ownership_hash"),
         raw.get("local_manifest_hash"),
     )
+    contract_hashes = (
+        raw.get("non_hybrid_plan_hash"),
+        raw.get("previous_state_hash"),
+    )
     if (
         not isinstance(deployment_id, str)
         or not deployment_id
@@ -573,13 +681,19 @@ def parse_pending(
         or not isinstance(created_at, int)
         or isinstance(created_at, bool)
         or created_at < 0
+        or (
+            schema == FTP_PENDING_SCHEMA
+            and not all(_valid_sha256(value) for value in contract_hashes)
+        )
     ):
         raise PlanError("FTP Hybrid Pending Marker contains invalid deployment fields")
     next_state = _parse_pending_state(raw.get("next_state"), target)
     if next_state.last_commit != head:
-        raise PlanError("FTP Hybrid Pending Marker HEAD does not match its frozen State")
+        raise PlanError(
+            "FTP Hybrid Pending Marker HEAD does not match its frozen State"
+        )
     return FTPHybridPending(
-        FTP_HYBRID_SCHEMA,
+        cast(int, schema),
         project_id,
         mapping,
         remote,
@@ -592,6 +706,8 @@ def parse_pending(
         head,
         next_state,
         created_at,
+        cast(str, contract_hashes[0]) if schema == FTP_PENDING_SCHEMA else None,
+        cast(str, contract_hashes[1]) if schema == FTP_PENDING_SCHEMA else None,
     )
 
 
@@ -600,6 +716,8 @@ def validate_pending_resume(
     *,
     manifest_hash: str | None = None,
     head: str | None = None,
+    non_hybrid_plan_hash: str | None = None,
+    previous_state_hash: str | None = None,
     current_ownership_hash: str,
 ) -> None:
     """Validate phase-sensitive local facts and the exact Ownership hash matrix."""
@@ -610,10 +728,28 @@ def validate_pending_resume(
         FTPPendingPhase.PRUNED,
     }
     if local_required:
+        if pending.schema == FTP_HYBRID_SCHEMA:
+            raise PlanError(
+                "FTP Hybrid Pending schema 1 cannot safely resume before Ownership "
+                "commit; restore git-deploy v1.5.1 for inspection or remove the marker "
+                "only after a manual remote-state review"
+            )
         if pending.local_manifest_hash != manifest_hash:
-            raise PlanError("Pending Manifest does not match current local deployment view")
+            raise PlanError(
+                "Pending Manifest does not match current local deployment view"
+            )
         if pending.head != head:
-            raise PlanError("Pending HEAD does not match the current local deployment view")
+            raise PlanError(
+                "Pending HEAD does not match the current local deployment view"
+            )
+        if pending.non_hybrid_plan_hash != non_hybrid_plan_hash:
+            raise PlanError(
+                "Pending non-Hybrid plan does not match the current deployment"
+            )
+        if pending.previous_state_hash != previous_state_hash:
+            raise PlanError(
+                "Pending previous State does not match the current deployment"
+            )
     validate_pending_ownership_phase(pending, current_ownership_hash)
 
 
@@ -802,21 +938,25 @@ def _parse_json_object(data: bytes, label: str) -> dict[str, Any]:
 def _json_bytes(value: Any) -> bytes:
     """Return deterministic compact UTF-8 JSON bytes."""
 
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
 
 
 def _valid_sha256(value: object) -> bool:
     """Return whether a value is one lowercase SHA256 digest."""
 
-    return isinstance(value, str) and len(value) == 64 and all(
-        character in "0123456789abcdef" for character in value
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 
 __all__ = [
     "FTP_HYBRID_SCHEMA",
+    "FTP_PENDING_SCHEMA",
     "FTP_CAPABILITY_SCHEMA",
     "MAX_CAPABILITY_PROFILE_BYTES",
     "MAX_PENDING_BYTES",

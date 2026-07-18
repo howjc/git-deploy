@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 
@@ -11,7 +12,13 @@ from git_deploy.config import load_config
 from git_deploy.errors import PlanError
 from git_deploy.git import GitRepository
 from git_deploy.manifest import ManifestEntry, TargetState
-from git_deploy.planner import DeleteOperation, UploadOperation, create_plan, render_plan
+from git_deploy.planner import (
+    DeleteOperation,
+    UploadOperation,
+    create_plan,
+    deployment_contract_hash,
+    render_plan,
+)
 from tests.conftest import commit_all, write_config
 
 
@@ -339,3 +346,67 @@ remote_root = "/public_html"
     )
     with pytest.raises(PlanError, match="executable mode"):
         create_plan(ftp_config, ftp_config.target(None), repository, None, full=False)
+
+
+def test_plan_contract_hash_binds_content_policy_full_and_previous_state(
+    git_project: Path,
+) -> None:
+    """Stable resume identity covers exact bytes and every drift-sensitive policy."""
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    source = next(item for item in plan.operations if item.remote_path == "app.py")
+
+    assert isinstance(source, UploadOperation)
+    assert source.sha256 is not None
+    assert source.size == len(b"print('v1')\n")
+    assert plan.non_hybrid_plan_hash == deployment_contract_hash(plan, config)
+    assert len(plan.non_hybrid_plan_hash) == 64
+    assert len(plan.previous_state_hash) == 64
+    assert replace(plan, full=not plan.full).non_hybrid_plan_hash == plan.non_hybrid_plan_hash
+    assert (
+        deployment_contract_hash(replace(plan, full=not plan.full), config)
+        != plan.non_hybrid_plan_hash
+    )
+
+
+def test_ftp_hybrid_rejects_cross_owner_casefold_root_before_connection(
+    git_project: Path,
+) -> None:
+    """Source and Hybrid direct roots share one NFC-plus-casefold namespace."""
+
+    source = git_project / "Assets/app.js"
+    source.parent.mkdir()
+    source.write_text("source", encoding="utf-8")
+    commit_all(git_project, "add source root")
+    dist = git_project / "dist"
+    dist.mkdir()
+    (dist / "assets").write_text("hybrid", encoding="utf-8")
+    config = load_config(
+        write_config(
+            git_project,
+            """
+project_id = "github.com/acme/project"
+
+[source]
+include = ["**"]
+
+[[outputs]]
+name = "frontend-root"
+local = "dist"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+""",
+        )
+    )
+
+    with pytest.raises(PlanError, match="root namespace.*Assets.*assets"):
+        create_plan(config, config.target(None), GitRepository(git_project), None, full=False)
