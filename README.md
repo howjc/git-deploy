@@ -8,7 +8,7 @@
 git-deploy
 ```
 
-v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、History、Verify、通用 Recover 或 Rollback。`--recover` 只处理一个已审阅的 SFTP Staged Hybrid 中断记录；FTP In-place Hybrid 使用普通部署命令自动 Forward Resume。旧实现冻结在 `legacy/v0.3` 分支和 v0.3.x tags；v1 配置和 state 与旧版不兼容。
+v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、History、Verify、通用 Recover 或 Rollback。`--recover` 只处理一个已审阅的 Hybrid 中断记录：SFTP Staged Hybrid 处理可证明的恢复阶段，FTP In-place Hybrid 只处理已提交 Ownership 后的冻结 State/清理阶段。旧实现冻结在 `legacy/v0.3` 分支和 v0.3.x tags；v1 配置和 state 与旧版不兼容。
 
 ## 安装
 
@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.5.0/git_deploy-1.5.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.5.1/git_deploy-1.5.1-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -146,7 +146,7 @@ git-deploy doctor prod --probe-ftp-hybrid
 git-deploy doctor prod --probe-ftp-hybrid --yes
 ```
 
-Probe 只在 `.git-deploy/ftp-probe/<随机 ID>` 写入并清理临时内容，本地 Capability Profile 绑定 Target Fingerprint 与 Server Banner。服务器必须可靠支持 FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；缺少任一能力时 Fail Closed，不回退 LIST/NLST 类型猜测或直接覆盖上传。
+Probe 只在 `.git-deploy/ftp-probe/<随机 ID>` 写入并清理本次临时内容，本地 Capability Profile Schema 2 绑定 Target Fingerprint 与 Server Banner。服务器必须可靠支持大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；缺少任一能力时 Fail Closed，不回退 LIST/NLST 类型猜测或直接覆盖上传。v1.5.0 的 Profile Schema 1 必须重新 Probe，不能无证据迁移。
 
 无 Ownership Manifest 且当前同名路径已存在时，普通部署会拒绝。先人工审阅，再用 `--full` 只接管当前本地存在的同名路径；未知路径不会被 Adoption。Hybrid 固定要求 `remote = "."`、单 Mapping，并禁止显式 `delete_removed`、本地 Local Root 等于项目根目录、本地/远端符号链接和隐式所有权转移。路径组件必须可稳定枚举：拒绝首尾空格、Tab、控制字符和不可见空白；直接 `.git`、`.deploy`、`.git-deploy` 永远拒绝。
 
@@ -188,7 +188,7 @@ git-deploy prod --skip-build --yes
 git-deploy prod --full --yes
 ```
 
-`--dry-run` 默认仍执行构建，但不连接服务器、不写 State；FTP Hybrid 会提示使用 `--remote-plan` 获取精确孤儿列表。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读 Capability Profile、Ownership、Pending、MLSD 受管树和当前路径类型，完整显示 Adoption/Upload/Delete/RMD Plan，绝不 Probe、上传、删除、执行命令或写远端 Manifest/本地 State。`--recover` 只用于 SFTP Staged Hybrid 的独立 Recovery-only Prepare；FTP Pending 会在下一次普通 `--remote-plan` / 部署中严格验证 Local Manifest、HEAD 和 Ownership 后自动向前收敛。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
+`--dry-run` 默认仍执行构建，但不连接服务器、不写 State；FTP Hybrid 会提示使用 `--remote-plan` 获取精确孤儿列表。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读 Capability Profile、Ownership、Pending、MLSD 受管树和当前路径类型，完整显示 Adoption/Upload/Delete/RMD Plan，绝不 Probe、上传、删除、执行命令或写远端 Manifest/本地 State。FTP Pending 的 `PREPARED`、`FILES_PUBLISHED`、`PRUNED` 仍由普通部署在严格匹配 Local Manifest/HEAD 后向前收敛；`OWNERSHIP_COMMITTED`、`STATE_COMPLETE` 使用独立 `--recover`，不 Build、不读当前 State、不扫描本地 Hybrid，只保存 Marker 中冻结的 State 并清理本次 Stage/Marker。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
 
 只构建或诊断：
 
@@ -200,7 +200,7 @@ git-deploy doctor prod --create-root
 git-deploy doctor prod --probe-ftp-hybrid
 ```
 
-`doctor` 默认只读检查配置、Git、构建命令、Output、State、连接和远端根目录；Hybrid 还报告 `.deploy` Ignore、Local Root、Project ID、Ownership、Recovery、内部目录、Owned Path Type 与 Adoption。只有 `--create-root` 才允许创建缺失 Root。Native OpenSSH Doctor 会显示 backend、系统命令绝对路径、Alias 和解析后的 Endpoint，并提示认证可能触发当前 SSH Agent。
+`doctor` 默认只读检查配置、Git、构建命令、Output、State、连接和远端根目录；Hybrid 还报告 `.deploy` Ignore、Local Root、Project ID、Ownership、Recovery、内部目录、Owned Path Type 与 Adoption；FTP 额外报告 Pending/Ownership 阶段矩阵和不自动删除的 Orphan Stage。只有 `--create-root` 才允许创建缺失 Root。Native OpenSSH Doctor 会显示 backend、系统命令绝对路径、Alias 和解析后的 Endpoint，并提示认证可能触发当前 SSH Agent。
 
 新仓库可先生成无凭据模板：
 

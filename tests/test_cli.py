@@ -22,6 +22,10 @@ def test_help_exposes_only_lite_workflow(capsys: pytest.CaptureFixture[str]) -> 
     output = capsys.readouterr().out
     assert "build" in output
     assert "doctor" in output
+    assert "--probe-ftp-hybrid" in output
+    assert "replace the" in output
+    assert "local capability profile" in output
+    assert "--reprobe" not in output
     assert "rollback" not in output
     assert "bootstrap" not in output
 

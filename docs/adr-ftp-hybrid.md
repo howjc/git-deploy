@@ -1,6 +1,6 @@
 # ADR：FTP In-place Hybrid
 
-状态：Accepted；目标版本 v1.5.0
+状态：Accepted；v1.5.1 安全收口
 
 日期：2026-07-18
 
@@ -17,7 +17,7 @@
 - FTP 只提供 Forward Resume，不提供目录 Swap、旧目录树回滚或 `after_deploy`；
 - 两种 backend 继续复用 `.git-deploy/hybrid/<mapping>.json` Ownership Schema；未被 Ownership 或经验证 Pending 声明拥有的未知根目录内容永不接管或删除。
 
-FTP Hybrid 强制要求 FEAT/MLSD、二进制 STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD。能力必须由用户显式运行 `git-deploy doctor TARGET --probe-ftp-hybrid` 探测，并缓存绑定 Target Fingerprint 与 Server Banner 的本地 Capability Profile。普通部署和只读 `--remote-plan` 不得静默写 Probe。
+FTP Hybrid 强制要求大小写敏感路径、FEAT/MLSD、二进制 STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD。能力必须由用户显式运行 `git-deploy doctor TARGET --probe-ftp-hybrid` 探测，并缓存绑定 Target Fingerprint 与 Server Banner 的本地 Capability Profile Schema 2。Schema 1 没有路径语义证明，升级后必须重新 Probe。普通部署和只读 `--remote-plan` 不得静默写 Probe。
 
 ## 为什么不用 Incremental
 
@@ -29,7 +29,9 @@ FTP 没有跨服务器一致的目录原子替换、目录备份恢复和符号�
 
 ## Forward Resume
 
-`.git-deploy/ftp-hybrid/pending/<mapping>.json` 记录冻结的 Local Manifest、旧/新 Ownership Hash、下一份 Local State 与阶段：`PREPARED`、`FILES_PUBLISHED`、`PRUNED`、`OWNERSHIP_COMMITTED`、`STATE_COMPLETE`。重跑必须验证 Project、Mapping、Remote、Target Fingerprint、Ownership Hash、Local Manifest Hash 和 HEAD，验证通过后只向前收敛；Local Build 或 Ownership 不匹配时 Fail Closed。
+`.git-deploy/ftp-hybrid/pending/<mapping>.json` 记录冻结的 Local Manifest、旧/新 Ownership Hash、下一份 Local State 与阶段：`PREPARED`、`FILES_PUBLISHED`、`PRUNED`、`OWNERSHIP_COMMITTED`、`STATE_COMPLETE`。前三个阶段必须验证当前 Local Manifest、HEAD 和严格 Ownership Hash 矩阵；后两个阶段只接受 Next Ownership，并通过显式 `--recover` 保存 Marker 中冻结的 State/清理，不运行 Build、不读取当前 State、不扫描当前 Hybrid 输出。
+
+每次 Freshness Gate 必须先清空 FTP MLSD、NLST 和 Missing Cache。清理只强制删除当前 Deployment Stage 和 Pending Marker；共享 Stage Parent 仅 best-effort 删除，旧 Orphan Stage 不得阻断当前部署完成。Doctor 只读报告 Orphan，不静默删除。
 
 ## 类型变化与接管
 
@@ -52,4 +54,4 @@ FTP Rename Replace 无法保证 Planned-Missing 的最后一刻不覆盖。FTP H
 
 ## 明确不做
 
-FTP Directory Swap、FTP Rollback、FTP `after_deploy`、多发布器协调、多 Hybrid 同根、全根目录 Reconcile、LIST/NLST 类型猜测和不安全降级均不属于 v1.5.0。
+FTP Directory Swap、FTP Rollback、FTP `after_deploy`、多发布器协调、多 Hybrid 同根、全根目录 Reconcile、LIST/NLST 类型猜测和不安全降级均不属于当前范围。

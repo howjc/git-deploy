@@ -5,19 +5,24 @@ from __future__ import annotations
 import shlex
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
+
 from git_deploy.config import Config, TargetConfig, resolve_target_for_plan
+from git_deploy.errors import PlanError
 from git_deploy.ftp_hybrid import (
     load_capability_profile,
     probe_ftp_hybrid_capabilities,
     read_pending,
     save_capability_profile,
     scan_ftp_tree,
+    validate_pending_ownership_phase,
 )
 from git_deploy.git import GitRepository
 from git_deploy.hybrid import (
     HybridLocalManifest,
     inspect_recovery,
     read_ownership,
+    read_ownership_snapshot,
     read_recovery_records,
     scan_hybrid_output,
 )
@@ -228,8 +233,9 @@ def run_doctor(
                 results.append(
                     DoctorResult(
                         "FTP Server Features",
-                        profile.mlsd,
-                        "MLSD, RETR, cross-directory rename, rename replace, DELE, RMD",
+                        profile.mlsd and profile.case_sensitive_paths,
+                        "case-sensitive paths, MLSD, RETR, cross-directory rename, "
+                        "rename replace, DELE, RMD",
                     )
                 )
                 _append_ftp_hybrid_remote_results(
@@ -279,7 +285,7 @@ def _append_ftp_hybrid_remote_results(
         )
         if not internal_ok:
             return
-        ownership = read_ownership(
+        ownership, ownership_snapshot = read_ownership_snapshot(
             transport,
             project_id=project_id,
             mapping=mapping,
@@ -304,6 +310,52 @@ def _append_ftp_hybrid_remote_results(
                 "FTP Hybrid Pending Resume",
                 pending is None,
                 "none" if pending is None else f"pending: {pending.phase.value}",
+            )
+        )
+        if pending is not None:
+            try:
+                validate_pending_ownership_phase(pending, ownership_snapshot)
+            except PlanError as exc:
+                results.append(
+                    DoctorResult(
+                        "FTP Hybrid Pending Ownership Matrix",
+                        False,
+                        f"manual inspection required: {exc}",
+                    )
+                )
+            else:
+                results.append(
+                    DoctorResult(
+                        "FTP Hybrid Pending Ownership Matrix",
+                        True,
+                        f"consistent with {pending.phase.value}",
+                    )
+                )
+        stage_parent = ".git-deploy/ftp-hybrid/stage"
+        stage_type = transport.lstat(stage_parent)
+        orphan_details: list[str] = []
+        if stage_type is RemotePathType.DIRECTORY:
+            active_id = pending.deployment_id if pending is not None else None
+            for entry in transport.list_directory_typed(stage_parent):
+                if entry.path == active_id:
+                    continue
+                stage_path = f"{stage_parent}/{entry.path}"
+                if entry.kind is RemotePathType.DIRECTORY:
+                    tree = scan_ftp_tree(transport, stage_path)
+                    entry_count = len(tree.files) + len(tree.directories)
+                else:
+                    entry_count = 1
+                orphan_details.append(
+                    f"{entry.path} (age={_ftp_stage_age(entry.modify)}, "
+                    f"entries={entry_count})"
+                )
+        elif stage_type is not RemotePathType.MISSING:
+            orphan_details.append(f"stage-parent ({stage_type.value})")
+        results.append(
+            DoctorResult(
+                "FTP Hybrid Orphan Stage",
+                not orphan_details,
+                "none" if not orphan_details else ", ".join(orphan_details),
             )
         )
         if local_hybrid is None:
@@ -492,3 +544,25 @@ def _missing_build_commands(config: Config) -> tuple[str, ...]:
             if not available:
                 missing.append(command)
     return tuple(dict.fromkeys(missing))
+
+
+def _ftp_stage_age(modify: str | None) -> str:
+    """Render a conservative age for one optional MLSD ``modify`` timestamp.
+
+    Args:
+        modify: UTC ``YYYYMMDDhhmmss`` fact, optionally with fractional seconds.
+
+    Returns:
+        Whole seconds such as ``42s``, or ``unknown`` for absent/invalid facts.
+    """
+
+    if modify is None:
+        return "unknown"
+    try:
+        modified = datetime.strptime(modify.split(".", 1)[0], "%Y%m%d%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return "unknown"
+    seconds = max(0, int((datetime.now(timezone.utc) - modified).total_seconds()))
+    return f"{seconds}s"

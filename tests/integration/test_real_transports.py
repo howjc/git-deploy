@@ -18,6 +18,7 @@ from pyftpdlib.servers import FTPServer
 
 from git_deploy.config import TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.deployer import execute_plan
+from git_deploy.doctor import run_doctor
 from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError, StateError
 from git_deploy.ftp_hybrid import (
     probe_ftp_hybrid_capabilities,
@@ -32,6 +33,7 @@ from git_deploy.prepared import (
     prepare_project,
     prepare_recovery,
     prepare_remote_plan,
+    validate_prepared_freshness,
 )
 from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.openssh_sftp import OpenSSHSFTPTransport
@@ -210,6 +212,9 @@ def test_real_ftp_hybrid_capability_probe_supports_active_mode(
 
     root, port = ftp_server
     (root / "active-root").mkdir()
+    sibling = root / "active-root/.git-deploy/ftp-probe/older-probe"
+    sibling.mkdir(parents=True)
+    (sibling / "marker.bin").write_bytes(b"preserve")
     target = TargetConfig(
         "active",
         "ftp",
@@ -230,7 +235,8 @@ def test_real_ftp_hybrid_capability_probe_supports_active_mode(
         assert profile.mlsd
     finally:
         transport.close()
-    assert not (root / "active-root/.git-deploy/ftp-probe").exists()
+    assert (sibling / "marker.bin").read_bytes() == b"preserve"
+    assert len(tuple(sibling.parent.iterdir())) == 1
 
 
 def test_real_ftp_hybrid_probe_adoption_mirror_state_loss_and_cleanup(
@@ -311,6 +317,18 @@ remote_root = "/public_html/ftp-hybrid"
     assert (remote_root / ".env").read_text(encoding="utf-8") == "secret"
     assert (remote_root / "uploads/user.dat").read_text(encoding="utf-8") == "user"
     assert not (remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json").exists()
+
+    stale = prepare_project("ftp-hybrid", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(stale)
+        (remote_root / "assets/external.js").write_text("external", encoding="utf-8")
+        with pytest.raises(StaleRemotePlanError, match="managed tree changed"):
+            validate_prepared_freshness(stale)
+        assert not (remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json").exists()
+        assert (remote_root / "assets/external.js").read_text(encoding="utf-8") == "external"
+    finally:
+        stale.close()
+    (remote_root / "assets/external.js").unlink()
 
     local_app = git_project / ".deploy/frontend-root/assets/app.js"
     local_app.unlink()
@@ -408,6 +426,54 @@ retry_delay = 0
         initial.close()
 
     assets = git_project / ".deploy/frontend-root/assets"
+    (assets / "prepared-write.js").write_text("prepared\n", encoding="utf-8")
+    prepared_failure = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    prepare_remote_plan(prepared_failure)
+    assert isinstance(prepared_failure.transport, FTPTransport)
+    original_rename = prepared_failure.transport.rename_replace
+
+    def fail_initial_pending(source: str, destination: str) -> None:
+        """Fail the first PREPARED marker publish after its Stage exists."""
+
+        if destination == ".git-deploy/ftp-hybrid/pending/frontend-root.json":
+            raise DeployError("injected initial Pending write failure")
+        original_rename(source, destination)
+
+    cast(Any, prepared_failure.transport).rename_replace = fail_initial_pending
+    with pytest.raises(DeployError, match="initial Pending"):
+        execute_prepared(prepared_failure)
+    assert not (remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json").exists()
+    assert not (remote_root / ".git-deploy/ftp-hybrid/stage").exists()
+
+    resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    try:
+        prepare_remote_plan(resumed)
+        execute_prepared(resumed)
+    finally:
+        resumed.close()
+
+    orphan = remote_root / ".git-deploy/ftp-hybrid/stage/orphan-stage"
+    orphan.mkdir(parents=True)
+    (orphan / "left.bin").write_bytes(b"left")
+    (assets / "orphan-safe.js").write_text("orphan-safe\n", encoding="utf-8")
+    with_orphan = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    try:
+        prepare_remote_plan(with_orphan)
+        execute_prepared(with_orphan)
+    finally:
+        with_orphan.close()
+    assert (orphan / "left.bin").read_bytes() == b"left"
+    assert not (remote_root / ".git-deploy/ftp-hybrid/pending/frontend-root.json").exists()
+    doctor = run_doctor(config, config.target(None), repository, store)
+    orphan_result = next(item for item in doctor if item.name == "FTP Hybrid Orphan Stage")
+    assert not orphan_result.ok
+    assert "orphan-stage" in orphan_result.detail
+    assert "entries=1" in orphan_result.detail
+
     (assets / "reset.js").write_text("reset\n", encoding="utf-8")
     reset = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(reset)
@@ -588,6 +654,16 @@ retry_delay = 0
     with pytest.raises(DeployError, match="Ownership failure"):
         execute_prepared(ownership_failure)
     assert '"phase":"PRUNED"' in pending_file.read_text(encoding="utf-8")
+    pruned_review = prepare_project(
+        "ftp-resume", config_path, None, full=False, skip_build=True
+    )
+    prepare_remote_plan(pruned_review)
+    (remote_root / "assets/pruned-external.js").write_text("external", encoding="utf-8")
+    with pytest.raises(StaleRemotePlanError, match="managed tree changed"):
+        execute_prepared(pruned_review)
+    assert '"phase":"PRUNED"' in pending_file.read_text(encoding="utf-8")
+    assert (remote_root / "assets/pruned-external.js").exists()
+    (remote_root / "assets/pruned-external.js").unlink()
     resumed = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
     try:
         prepare_remote_plan(resumed)
@@ -608,8 +684,14 @@ retry_delay = 0
         execute_prepared(state_failure)
     assert '"phase":"OWNERSHIP_COMMITTED"' in pending_file.read_text(encoding="utf-8")
 
-    cleanup_failure = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
-    prepare_remote_plan(cleanup_failure)
+    (git_project / "after-ownership.txt").write_text("new head\n", encoding="utf-8")
+    commit_all(git_project, "continue after FTP Ownership commit")
+    shutil.rmtree(git_project / ".deploy")
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[build]\nsteps = ["definitely-missing-build-command"]\n')
+    broken_config = load_config(config_path)
+    cleanup_failure = prepare_recovery("ftp-resume", broken_config, None)
+    assert cleanup_failure is not None
     assert isinstance(cleanup_failure.transport, FTPTransport)
     original_remove_tree = cleanup_failure.transport.remove_tree
 
@@ -621,14 +703,19 @@ retry_delay = 0
         original_remove_tree(path)
 
     cast(Any, cleanup_failure.transport).remove_tree = fail_stage_cleanup
-    execute_prepared(cleanup_failure)
+    execute_prepared_recovery(cleanup_failure)
     assert '"phase":"STATE_COMPLETE"' in pending_file.read_text(encoding="utf-8")
     assert "cleanup is pending" in capsys.readouterr().err
+    frozen_commit = store.load("dev")
+    assert frozen_commit is not None
+    assert frozen_commit.last_commit != GitRepository(git_project).head()
 
-    cleaned = prepare_project("ftp-resume", config_path, None, full=False, skip_build=True)
+    (git_project / "after-state.txt").write_text("newer head\n", encoding="utf-8")
+    commit_all(git_project, "continue after FTP State commit")
+    cleaned = prepare_recovery("ftp-resume", broken_config, None)
+    assert cleaned is not None
     try:
-        prepare_remote_plan(cleaned)
-        execute_prepared(cleaned)
+        execute_prepared_recovery(cleaned)
     finally:
         cleaned.close()
     assert not pending_file.exists()

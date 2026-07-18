@@ -83,12 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--probe-ftp-hybrid",
         action="store_true",
-        help="allow doctor to create and remove FTP Hybrid capability probe files",
-    )
-    parser.add_argument(
-        "--reprobe",
-        action="store_true",
-        help="replace an existing FTP Hybrid capability profile during an explicit probe",
+        help=(
+            "allow doctor to create/remove FTP Hybrid probe files and replace the "
+            "local capability profile"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"git-deploy {__version__}")
     return parser
@@ -229,8 +227,8 @@ def _deploy_project(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
-    if args.probe_ftp_hybrid or args.reprobe:
-        raise ConfigError("--probe-ftp-hybrid and --reprobe are only valid with doctor")
+    if args.probe_ftp_hybrid:
+        raise ConfigError("--probe-ftp-hybrid is only valid with doctor")
     if args.recover and args.full:
         raise ConfigError("--recover does not accept --full")
     if args.recover:
@@ -320,8 +318,8 @@ def _deploy_workspace(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
-    if args.probe_ftp_hybrid or args.reprobe:
-        raise ConfigError("--probe-ftp-hybrid and --reprobe are only valid with doctor")
+    if args.probe_ftp_hybrid:
+        raise ConfigError("--probe-ftp-hybrid is only valid with doctor")
     if args.recover and args.full:
         raise ConfigError("--recover does not accept --full")
     if args.recover:
@@ -580,7 +578,6 @@ def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> Non
         or args.yes
         or args.create_root
         or args.probe_ftp_hybrid
-        or args.reprobe
     ):
         raise ConfigError("build does not accept deploy-only flags")
 
@@ -597,8 +594,6 @@ def _validate_doctor_args(args: argparse.Namespace) -> None:
         or (args.yes and not args.probe_ftp_hybrid)
     ):
         raise ConfigError("doctor does not accept deploy-only flags")
-    if args.reprobe and not args.probe_ftp_hybrid:
-        raise ConfigError("--reprobe requires --probe-ftp-hybrid")
 
 
 def _validate_init_args(args: argparse.Namespace) -> None:
@@ -616,7 +611,6 @@ def _validate_init_args(args: argparse.Namespace) -> None:
         or args.verbose
         or args.create_root
         or args.probe_ftp_hybrid
-        or args.reprobe
     ):
         raise ConfigError("init does not accept deploy or doctor flags")
 

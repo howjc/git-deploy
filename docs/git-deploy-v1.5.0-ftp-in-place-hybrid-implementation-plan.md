@@ -451,7 +451,7 @@ git-deploy doctor prod --probe-ftp-hybrid
 - Host/Port/Username/Root 变化；
 - Server Banner Hash 变化；
 - Capability Cache 损坏；
-- 明确传入 `--reprobe`；
+- 显式再次运行 `--probe-ftp-hybrid`（v1.5.1 已移除无独立语义的 `--reprobe`）；
 - 执行中出现能力不兼容错误。
 
 ---
