@@ -29,6 +29,7 @@ from git_deploy.prepared import (
     prepare_remote_plan,
 )
 from git_deploy.transports.ftp import FTPTransport
+from git_deploy.transports.openssh_sftp import OpenSSHSFTPTransport
 from git_deploy.transports.sftp import SFTPTransport
 from tests.conftest import commit_all, write_config
 
@@ -682,6 +683,7 @@ def test_real_native_openssh_hybrid_stage_swap_and_manifest_read(
     git_project: Path,
     sftp_server,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Native OpenSSH performs Hybrid Stage/Swap and rereads ownership through one master."""
 
@@ -767,6 +769,106 @@ remote_root = "/srv/application/hybrid-native"
         "/srv/application/hybrid-native/native-race/item",
     ) == "important"
     race.unlink()
+
+    last_moment = git_project / ".deploy/frontend-root/native-last-moment.txt"
+    last_moment.write_text("planned", encoding="utf-8")
+    ownership_path = (
+        "/srv/application/hybrid-native/.git-deploy/hybrid/frontend-root.json"
+    )
+    old_ownership = _docker("exec", container, "cat", ownership_path)
+    state_store = StateStore(GitRepository(git_project).common_dir())
+    old_state = state_store.path_for("dev").read_bytes()
+    raced = prepare_project(
+        "hybrid", git_project / "deploy.toml", None, full=False, skip_build=True
+    )
+    try:
+        prepare_remote_plan(raced)
+        assert isinstance(raced.transport, OpenSSHSFTPTransport)
+        master = raced.transport.master
+        assert master is not None
+        original_batch = master.run_batch
+        injected = False
+
+        def create_before_legacy_rename(
+            commands: tuple[str, ...],
+            *,
+            operation: str,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            """Create the real destination after lstat but before legacy rename."""
+
+            nonlocal injected
+            command = commands[0]
+            if (
+                not injected
+                and command.startswith("rename -l ")
+                and ".git-deploy/stage/" in command
+                and command.endswith(
+                    ' "/srv/application/hybrid-native/native-last-moment.txt"'
+                )
+            ):
+                injected = True
+                _docker(
+                    "exec",
+                    container,
+                    "sh",
+                    "-c",
+                    "printf last-moment-important > "
+                    "/srv/application/hybrid-native/native-last-moment.txt && "
+                    "chown deploy:deploy "
+                    "/srv/application/hybrid-native/native-last-moment.txt",
+                )
+            return original_batch(commands, operation=operation, check=check)
+
+        monkeypatch.setattr(master, "run_batch", create_before_legacy_rename)
+        with pytest.raises(
+            StaleRemotePlanError,
+            match="appeared during no-overwrite Hybrid publish",
+        ):
+            execute_prepared(raced)
+        assert injected
+    finally:
+        raced.close()
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-native/native-last-moment.txt",
+    ) == "last-moment-important"
+    assert _docker("exec", container, "cat", ownership_path) == old_ownership
+    assert state_store.path_for("dev").read_bytes() == old_state
+    assert _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "test -n \"$(find /srv/application/hybrid-native/.git-deploy/stage "
+        "-mindepth 1 -print -quit)\" && "
+        "test -n \"$(find /srv/application/hybrid-native/.git-deploy/recovery "
+        "-mindepth 1 -print -quit)\"",
+    ) == ""
+
+    _deploy_hybrid(git_project, recover=True)
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-native/native-last-moment.txt",
+    ) == "last-moment-important"
+    assert _docker("exec", container, "cat", ownership_path) == old_ownership
+    assert state_store.path_for("dev").read_bytes() == old_state
+    assert _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "test -z \"$(find /srv/application/hybrid-native/.git-deploy/stage "
+        "/srv/application/hybrid-native/.git-deploy/backup "
+        "/srv/application/hybrid-native/.git-deploy/recovery "
+        "-mindepth 1 -print -quit)\"",
+    ) == ""
+    last_moment.unlink()
+
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
         "native next\n", encoding="utf-8"
     )
@@ -780,6 +882,12 @@ remote_root = "/srv/application/hybrid-native"
         "cat",
         "/srv/application/hybrid-native/native-race/item",
     ) == "important"
+    assert _docker(
+        "exec",
+        container,
+        "cat",
+        "/srv/application/hybrid-native/native-last-moment.txt",
+    ) == "last-moment-important"
     assert _docker(
         "exec",
         container,

@@ -1,6 +1,6 @@
 # ADR：单 Hybrid Output 与远端所有权
 
-状态：Accepted；v1.4.2 运行期新鲜度与独立恢复修订
+状态：Accepted；v1.4.3 Native OpenSSH No-overwrite 收口
 
 日期：2026-07-17
 
@@ -27,6 +27,8 @@ v1.4.0 只增加一个受控模型：项目 Build 先把明确来源聚合到一
 ## Recovery 与原子性边界
 
 Root File 与 Mirror Directory 都先完整上传到 `.git-deploy/stage/<id>`，现有路径移动到 `.git-deploy/backup/<id>` 后再发布。计划时 Missing 的路径使用不覆盖目标的 Rename，目标最后一刻出现时发布失败，不会把外部路径移入 Backup。`.git-deploy/recovery/<id>.json` 记录 Deployment ID、Mapping、Target Fingerprint、Stage/Backup、阶段和新旧 Ownership Hash。
+
+Native OpenSSH 后端的部署路径 Rename 强制使用传统 SFTP No-replace 语义，禁止协商会覆盖既有目标的 POSIX Rename 扩展；因此目标在最终 Rename 前出现时，发布必须失败并进入可恢复状态。普通文件的同目录临时文件发布仍使用其独立的兼容替换流程，不属于 Hybrid Planned-Missing 契约。
 
 中断记录的发现与执行严格分离。普通部署、`--remote-plan` 和 Doctor 都只读报告；只有用户确认后的 `--recover` 才执行恢复，并在完成后退出，要求下一次普通部署重新读取事实和确认计划。Recovery-only Prepare 不运行 Build、不读取既有 State 内容、不扫描或冻结当前 Local Hybrid，也不生成当前 Source/Output 操作；它只冻结 Target/Command Contract，获取本地 Target Lock，并读取完成恢复所需的远端事实。Workspace 只保留实际存在 Recovery 的项目。
 

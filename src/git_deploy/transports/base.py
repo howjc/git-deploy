@@ -175,7 +175,7 @@ class Transport(ABC):
         raise DeployError("remote directory creation is not supported by this transport")
 
     def rename_path(self, source: str, destination: str) -> None:
-        """Rename one relative file or directory without overwriting destination."""
+        """Atomically rename one path only if destination is absent remotely."""
 
         raise DeployError("remote rename is not supported by this transport")
 
