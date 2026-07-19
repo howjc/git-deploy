@@ -666,9 +666,117 @@ def test_ftp_upload_and_delete_keep_cached_listing_coherent(tmp_path: Path) -> N
 
     assert fake.nlst_calls == ["/root"]
     assert fake.deleted == ["/root/new.txt"]
-    assert progress == [(3, 3)]
+    assert progress == [(0, 3), (3, 3)]
     transport.close()
     assert transport._directory_entries == {}
+
+
+def test_ftp_upload_timer_starts_after_parent_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FTP directory preparation is excluded from active STOR time."""
+
+    now = 100.0
+
+    def clock() -> float:
+        """Return the mutable synthetic monotonic time."""
+
+        return now
+
+    fake = CachingFTP({"/": {"root"}, "/root": set()})
+    original_store = fake.storbinary
+
+    def mkdirs(_path: str) -> None:
+        """Model five seconds of FTP parent preparation."""
+
+        nonlocal now
+        now += 5
+
+    def storbinary(command, handle, *, blocksize, callback):  # noqa: ANN001, ANN202
+        """Model one second of STOR before its cumulative callback."""
+
+        nonlocal now
+        now += 1
+        return original_store(command, handle, blocksize=blocksize, callback=callback)
+
+    fake.storbinary = storbinary  # type: ignore[method-assign]
+    transport = FTPTransport(ftp_target())
+    transport.ftp = fake  # type: ignore[assignment]
+    monkeypatch.setattr(transport, "_mkdirs", mkdirs)
+    payload = tmp_path / "timed.bin"
+    payload.write_bytes(b"payload")
+    reporter = ProgressReporter(clock=clock)
+
+    transport.upload(payload, "timed.bin", reporter.callback("timed.bin", 7))
+
+    summary = reporter.finish()
+    assert summary is not None
+    assert summary.active_seconds == pytest.approx(1)
+
+
+def test_paramiko_upload_timer_starts_after_parent_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paramiko directory preparation is excluded from active put time."""
+
+    now = 100.0
+    callbacks: list[tuple[int, int]] = []
+
+    def clock() -> float:
+        """Return the mutable synthetic monotonic time."""
+
+        return now
+
+    class UploadSFTP:
+        """Provide only the Paramiko upload calls used by this test."""
+
+        def put(self, local, remote, *, callback, confirm):  # noqa: ANN001, ANN201
+            """Advance upload time and publish one cumulative callback."""
+
+            nonlocal now
+            del remote, confirm
+            now += 1
+            size = Path(local).stat().st_size
+            callbacks.append((size, size))
+            callback(size, size)
+
+        def chmod(self, path: str, mode: int) -> None:
+            """Accept temporary-file mode publication."""
+
+        def remove(self, path: str) -> None:
+            """Accept best-effort cleanup if an assertion fails."""
+
+    def mkdirs(_path: str) -> None:
+        """Model five seconds of Paramiko parent preparation."""
+
+        nonlocal now
+        now += 5
+
+    transport = SFTPTransport(sftp_target())
+    transport.sftp = UploadSFTP()  # type: ignore[assignment]
+    monkeypatch.setattr(transport, "_mkdirs", mkdirs)
+    monkeypatch.setattr(transport, "_publish_temporary", lambda source, target: None)
+    payload = tmp_path / "timed.bin"
+    payload.write_bytes(b"payload")
+    reporter = ProgressReporter(clock=clock)
+    reported: list[tuple[int, int | None]] = []
+    callback = reporter.callback("timed.bin", 7)
+
+    def record(done: int, total: int | None = None) -> None:
+        """Record transport signals before forwarding them to the Reporter."""
+
+        reported.append((done, total))
+        callback(done, total)
+
+    transport.upload(payload, "timed.bin", record)
+
+    summary = reporter.finish()
+    assert callbacks == [(7, 7)]
+    assert reported == [(0, 7), (7, 7)]
+    assert summary is not None
+    assert summary.active_seconds == pytest.approx(1)
 
 
 def test_ftp_missing_parent_probe_is_cached_and_root_probe_is_three_state() -> None:

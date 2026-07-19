@@ -114,6 +114,9 @@ class SFTPTransport(Transport):
         self._mkdirs(posixpath.dirname(target))
         temporary = f"{target}.git-deploy-{uuid.uuid4().hex}.tmp"
         try:
+            # Parent creation is not upload activity; the explicit zero signal
+            # aligns Paramiko timing with FTP and Native OpenSSH.
+            callback(0, local_path.stat().st_size)
             sftp.put(str(local_path), temporary, callback=callback, confirm=True)
             sftp.chmod(temporary, 0o755 if executable else 0o644)
             self._publish_temporary(temporary, target)

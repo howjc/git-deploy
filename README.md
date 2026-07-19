@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.6.0/git_deploy-1.6.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.6.1/git_deploy-1.6.1-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -200,13 +200,27 @@ UPLOAD public/assets/app.js 100%  6.0 MiB  avg 2.36 MiB/s
 TRANSFER SUMMARY
   files:          1
   payload:        6.0 MiB
-  wire bytes:     7.2 MiB
+  attempt bytes:  7.2 MiB
   active time:    3.05s
   average upload: 2.36 MiB/s (19.8 Mbps)
   retries:        1
 ```
 
-`payload` 是按最终路径去重后的成功逻辑文件大小；`wire bytes` 包含失败的部分上传和重传，因此可能更大。`active time` 与 `average upload` 只覆盖实际 Upload Attempt，不包含 Build、Freeze、Plan、FTP RETR 校验、Rename、Delete/RMD、远端命令和重试等待，也不代表端到端部署耗时。样本小于 1 MiB 或 1 秒时会标记 `sample too small`；没有上传的 Delete-only/No-op 部署不显示汇总。部署失败不会显示成功汇总。Workspace 为每个 Repository 独立显示带名称的汇总，不计算跨服务器全局平均。
+`payload` 是按最终路径去重后的成功逻辑文件大小；Streaming 后端的 `attempt bytes` 是 Transport Callback 报告的应用层上传字节，包含已回调的失败部分上传和重传，但不包含协议头、TCP 重传或失败 Block 中尚未回调的字节。FTP 与 Paramiko 在父目录准备完成、即将上传时才启动 `active time`；其 `average upload` 不包含 Parent MKD、Build、Freeze、Plan、FTP RETR、Rename、Delete/RMD、远端命令或重试等待。
+
+Native OpenSSH 的 Batch CLI 不提供稳定的分块进度，因此诚实显示为粗粒度发布测量：
+
+```text
+UPLOAD public/assets/app.js transferring (Native batch)
+UPLOAD public/assets/app.js 100%  6.0 MiB  avg publish 2.36 MiB/s (coarse)
+TRANSFER SUMMARY
+  measurement:    coarse Native batch
+  reported bytes: >= 6.0 MiB
+  average publish: 2.36 MiB/s (coarse)
+  note:           failed partial bytes may be unreported
+```
+
+Native 的 Active Time 覆盖整个 Batch/Publish 区间，不能解释为实时网络速率；失败 Attempt 在首尾 Callback 之间发送的部分字节可能不可见。所有进度和 Summary 输出均为 Fail-open：关闭的 Pipe、Stream I/O 或控制台编码错误只会禁用后续显示，不会触发上传 Retry、改变 State/Recovery 或把成功部署报告为失败。Streaming 样本小于 1 MiB 或 1 秒时会标记 `sample too small`；Delete-only/No-op 不显示 Summary，失败部署不显示成功 Summary。Workspace 为每个 Repository 独立汇总。
 
 只构建或诊断：
 
@@ -355,7 +369,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.6.0-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.6.1-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

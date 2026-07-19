@@ -151,9 +151,10 @@ class FTPTransport(Transport):
 
         try:
             with local_path.open("rb") as handle:
+                # Directory preparation is setup latency, so activate transfer
+                # timing only immediately before STOR starts sending bytes.
+                callback(0, total)
                 ftp.storbinary(f"STOR {target}", handle, blocksize=64 * 1024, callback=block_callback)
-            if total == 0:
-                callback(0, 0)
             self._cache_add(PurePosixPath(target).parent.as_posix(), PurePosixPath(target).name)
             self._typed_entries.clear()
         except (OSError, ftplib.Error) as exc:

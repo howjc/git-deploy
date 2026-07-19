@@ -20,6 +20,7 @@ from git_deploy.transports.base import (
     ProgressCallback,
     RemotePathType,
     Transport,
+    TransferMeasurementMode,
     is_stable_remote_component,
 )
 
@@ -435,6 +436,8 @@ class SSHConnectionPool:
 
 class OpenSSHSFTPTransport(Transport):
     """Perform SFTP file operations through the user's native OpenSSH environment."""
+
+    measurement_mode = TransferMeasurementMode.COARSE
 
     def __init__(
         self,

@@ -6,7 +6,8 @@ from io import StringIO
 
 import pytest
 
-from git_deploy.progress import MIB, ProgressReporter, format_bytes, format_rate
+from git_deploy.progress import MIB, ProgressReporter, TransferSummary, format_bytes, format_rate
+from git_deploy.transports.base import TransferMeasurementMode
 
 
 class FakeClock:
@@ -41,6 +42,26 @@ class FakeStream(StringIO):
         """Return the configured terminal capability."""
 
         return self.tty
+
+
+class FailingStream(FakeStream):
+    """Raise one configured output error instead of accepting rendered text."""
+
+    def __init__(self, error: BaseException, *, successful_writes: int = 0) -> None:
+        """Configure the failure and number of writes allowed before it."""
+
+        super().__init__(tty=True)
+        self.error = error
+        self.successful_writes = successful_writes
+        self.write_calls = 0
+
+    def write(self, value: str) -> int:
+        """Accept initial writes, then raise the configured display exception."""
+
+        self.write_calls += 1
+        if self.write_calls > self.successful_writes:
+            raise self.error
+        return super().write(value)
 
 
 def test_progress_uses_sliding_rate_and_throttles_tty_updates() -> None:
@@ -88,17 +109,19 @@ def test_non_tty_only_renders_completed_file_and_summary() -> None:
     assert "average upload: 1.00 MiB/s (8.4 Mbps)" in output
 
 
-def test_retry_counts_partial_wire_bytes_but_deduplicates_payload() -> None:
-    """A failed partial attempt contributes wire/time while payload stays logical."""
+def test_retry_counts_partial_attempt_bytes_but_deduplicates_payload() -> None:
+    """A failed partial attempt contributes bytes/time while payload stays logical."""
 
     clock = FakeClock()
     reporter = ProgressReporter(clock=clock, stream=FakeStream(tty=False))
     first = reporter.callback("app.bin", 1000)
+    first(0)
     clock.advance(1)
     first(400)
     reporter.record_retry("app.bin")
     clock.advance(2)
     second = reporter.callback("app.bin", 1000)
+    second(0)
     clock.advance(2)
     second(1000)
 
@@ -106,17 +129,18 @@ def test_retry_counts_partial_wire_bytes_but_deduplicates_payload() -> None:
     assert summary is not None
     assert summary.files == 1
     assert summary.payload_bytes == 1000
-    assert summary.wire_bytes == 1400
+    assert summary.attempt_bytes == 1400
     assert summary.active_seconds == pytest.approx(3)
     assert summary.retries == 1
 
 
 def test_callback_rollback_starts_an_implicit_retry_without_negative_delta() -> None:
-    """A cumulative-byte reset opens a new attempt and preserves prior wire bytes."""
+    """A cumulative-byte reset opens a new attempt and preserves prior bytes."""
 
     clock = FakeClock()
     reporter = ProgressReporter(clock=clock, stream=FakeStream(tty=False))
     callback = reporter.callback("bundle.js", 100)
+    callback(0)
     clock.advance(1)
     callback(60)
     clock.advance(1)
@@ -128,7 +152,7 @@ def test_callback_rollback_starts_an_implicit_retry_without_negative_delta() -> 
     summary = reporter.finish()
     assert summary is not None
     assert summary.payload_bytes == 100
-    assert summary.wire_bytes == 160
+    assert summary.attempt_bytes == 160
     assert summary.active_seconds == pytest.approx(3)
     assert summary.retries == 1
 
@@ -144,7 +168,7 @@ def test_repeated_attempt_registration_counts_retry_without_explicit_hook() -> N
     assert summary is not None
     assert summary.files == 1
     assert summary.payload_bytes == 10
-    assert summary.wire_bytes == 20
+    assert summary.attempt_bytes == 20
     assert summary.retries == 1
 
 
@@ -159,11 +183,11 @@ def test_retry_hook_after_completed_upload_retains_logical_success_without_resta
     assert summary is not None
     assert summary.files == 1
     assert summary.payload_bytes == 10
-    assert summary.wire_bytes == 10
+    assert summary.attempt_bytes == 10
     assert summary.retries == 1
 
 
-def test_duplicate_and_oversized_callbacks_do_not_double_count_wire_bytes() -> None:
+def test_duplicate_and_oversized_callbacks_do_not_double_count_attempt_bytes() -> None:
     """Duplicate cumulative values and values beyond total are clamped safely."""
 
     reporter = ProgressReporter(stream=FakeStream(tty=False))
@@ -175,7 +199,7 @@ def test_duplicate_and_oversized_callbacks_do_not_double_count_wire_bytes() -> N
 
     summary = reporter.finish()
     assert summary is not None
-    assert summary.wire_bytes == 10
+    assert summary.attempt_bytes == 10
     assert summary.payload_bytes == 10
 
 
@@ -185,9 +209,11 @@ def test_multiple_files_sum_payload_time_and_average() -> None:
     clock = FakeClock()
     reporter = ProgressReporter(clock=clock, stream=FakeStream(tty=False))
     first = reporter.callback("one.bin", 2 * 1024 * 1024)
+    first(0)
     clock.advance(1)
     first(2 * 1024 * 1024)
     second = reporter.callback("two.bin", 4 * 1024 * 1024)
+    second(0)
     clock.advance(2)
     second(4 * 1024 * 1024)
 
@@ -195,7 +221,7 @@ def test_multiple_files_sum_payload_time_and_average() -> None:
     assert summary is not None
     assert summary.files == 2
     assert summary.payload_bytes == 6 * 1024 * 1024
-    assert summary.wire_bytes == 6 * 1024 * 1024
+    assert summary.attempt_bytes == 6 * 1024 * 1024
     assert summary.active_seconds == pytest.approx(3)
     assert summary.average_bytes_per_second == pytest.approx(2 * 1024 * 1024)
 
@@ -215,7 +241,7 @@ def test_zero_byte_upload_is_counted_and_no_upload_has_no_summary() -> None:
     assert summary is not None
     assert summary.files == 1
     assert summary.payload_bytes == 0
-    assert summary.wire_bytes == 0
+    assert summary.attempt_bytes == 0
     assert summary.average_bytes_per_second == 0
 
 
@@ -254,7 +280,7 @@ def test_byte_formatter_covers_iec_unit_boundaries(value: float, rendered: str) 
     [
         (17, "17 B/s"),
         (1536, "1.50 KiB/s"),
-        (3.25 * MIB, "3.20 MiB/s"),
+        (3.25 * MIB, "3.25 MiB/s"),
         (2 * 1024 * MIB, "2.00 GiB/s"),
     ],
 )
@@ -297,3 +323,102 @@ def test_verbose_mode_still_respects_refresh_throttle() -> None:
     callback(100)
 
     assert stream.getvalue().count("UPLOAD large.bin") == 2
+
+
+def test_callback_registration_defers_active_time_until_first_signal() -> None:
+    """Parent setup and retry delay before the first callback are excluded."""
+
+    clock = FakeClock()
+    reporter = ProgressReporter(clock=clock, stream=FakeStream(tty=False))
+    reporter.callback("first.bin", 100)
+    clock.advance(5)
+    reporter.record_retry("first.bin")
+    retried = reporter.callback("first.bin", 100)
+    clock.advance(3)
+    retried(0)
+    clock.advance(1)
+    retried(100)
+
+    summary = reporter.finish()
+    assert summary is not None
+    assert summary.active_seconds == pytest.approx(1)
+    assert summary.retries == 1
+
+
+def test_transfer_summary_preserves_streaming_constructor_compatibility() -> None:
+    """The v1.6.0 five-value Summary shape defaults to Streaming measurement."""
+
+    summary = TransferSummary(1, 2, 3, 4.0, 5)
+
+    assert summary.attempt_bytes == 3
+    assert summary.wire_bytes == 3
+    assert summary.measurement_mode is TransferMeasurementMode.STREAMING
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BrokenPipeError("closed pipe"),
+        OSError("closed stream"),
+        UnicodeEncodeError("ascii", "路径", 0, 1, "unsupported"),
+        ValueError("closed text stream"),
+    ],
+)
+def test_rendering_errors_disable_output_without_affecting_metrics(error: BaseException) -> None:
+    """Pipe, stream, and encoding failures are strictly fail-open."""
+
+    stream = FailingStream(error)
+    reporter = ProgressReporter(stream=stream)
+    callback = reporter.callback("路径/app.bin", 100)
+
+    callback(0)
+    callback(100)
+    reporter.render_summary()
+
+    summary = reporter.finish()
+    assert summary is not None
+    assert summary.files == 1
+    assert summary.attempt_bytes == 100
+    assert reporter._render_disabled
+    assert stream.write_calls == 1
+
+
+def test_summary_failure_after_completion_is_fail_open() -> None:
+    """A stream that closes at the Summary boundary cannot escape the Reporter."""
+
+    stream = FailingStream(OSError("summary sink closed"), successful_writes=2)
+    stream.tty = False
+    reporter = ProgressReporter(stream=stream)
+    reporter.callback("app.bin", 100)(100)
+
+    reporter.render_summary()
+
+    assert reporter.finish() is not None
+    assert reporter._render_disabled
+
+
+def test_coarse_native_mode_avoids_streaming_and_exact_wire_claims() -> None:
+    """Native batch output honestly labels its coarse publish measurement."""
+
+    clock = FakeClock()
+    stream = FakeStream(tty=True)
+    reporter = ProgressReporter(
+        clock=clock,
+        stream=stream,
+        measurement_mode=TransferMeasurementMode.COARSE,
+    )
+    callback = reporter.callback("assets/app.js", 2 * MIB)
+    callback(0)
+    clock.advance(2)
+    callback(2 * MIB)
+    reporter.render_summary()
+
+    output = stream.getvalue()
+    assert "transferring (Native batch)" in output
+    assert "  0%" not in output
+    assert "avg publish 1.00 MiB/s (coarse)" in output
+    assert "measurement:    coarse Native batch" in output
+    assert "reported bytes: >= 2.0 MiB" in output
+    assert "failed partial bytes may be unreported" in output
+    assert "attempt bytes:" not in output
+    assert "average upload:" not in output

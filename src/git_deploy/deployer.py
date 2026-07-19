@@ -142,11 +142,15 @@ def execute_frozen_plan(
         )
         print("No file changes; deployment state advanced to HEAD.")
         return
-    progress = ProgressReporter(verbose, label=progress_label)
     transport = prepared_transport or (
         transport_factory(plan.target)
         if transport_factory is not None
         else create_transport(plan.target, connection_pool)
+    )
+    progress = ProgressReporter(
+        verbose,
+        label=progress_label,
+        measurement_mode=transport.measurement_mode,
     )
     try:
         if prepared_transport is None:
