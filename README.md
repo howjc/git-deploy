@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.5.3/git_deploy-1.5.3-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.6.0/git_deploy-1.6.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -190,6 +190,24 @@ git-deploy prod --full --yes
 
 `--dry-run` 默认仍执行构建，但不连接服务器、不写 State；FTP Hybrid 会提示使用 `--remote-plan` 获取精确孤儿列表。`--remote-plan` 与它互斥：同样先 Build/Freeze，但只读 Capability Profile、Ownership、Pending、MLSD 受管树和当前路径类型，完整显示 Adoption/Upload/Delete/RMD Plan，绝不 Probe、上传、删除、执行命令或写远端 Manifest/本地 State。FTP Pending Schema 2 的 `PREPARED`、`FILES_PUBLISHED`、`PRUNED` 仅在 Local Manifest、HEAD、Previous State、Source/Incremental Operation 与配置策略全部匹配后向前收敛；`FILES_PUBLISHED` 不重放普通上传/删除。`OWNERSHIP_COMMITTED`、`STATE_COMPLETE` 使用独立 `--recover`，普通部署会在 Build/Plan 前拒绝；恢复不 Build、不读当前 State、不扫描本地 Hybrid，并始终保存 Marker 中冻结的 State 后再清理 Stage/Marker。`--full` 上传全部当前受管内容；Hybrid 中还显式允许接管当前同名路径，但仍不清空根目录或处理未知内容。
 
+### 传输速率与汇总
+
+上传时会显示当前文件进度、IEC 字节单位和 1.5 秒滑动窗口速率；TTY 最多每 250ms 刷新一次，重定向到日志时只保留文件完成行和最终汇总，不产生逐 Block 日志。`--verbose` 也遵守相同节流。
+
+```text
+UPLOAD public/assets/app.js  63%  3.8 MiB / 6.0 MiB  2.42 MiB/s
+UPLOAD public/assets/app.js 100%  6.0 MiB  avg 2.36 MiB/s
+TRANSFER SUMMARY
+  files:          1
+  payload:        6.0 MiB
+  wire bytes:     7.2 MiB
+  active time:    3.05s
+  average upload: 2.36 MiB/s (19.8 Mbps)
+  retries:        1
+```
+
+`payload` 是按最终路径去重后的成功逻辑文件大小；`wire bytes` 包含失败的部分上传和重传，因此可能更大。`active time` 与 `average upload` 只覆盖实际 Upload Attempt，不包含 Build、Freeze、Plan、FTP RETR 校验、Rename、Delete/RMD、远端命令和重试等待，也不代表端到端部署耗时。样本小于 1 MiB 或 1 秒时会标记 `sample too small`；没有上传的 Delete-only/No-op 部署不显示汇总。部署失败不会显示成功汇总。Workspace 为每个 Repository 独立显示带名称的汇总，不计算跨服务器全局平均。
+
 只构建或诊断：
 
 ```bash
@@ -337,7 +355,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.4.3-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.6.0-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

@@ -117,6 +117,7 @@ def execute_frozen_plan(
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
     prepared_transport: Transport | None = None,
+    progress_label: str | None = None,
 ) -> None:
     """Execute already frozen bytes and commit only this project's successful state.
 
@@ -128,6 +129,8 @@ def execute_frozen_plan(
         verbose: Enable more frequent progress output.
         transport_factory: Optional fake/custom transport factory.
         connection_pool: Command-scoped Native OpenSSH connection pool.
+        prepared_transport: Optional already connected transport from remote planning.
+        progress_label: Optional repository name prefixed to the transfer summary.
 
     Returns:
         ``None`` after this project's remote operations and state commit succeed.
@@ -139,7 +142,7 @@ def execute_frozen_plan(
         )
         print("No file changes; deployment state advanced to HEAD.")
         return
-    progress = ProgressReporter(verbose)
+    progress = ProgressReporter(verbose, label=progress_label)
     transport = prepared_transport or (
         transport_factory(plan.target)
         if transport_factory is not None
@@ -195,6 +198,7 @@ def execute_frozen_plan(
     state_store.save(
         new_state(plan.target.name, plan.target_fingerprint, plan.head, plan.output_manifest)
     )
+    progress.render_summary()
 
 
 def _execute_hybrid_plan(
@@ -331,6 +335,7 @@ def _execute_hybrid_plan(
                 f"{stage_root}/{operation.path}",
                 transport,
                 progress,
+                display_path=operation.path,
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
@@ -351,6 +356,7 @@ def _execute_hybrid_plan(
                     staged_path,
                     transport,
                     progress,
+                    display_path=final_path,
                     attempts=config.deploy.retries,
                     delay=config.deploy.retry_delay,
                 )
@@ -461,6 +467,7 @@ def _execute_hybrid_plan(
             file=sys.stderr,
             flush=True,
         )
+    progress.render_summary()
 
 
 def _execute_ftp_hybrid_plan(
@@ -647,6 +654,7 @@ def _execute_ftp_hybrid_plan(
                 file=sys.stderr,
                 flush=True,
             )
+    progress.render_summary()
 
 
 def _ensure_ftp_internal_directories(
@@ -734,6 +742,7 @@ def _stage_ftp_hybrid_file(
         operation.path,
         action,
         transport,
+        on_retry=lambda: progress.record_retry(operation.path),
         attempts=attempts,
         delay=delay,
     )
@@ -752,11 +761,15 @@ def _publish_ftp_hybrid_file(
     """Rename-replace and final-verify one file, restaging before a retry."""
 
     staged_path = f"{stage_root}/files/{operation.path}"
+    upload_attempted = False
 
     def action() -> None:
         """Publish one staged file and prove final content and source consumption."""
 
+        nonlocal upload_attempted
+        upload_attempted = False
         if transport.lstat(staged_path) is RemotePathType.MISSING:
+            upload_attempted = True
             transport.upload(
                 local_path,
                 staged_path,
@@ -772,10 +785,17 @@ def _publish_ftp_hybrid_file(
         if transport.lstat(staged_path) is not RemotePathType.MISSING:
             raise DeployError(f"FTP Stage was not consumed for {operation.path}")
 
+    def record_upload_retry() -> None:
+        """Close transfer timing only when this publish attempt restaged bytes."""
+
+        if upload_attempted:
+            progress.record_retry(operation.path)
+
     _retry_ftp_mutation(
         operation.path,
         action,
         transport,
+        on_retry=record_upload_retry,
         attempts=attempts,
         delay=delay,
     )
@@ -786,10 +806,23 @@ def _retry_ftp_mutation(
     action: Callable[[], None],
     transport: FTPTransport,
     *,
+    on_retry: Callable[[], None] | None = None,
     attempts: int,
     delay: float,
 ) -> None:
-    """Retry one idempotent FTP Hybrid action with a clean listing cache."""
+    """Retry one idempotent FTP Hybrid action with a clean listing cache.
+
+    Args:
+        label: User-facing operation path.
+        action: Idempotent mutation attempt.
+        transport: Connected FTP transport whose caches are invalidated on retry.
+        on_retry: Optional upload-accounting hook run before the retry delay.
+        attempts: Maximum mutation attempts.
+        delay: Retry delay in seconds.
+
+    Returns:
+        ``None`` after the action succeeds.
+    """
 
     for attempt in range(1, attempts + 1):
         try:
@@ -805,6 +838,8 @@ def _retry_ftp_mutation(
                 f"Retry {attempt}/{attempts - 1} for {label} after error: {exc}",
                 flush=True,
             )
+            if on_retry is not None:
+                on_retry()
             if delay:
                 time.sleep(delay)
 
@@ -983,10 +1018,26 @@ def _upload_with_retry(
     transport: Transport,
     progress: ProgressReporter,
     *,
+    display_path: str | None = None,
     attempts: int,
     delay: float,
 ) -> None:
-    """Retry one idempotent Hybrid upload without rebuilding local bytes."""
+    """Retry one idempotent Hybrid upload without rebuilding local bytes.
+
+    Args:
+        local_path: Frozen bytes to upload.
+        remote_path: Internal or final transport destination.
+        transport: Connected upload transport.
+        progress: Deployment-scoped transfer reporter.
+        display_path: Optional logical final path hiding an internal Stage path.
+        attempts: Maximum physical upload attempts.
+        delay: Retry delay in seconds.
+
+    Returns:
+        ``None`` after one successful upload.
+    """
+
+    logical_path = display_path or remote_path
 
     for attempt in range(1, attempts + 1):
         try:
@@ -996,7 +1047,7 @@ def _upload_with_retry(
             transport.upload(
                 local_path,
                 remote_path,
-                progress.callback(remote_path, local_path.stat().st_size),
+                progress.callback(logical_path, local_path.stat().st_size),
             )
             return
         except Exception as exc:
@@ -1008,6 +1059,7 @@ def _upload_with_retry(
                 f"Retry {attempt}/{attempts - 1} for {remote_path} after error: {exc}",
                 flush=True,
             )
+            progress.record_retry(logical_path)
             if delay:
                 time.sleep(delay)
 
@@ -1285,5 +1337,7 @@ def _execute_with_retry(
                 f"Retry {attempt}/{attempts - 1} for {operation.remote_path} after error: {exc}",
                 flush=True,
             )
+            if isinstance(operation, UploadOperation):
+                progress.record_retry(operation.remote_path)
             if delay:
                 time.sleep(delay)

@@ -434,6 +434,7 @@ def execute_workspace(
                 verbose=verbose,
                 transport_factory=transport_factory,
                 connection_pool=pool,
+                progress_label=item.name,
             )
             completed.append(item.name)
         return tuple(completed)
