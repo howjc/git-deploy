@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import git_deploy.deployer as deployer_module
 from git_deploy.config import load_config
 from git_deploy.deployer import execute_plan, execute_recovery_plan
 from git_deploy.errors import DeployError, PlanError
@@ -13,7 +14,9 @@ from git_deploy.ftp_hybrid import FTP_PENDING_SCHEMA, FTPHybridPending, FTPPendi
 from git_deploy.git import GitRepository
 from git_deploy.manifest import ManifestEntry, StateStore, TargetState
 from git_deploy.planner import FTPRecoveryPlan, create_plan
+from git_deploy.progress import ProgressReporter
 from git_deploy.transports.base import ProgressCallback, Transport
+from git_deploy.transports.base import TransferMeasurementMode
 from git_deploy.transports.ftp import FTPTransport
 from tests.conftest import commit_all, write_config
 
@@ -181,8 +184,102 @@ def test_per_file_retry_does_not_rebuild_plan(
     output = capsys.readouterr().err
     assert output.count("TRANSFER SUMMARY") == 1
     assert "payload:        12 B" in output
-    assert "wire bytes:     12 B" in output
+    assert "attempt bytes:  12 B" in output
     assert "retries:        1" in output
+
+
+def test_summary_stream_failure_after_state_commit_is_fail_open(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A closed Summary sink cannot fail deployment or trigger an upload retry."""
+
+    class SummaryFailingStream:
+        """Accept one completion line, then fail when Summary rendering begins."""
+
+        def __init__(self) -> None:
+            """Initialize the two writes used by one line-oriented completion."""
+
+            self.write_calls = 0
+
+        def isatty(self) -> bool:
+            """Select non-TTY completion and Summary output."""
+
+            return False
+
+        def write(self, value: str) -> int:
+            """Raise when the Summary heading attempts its first write."""
+
+            self.write_calls += 1
+            if self.write_calls > 2:
+                raise OSError("summary sink closed")
+            return len(value)
+
+        def flush(self) -> None:
+            """Accept completion-line flushing."""
+
+    stream = SummaryFailingStream()
+
+    def reporter_factory(verbose: bool = False, **kwargs):  # noqa: ANN003, ANN202
+        """Inject the failing display stream into the real deployment flow."""
+
+        return ProgressReporter(verbose, stream=stream, **kwargs)
+
+    monkeypatch.setattr(deployer_module, "ProgressReporter", reporter_factory)
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    transport = FakeTransport()
+
+    execute_plan(plan, config, repository, store, transport_factory=lambda target: transport)
+
+    assert store.load("dev") is not None
+    assert transport.files["app.py"] == b"print('v1')\n"
+    assert transport.connects == 1
+    assert stream.write_calls == 3
+
+
+def test_transport_measurement_mode_reaches_deployment_summary(
+    git_project: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deployment construction binds a coarse backend to its shared Reporter."""
+
+    class CoarseTransport(FakeTransport):
+        """Model Native OpenSSH's callback and measurement capability."""
+
+        measurement_mode = TransferMeasurementMode.COARSE
+
+        def upload(
+            self,
+            local_path: Path,
+            remote_path: str,
+            callback: ProgressCallback,
+            *,
+            executable: bool = False,
+        ) -> None:
+            """Emit only Native-style start and completion callbacks."""
+
+            del executable
+            content = local_path.read_bytes()
+            callback(0, len(content))
+            self.files[remote_path] = content
+            callback(len(content), len(content))
+
+    config = load_config(write_config(git_project))
+    repository = GitRepository(git_project)
+    store = StateStore(repository.git_dir())
+    plan = create_plan(config, config.target(None), repository, None, full=False)
+    transport = CoarseTransport()
+
+    execute_plan(plan, config, repository, store, transport_factory=lambda target: transport)
+
+    output = capsys.readouterr().err
+    assert "measurement:    coarse Native batch" in output
+    assert "reported bytes: >= 12 B" in output
+    assert "attempt bytes:" not in output
+    assert "average upload:" not in output
 
 
 def test_initial_connection_and_root_check_are_retried(git_project: Path) -> None:

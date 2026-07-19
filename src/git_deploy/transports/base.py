@@ -47,8 +47,17 @@ class RemotePathType(str, Enum):
     OTHER = "other"
 
 
+class TransferMeasurementMode(str, Enum):
+    """Declare how precisely one transport reports upload progress."""
+
+    STREAMING = "streaming"
+    COARSE = "coarse"
+
+
 class Transport(ABC):
     """Define idempotent remote operations used by the deployer."""
+
+    measurement_mode = TransferMeasurementMode.STREAMING
 
     @abstractmethod
     def connect(self) -> None:
@@ -77,6 +86,8 @@ class Transport(ABC):
             local_path: Frozen local file to stream.
             remote_path: Normalized relative path below the configured root.
             callback: Progress callback receiving transferred and total bytes.
+                Built-in transports emit ``(0, total)`` after parent setup and
+                immediately before transfer work so active timing has one boundary.
             executable: Whether SFTP should publish the file with mode ``0755``.
         """
 

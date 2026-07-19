@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -16,7 +17,7 @@ from git_deploy.errors import DeployError
 from git_deploy.planner import UploadOperation
 from git_deploy.progress import ProgressReporter
 from git_deploy.transports import create_transport
-from git_deploy.transports.base import RemotePathType
+from git_deploy.transports.base import RemotePathType, TransferMeasurementMode
 from git_deploy.transports.openssh_sftp import (
     OpenSSHMaster,
     OpenSSHSFTPTransport,
@@ -56,7 +57,9 @@ def native_target(tmp_path: Path, *, root: str = "/srv/app") -> TargetConfig:
 def test_backend_selection_uses_alias_only_for_native(tmp_path: Path) -> None:
     """Alias targets select native OpenSSH while direct hosts retain Paramiko."""
 
-    assert isinstance(create_transport(native_target(tmp_path)), OpenSSHSFTPTransport)
+    native = create_transport(native_target(tmp_path))
+    assert isinstance(native, OpenSSHSFTPTransport)
+    assert native.measurement_mode is TransferMeasurementMode.COARSE
     direct = TargetConfig(
         "legacy",
         "sftp",
@@ -66,7 +69,9 @@ def test_backend_selection_uses_alias_only_for_native(tmp_path: Path) -> None:
         22,
         ssh_resolved=True,
     )
-    assert isinstance(create_transport(direct), SFTPTransport)
+    paramiko = create_transport(direct)
+    assert isinstance(paramiko, SFTPTransport)
+    assert paramiko.measurement_mode is TransferMeasurementMode.STREAMING
 
 
 def test_missing_or_windows_executables_fail_structurally(
@@ -691,16 +696,26 @@ def test_operation_retry_replaces_dead_pooled_master_and_succeeds(
     local = tmp_path / "asset.js"
     local.write_text("asset", encoding="utf-8")
     operation = UploadOperation("asset.js", "output", local_path=local, size=5)
+    stream = StringIO()
+    progress = ProgressReporter(
+        stream=stream,
+        measurement_mode=TransferMeasurementMode.COARSE,
+    )
 
     _execute_with_retry(
         operation,
         {"asset.js": local},
         transport,
-        ProgressReporter(),
+        progress,
         attempts=2,
         delay=0,
     )
+    progress.render_summary()
 
     assert len([command for command in commands if "-MNf" in command]) == 2
     assert failed_once
+    output = stream.getvalue()
+    assert "reported bytes: >= 5 B" in output
+    assert "retries:        1" in output
+    assert "failed partial bytes may be unreported" in output
     pool.close_all()
