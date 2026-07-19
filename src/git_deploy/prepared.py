@@ -403,8 +403,20 @@ def execute_prepared(
     verbose: bool = False,
     transport_factory: TransportFactory | None = None,
     connection_pool: SSHConnectionPool | None = None,
+    progress_label: str | None = None,
 ) -> None:
-    """Execute one prepared project and always release its local resources."""
+    """Execute one prepared project and always release its local resources.
+
+    Args:
+        prepared: Frozen project and owned execution resources.
+        verbose: Whether to print detailed execution context.
+        transport_factory: Optional transport factory used by tests and callers.
+        connection_pool: Optional command-scoped Native OpenSSH connection pool.
+        progress_label: Optional repository name for the transfer summary.
+
+    Returns:
+        ``None`` after successful deployment and resource release.
+    """
 
     try:
         execute_frozen_plan(
@@ -416,6 +428,7 @@ def execute_prepared(
             transport_factory=transport_factory,
             connection_pool=connection_pool,
             prepared_transport=prepared.transport,
+            progress_label=progress_label,
         )
         prepared.transport = None
     finally:

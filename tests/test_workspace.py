@@ -298,7 +298,10 @@ def test_all_workspace_locks_are_available_before_first_build(tmp_path: Path) ->
         pass
 
 
-def test_sequential_failure_then_workspace_rerun_converges(tmp_path: Path) -> None:
+def test_sequential_failure_then_workspace_rerun_converges(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """A succeeds, B fails, C waits; rerun makes A no-op and completes B/C."""
 
     repositories = tuple(_create_repository(tmp_path, name) for name in ("api", "web", "admin"))
@@ -320,6 +323,10 @@ def test_sequential_failure_then_workspace_rerun_converges(tmp_path: Path) -> No
     _, first_run = prepare_workspace(workspace, None, full=False, skip_build=True)
     with pytest.raises(DeployError, match="workspace repository interrupted"):
         execute_workspace(first_run, transport_factory=interrupted_factory)
+    first_output = capsys.readouterr().err
+    assert "[api] TRANSFER SUMMARY" in first_output
+    assert "[web] TRANSFER SUMMARY" not in first_output
+    assert "[admin] TRANSFER SUMMARY" not in first_output
 
     states = tuple(StateStore(GitRepository(path).common_dir()) for path in repositories)
     assert states[0].load("dev") is not None
@@ -341,6 +348,10 @@ def test_sequential_failure_then_workspace_rerun_converges(tmp_path: Path) -> No
         "web",
         "admin",
     )
+    rerun_output = capsys.readouterr().err
+    assert "[api] TRANSFER SUMMARY" not in rerun_output
+    assert "[web] TRANSFER SUMMARY" in rerun_output
+    assert "[admin] TRANSFER SUMMARY" in rerun_output
     assert all(store.load("dev") is not None for store in states)
     assert remotes["/srv/api"]["app.py"] == b"print('api')\n"
 

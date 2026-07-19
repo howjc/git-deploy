@@ -657,14 +657,16 @@ def test_ftp_upload_and_delete_keep_cached_listing_coherent(tmp_path: Path) -> N
     transport.ftp = fake  # type: ignore[assignment]
     payload = tmp_path / "new.txt"
     payload.write_text("new", encoding="utf-8")
+    progress: list[tuple[int, int | None]] = []
 
     transport.delete("absent.txt")
-    transport.upload(payload, "new.txt", lambda done, total: None)
+    transport.upload(payload, "new.txt", lambda done, total: progress.append((done, total)))
     transport.delete("new.txt")
     transport.delete("new.txt")
 
     assert fake.nlst_calls == ["/root"]
     assert fake.deleted == ["/root/new.txt"]
+    assert progress == [(3, 3)]
     transport.close()
     assert transport._directory_entries == {}
 
