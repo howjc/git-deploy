@@ -6,6 +6,7 @@ import ftplib
 import hashlib
 import io
 import os
+import re
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
@@ -19,6 +20,39 @@ from git_deploy.transports.base import (
     Transport,
     is_stable_remote_component,
 )
+
+# Pure-FTPd (and similar) welcome banners embed session-volatile fields such as
+# concurrent user counts and wall-clock time. Capability profiles bind to the
+# banner hash; hashing those fields invalidates the profile every connect.
+_VOLATILE_BANNER_BODY = re.compile(
+    r"(?is)"
+    r"(?:you are user number\s+\d+\s+of\s+\d+\s+allowed\.?|"
+    r"local time is now\b.*)"
+)
+
+
+def normalize_ftp_server_banner(welcome: str) -> str:
+    """Drop session-volatile FTP welcome lines before identity hashing.
+
+    Args:
+        welcome: Raw multi-line server greeting from ``FTP.getwelcome()``.
+
+    Returns:
+        Newline-joined stable banner lines. Empty input yields an empty string.
+    """
+
+    kept: list[str] = []
+    for raw_line in welcome.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        body = line
+        if len(line) >= 4 and line[:3].isdigit() and line[3] in "- ":
+            body = line[4:].strip()
+        if _VOLATILE_BANNER_BODY.fullmatch(body):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 class FTPPathProbeResult(Enum):
@@ -195,10 +229,12 @@ class FTPTransport(Transport):
         """Return a non-secret SHA256 identity for the connected server banner.
 
         Returns:
-            Lowercase SHA256 of the welcome response exposed by ftplib.
+            Lowercase SHA256 of the normalized welcome response. Session-volatile
+            Pure-FTPd fields (user count, local time) are stripped so Hybrid
+            Capability Profiles remain valid across reconnects.
         """
 
-        welcome = self._require_ftp().getwelcome() or ""
+        welcome = normalize_ftp_server_banner(self._require_ftp().getwelcome() or "")
         return hashlib.sha256(welcome.encode("utf-8", errors="replace")).hexdigest()
 
     def features(self) -> frozenset[str]:

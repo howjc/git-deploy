@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.6.2/git_deploy-1.6.2-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.6.3/git_deploy-1.6.3-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -369,7 +369,7 @@ make release-check
 
 ```bash
 uv venv --clear tmp/release-smoke
-uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.6.2-py3-none-any.whl
+uv pip install --python tmp/release-smoke/bin/python dist/git_deploy-1.6.3-py3-none-any.whl
 tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```

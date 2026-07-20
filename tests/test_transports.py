@@ -488,6 +488,75 @@ def test_ftp_enable_utf8_requires_feat_advertisement(
         transport.enable_utf8()
 
 
+def test_normalize_ftp_server_banner_strips_pureftpd_volatile_fields() -> None:
+    """User-count and local-time lines must not affect banner identity."""
+
+    from git_deploy.transports.ftp import normalize_ftp_server_banner
+
+    morning = (
+        "220---------- Welcome to Pure-FTPd [privsep] [TLS] ----------\n"
+        "220-You are user number 1 of 50 allowed.\n"
+        "220-Local time is now 09:01. Server port: 21.\n"
+        "220-This is a private system - No anonymous login\n"
+        "220 You will be disconnected after 15 minutes of inactivity."
+    )
+    evening = (
+        "220---------- Welcome to Pure-FTPd [privsep] [TLS] ----------\n"
+        "220-You are user number 12 of 50 allowed.\n"
+        "220-Local time is now 18:48. Server port: 21.\n"
+        "220-This is a private system - No anonymous login\n"
+        "220 You will be disconnected after 15 minutes of inactivity."
+    )
+    assert normalize_ftp_server_banner(morning) == normalize_ftp_server_banner(evening)
+    assert "user number" not in normalize_ftp_server_banner(morning).lower()
+    assert "local time" not in normalize_ftp_server_banner(morning).lower()
+    assert "Welcome to Pure-FTPd" in normalize_ftp_server_banner(morning)
+
+
+def test_ftp_server_banner_hash_stable_across_pureftpd_volatile_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capability-profile identity stays fixed when Pure-FTPd rewrites the clock."""
+
+    class FixedBannerSession(ConnectableFTPSession):
+        """Connectable session with an explicit Pure-FTPd-style welcome."""
+
+        def __init__(self, banner: str) -> None:
+            """Store one welcome string for hashing tests."""
+
+            super().__init__()
+            self._fixed_banner = banner
+
+        def getwelcome(self) -> str:
+            """Return the configured Pure-FTPd-style banner."""
+
+            return self._fixed_banner
+
+    morning = (
+        "220---------- Welcome to Pure-FTPd [privsep] [TLS] ----------\n"
+        "220-You are user number 1 of 50 allowed.\n"
+        "220-Local time is now 09:01. Server port: 21.\n"
+        "220-This is a private system - No anonymous login"
+    )
+    evening = (
+        "220---------- Welcome to Pure-FTPd [privsep] [TLS] ----------\n"
+        "220-You are user number 3 of 50 allowed.\n"
+        "220-Local time is now 18:48. Server port: 21.\n"
+        "220-This is a private system - No anonymous login"
+    )
+    sessions = [FixedBannerSession(morning), FixedBannerSession(evening)]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+    hash_a = transport.server_banner_hash()
+    transport.close()
+    transport.connect()
+    hash_b = transport.server_banner_hash()
+    assert hash_a == hash_b
+    assert len(hash_a) == 64
+
+
 def test_ftp_reconnect_banner_drift_fails_before_utf8_or_business_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
