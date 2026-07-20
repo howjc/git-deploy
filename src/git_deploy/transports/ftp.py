@@ -231,7 +231,10 @@ class FTPTransport(Transport):
         """Require UTF-8 for this and every later connection of the transport.
 
         Returns:
-            ``None`` after the server advertises and accepts UTF-8.
+            ``None`` after FEAT proves UTF-8 and the session encoding is set.
+            Servers that advertise UTF8 but reject ``OPTS UTF8 ON`` (common on
+            Pure-FTPd) are treated as always-on UTF-8; path semantics are still
+            proven by the Hybrid capability probe.
         """
 
         self._activate_required_utf8()
@@ -243,7 +246,9 @@ class FTPTransport(Transport):
         """Validate server identity and activate UTF-8 on the current session.
 
         Returns:
-            ``None`` after FEAT and OPTS prove the per-session contract.
+            ``None`` after FEAT UTF8 is present and the client encoding is utf-8.
+            ``OPTS UTF8 ON`` is attempted when supported; permanent 5xx rejection
+            is accepted for always-on servers such as Pure-FTPd.
         """
 
         actual_banner_hash = self.server_banner_hash()
@@ -256,13 +261,25 @@ class FTPTransport(Transport):
             )
         if "UTF8" not in self.features():
             raise DeployError("FTP server does not advertise mandatory UTF8 support")
+        ftp = self._require_ftp()
         try:
-            response = self._require_ftp().sendcmd("OPTS UTF8 ON")
+            response = ftp.sendcmd("OPTS UTF8 ON")
+        except ftplib.error_perm:
+            # Pure-FTPd advertises FEAT UTF8 but returns 504 Unknown command for
+            # OPTS; UTF-8 is always active when advertised. Temporary/network
+            # errors still fail closed via other ftplib.Error subclasses.
+            pass
         except ftplib.Error as exc:
             raise DeployError(f"FTP OPTS UTF8 ON failed: {exc}") from exc
-        if not response.startswith("2"):
-            raise DeployError(f"FTP OPTS UTF8 ON was not accepted: {response}")
-        self._require_ftp().encoding = "utf-8"
+        else:
+            if response.startswith("2"):
+                pass
+            elif response[:1] == "5":
+                # Permanent rejection without raising (rare, but same always-on case).
+                pass
+            else:
+                raise DeployError(f"FTP OPTS UTF8 ON was not accepted: {response}")
+        ftp.encoding = "utf-8"
 
     def lstat(
         self,

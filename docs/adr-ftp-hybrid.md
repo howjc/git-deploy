@@ -17,9 +17,9 @@
 - FTP 只提供 Forward Resume，不提供目录 Swap、旧目录树回滚或 `after_deploy`；
 - 两种 backend 继续复用 `.git-deploy/hybrid/<mapping>.json` Ownership Schema；未被 Ownership 或经验证 Pending 声明拥有的未知根目录内容永不接管或删除。
 
-FTP Hybrid 强制要求大小写敏感且保留 Unicode normalization 的 UTF-8 路径、FEAT/MLSD、二进制 STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD。能力必须由用户显式运行 `git-deploy doctor TARGET --probe-ftp-hybrid` 探测：服务器需广告 `UTF8`、接受 `OPTS UTF8 ON`，并通过中文名及 NFC/NFD 精确 MLSD/RETR/Rename/Delete。结果缓存为绑定 Target Fingerprint 与 Server Banner 的 Capability Profile Schema 3；旧 Schema 1/2 升级后必须重新 Probe。普通部署和只读 `--remote-plan` 不得静默写 Probe。
+FTP Hybrid 强制要求大小写敏感且保留 Unicode normalization 的 UTF-8 路径、FEAT/MLSD、二进制 STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD。能力必须由用户显式运行 `git-deploy doctor TARGET --probe-ftp-hybrid` 探测：服务器必须广告 `UTF8`；客户端会尝试 `OPTS UTF8 ON`，若服务器以永久 5xx 拒绝（Pure-FTPd 等 always-on UTF-8 实现常见），在 FEAT 已广告 UTF8 时仍启用客户端 UTF-8 encoding，并通过中文名及 NFC/NFD 精确 MLSD/RETR/Rename/Delete 完成真实路径契约证明。结果缓存为绑定 Target Fingerprint 与 Server Banner 的 Capability Profile Schema 3；旧 Schema 1/2 升级后必须重新 Probe。普通部署和只读 `--remote-plan` 不得静默写 Probe。
 
-一次 `enable_utf8()` 成功后，UTF-8 要求绑定 Transport 生命周期而非单条 FTP Session。网络重试的新 Session 必须在 Login 后重新核对 Server Banner、FEAT UTF8、`OPTS UTF8 ON` 与客户端 encoding；任一步失败都在 STOR/RETR/DELE/RMD/Rename 等业务命令前关闭连接。`close()` 与 retry invalidation 不得清除此要求。
+一次 `enable_utf8()` 成功后，UTF-8 要求绑定 Transport 生命周期而非单条 FTP Session。网络重试的新 Session 必须在 Login 后重新核对 Server Banner、FEAT UTF8、`OPTS UTF8 ON`（或 always-on 5xx 兼容路径）与客户端 encoding；任一步失败都在 STOR/RETR/DELE/RMD/Rename 等业务命令前关闭连接。`close()` 与 retry invalidation 不得清除此要求。
 
 ## 为什么不用 Incremental
 

@@ -33,7 +33,7 @@ FTP Target 不能配置 `after_deploy`。Hybrid 不能显式配置 `delete_remov
 git-deploy doctor prod --probe-ftp-hybrid
 ```
 
-此命令先用 Root MLSD 检查 `.git-deploy` 的远端未知别名；通过后才会在 `.git-deploy/ftp-probe/<随机 ID>` 创建、读取、Rename、删除临时文件，并清理本次 Probe Root。服务器必须广告 `UTF8`、接受 `OPTS UTF8 ON`，并证明中文文件名、NFC/NFD 两个精确名称、大小写变体可同时存在且能独立 MLSD/RETR/Delete/Rename，同时通过二进制零/非零回读、跨目录 Rename、Rename Replace、DELE 与 RMD。Profile 缺失、损坏、Target/Banner 变化、Schema 1/2 或运行期能力错误时重新执行；`--probe-ftp-hybrid` 本身会明确覆盖 Schema 3 Profile，不再需要 `--reprobe`。不要改用 LIST/NLST 或关闭校验。
+此命令先用 Root MLSD 检查 `.git-deploy` 的远端未知别名；通过后才会在 `.git-deploy/ftp-probe/<随机 ID>` 创建、读取、Rename、删除临时文件，并清理本次 Probe Root。服务器必须广告 `UTF8`；客户端会尝试 `OPTS UTF8 ON`，Pure-FTPd 等 always-on 实现对 OPTS 返回 5xx 时仍视为 UTF-8 已启用。随后必须证明中文文件名、NFC/NFD 两个精确名称、大小写变体可同时存在且能独立 MLSD/RETR/Delete/Rename，同时通过二进制零/非零回读、跨目录 Rename、Rename Replace、DELE 与 RMD。Profile 缺失、损坏、Target/Banner 变化、Schema 1/2 或运行期能力错误时重新执行；`--probe-ftp-hybrid` 本身会明确覆盖 Schema 3 Profile，不再需要 `--reprobe`。不要改用 LIST/NLST 或关闭校验。
 
 ## 4. 首次审阅与 Adoption
 

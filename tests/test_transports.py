@@ -280,11 +280,30 @@ def ftp_target() -> TargetConfig:
 class ConnectableFTPSession:
     """Record login, UTF-8 negotiation, and cleanup across reconnects."""
 
-    def __init__(self, *, banner: str = "220 stable", opts_error: bool = False) -> None:
-        """Configure server identity and optional OPTS rejection."""
+    def __init__(
+        self,
+        *,
+        banner: str = "220 stable",
+        opts_error: bool = False,
+        opts_error_reply: str = "504 Unknown command",
+        feat_utf8: bool = True,
+        opts_temp_error: bool = False,
+    ) -> None:
+        """Configure server identity and optional OPTS rejection.
+
+        Args:
+            banner: Welcome banner used for reconnect identity checks.
+            opts_error: When True, OPTS raises a permanent (5xx) error_perm.
+            opts_error_reply: Reply text for the permanent OPTS rejection.
+            feat_utf8: Whether FEAT advertises the UTF8 feature token.
+            opts_temp_error: When True, OPTS raises a temporary/network error.
+        """
 
         self.banner = banner
         self.opts_error = opts_error
+        self.opts_error_reply = opts_error_reply
+        self.feat_utf8 = feat_utf8
+        self.opts_temp_error = opts_temp_error
         self.commands: list[str] = []
         self.passive: bool | None = None
         self.encoding = "latin-1"
@@ -315,9 +334,13 @@ class ConnectableFTPSession:
 
         self.commands.append(command)
         if command == "FEAT":
-            return "211-Features\n UTF8\n MLSD\n211 End"
+            if self.feat_utf8:
+                return "211-Features\n UTF8\n MLSD\n211 End"
+            return "211-Features\n MLSD\n211 End"
+        if self.opts_temp_error:
+            raise ftplib.error_temp("421 Service not available")
         if self.opts_error:
-            raise ftplib.error_perm("500 OPTS rejected")
+            raise ftplib.error_perm(self.opts_error_reply)
         return "200 UTF8 enabled"
 
     def quit(self) -> None:
@@ -400,13 +423,41 @@ def test_ftp_utf8_requirement_is_restored_on_every_reconnect(
     assert second.passive is passive
 
 
-def test_ftp_reconnect_opts_failure_stops_before_business_commands(
+def test_ftp_pureftpd_opts_rejection_still_enables_utf8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reconnect that cannot restore UTF-8 fails closed during connect."""
+    """Pure-FTPd style OPTS 504 still activates client UTF-8 when FEAT has UTF8."""
+
+    sessions = [
+        ConnectableFTPSession(opts_error=True, opts_error_reply="504 Unknown command"),
+        ConnectableFTPSession(opts_error=True, opts_error_reply="504 Unknown command"),
+    ]
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
+    transport = FTPTransport(ftp_target())
+
+    transport.connect()
+    transport.enable_utf8()
+    first = transport.ftp
+    assert isinstance(first, ConnectableFTPSession)
+    assert first.encoding == "utf-8"
+    transport.close()
+    transport.connect()
+    second = transport.ftp
+
+    assert isinstance(second, ConnectableFTPSession)
+    assert first.commands == ["FEAT", "OPTS UTF8 ON"]
+    assert second.commands == ["FEAT", "OPTS UTF8 ON"]
+    assert second.encoding == "utf-8"
+
+
+def test_ftp_reconnect_opts_temp_failure_stops_before_business_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temporary OPTS failure still fails closed during sticky reconnect."""
 
     first = ConnectableFTPSession()
-    second = ConnectableFTPSession(opts_error=True)
+    second = ConnectableFTPSession(opts_temp_error=True)
     sessions = [first, second]
     monkeypatch.setenv("PASSWORD", "secret")
     monkeypatch.setattr(ftplib, "FTP", lambda: sessions.pop(0))
@@ -421,6 +472,20 @@ def test_ftp_reconnect_opts_failure_stops_before_business_commands(
     assert second.commands == ["FEAT", "OPTS UTF8 ON"]
     assert second.closed
     assert transport.ftp is None
+
+
+def test_ftp_enable_utf8_requires_feat_advertisement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing FEAT UTF8 remains a hard failure even without OPTS."""
+
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: ConnectableFTPSession(feat_utf8=False))
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+
+    with pytest.raises(DeployError, match="mandatory UTF8"):
+        transport.enable_utf8()
 
 
 def test_ftp_reconnect_banner_drift_fails_before_utf8_or_business_commands(
