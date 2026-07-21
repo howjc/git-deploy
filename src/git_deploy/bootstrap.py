@@ -613,8 +613,10 @@ def execute_bootstrap_item(
 
     lock = TargetLock(item.state_base, item.target_name)
     try:
+        # PlanError (busy lock) plus mkdir/open/flock/fsync I/O must not abort
+        # the batch; convert every acquisition failure into a per-item FAIL.
         lock.acquire()
-    except PlanError as exc:
+    except Exception as exc:
         return BootstrapResult(item, False, None, str(exc))
 
     transport: FTPTransport | None = None
@@ -656,7 +658,11 @@ def execute_bootstrap_item(
                 transport.close()
             except Exception:
                 pass
-        lock.release()
+        try:
+            # Release I/O must not rewrite a successful probe as a process crash.
+            lock.release()
+        except Exception:
+            pass
 
 
 def execute_bootstrap(
@@ -671,11 +677,19 @@ def execute_bootstrap(
         transport_factory: Injectable transport factory for tests.
 
     Returns:
-        One result per item in plan order.
+        One result per item in plan order. Unexpected escapes from one item
+        become a FAIL row so later targets still run (best-effort batch).
     """
 
     factory = transport_factory or create_transport
-    return tuple(execute_bootstrap_item(item, transport_factory=factory) for item in items)
+    results: list[BootstrapResult] = []
+    for item in items:
+        try:
+            results.append(execute_bootstrap_item(item, transport_factory=factory))
+        except Exception as exc:
+            # Outer isolation: KeyboardInterrupt/SystemExit are not Exception.
+            results.append(BootstrapResult(item, False, None, str(exc)))
+    return tuple(results)
 
 
 def render_bootstrap_summary(results: tuple[BootstrapResult, ...]) -> str:
@@ -823,12 +837,38 @@ def run_bootstrap(
         create_root=create_root,
         transport_factory=factory,
     )
-    print_fn(render_bootstrap_plan(plan))
+    # Plan must be visible before any mutation; output failure is fail-closed.
+    if not _emit_bootstrap_output(print_fn, render_bootstrap_plan(plan)):
+        raise ConfigError(
+            "bootstrap plan output failed; refusing remote mutations"
+        )
     confirm_fn(plan, yes=yes)
     results = execute_bootstrap(plan, transport_factory=factory)
-    print_fn("")
-    print_fn(render_bootstrap_summary(results))
-    return bootstrap_exit_code(results)
+    exit_code = bootstrap_exit_code(results)
+    # Summary is observational only: preserve the computed exit code when the
+    # pipe closes after successful remote initialization.
+    _emit_bootstrap_output(print_fn, "")
+    _emit_bootstrap_output(print_fn, render_bootstrap_summary(results))
+    return exit_code
+
+
+def _emit_bootstrap_output(print_fn, text: str) -> bool:  # noqa: ANN001
+    """Write one bootstrap line and suppress stream failures.
+
+    Args:
+        print_fn: Callable used for stdout (usually ``print``).
+        text: Line or multi-line block to emit.
+
+    Returns:
+        ``True`` when the write succeeded; ``False`` when the stream raised a
+        non-fatal output error (broken pipe, encoding, closed file).
+    """
+
+    try:
+        print_fn(text)
+        return True
+    except (BrokenPipeError, OSError, UnicodeError, ValueError):
+        return False
 
 
 def _verify_ready_item(item: BootstrapItem, transport: FTPTransport) -> BootstrapResult:

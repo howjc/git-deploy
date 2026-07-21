@@ -1293,3 +1293,376 @@ def test_force_reprobe_does_not_bypass_pending(
     assert bootstrap_exit_code(results) == 1
     assert probes == 0
     assert "Pending" in (results[0].error or "")
+
+
+def test_lock_acquire_permission_error_fails_item_and_continues(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock mkdir/open PermissionError becomes FAIL without aborting the batch."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    monkeypatch.setenv("FTP_STAGING", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    candidates = tuple(
+        item
+        for item in enumerate_project_bootstrap_candidates(config)
+        if item.target_name in {"prod", "staging"}
+    )
+    plan = plan_bootstrap_items(
+        candidates,
+        transport_factory=lambda t: FakeBootstrapTransport(t),
+    )
+    staging_transport = FakeBootstrapTransport(
+        next(item.target for item in plan if item.target_name == "staging")  # type: ignore[misc]
+    )
+    probes = 0
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Probe only the surviving staging target."""
+
+        nonlocal probes
+        del now
+        probes += 1
+        return save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+
+    original_acquire = TargetLock.acquire
+
+    def acquire_maybe_perm(self: TargetLock) -> None:
+        """Fail only the prod lock with a filesystem PermissionError."""
+
+        if self.target == "prod":
+            raise PermissionError("simulated lock parent not writable")
+        return original_acquire(self)
+
+    monkeypatch.setattr(TargetLock, "acquire", acquire_maybe_perm)
+
+    def factory(target: TargetConfig) -> FTPTransport:
+        """Serve staging only; prod must never reach the factory."""
+
+        if target.name == "prod":
+            raise AssertionError("prod must fail before transport construction")
+        return staging_transport
+
+    results = execute_bootstrap(plan, transport_factory=factory)
+    assert bootstrap_exit_code(results) == 1
+    by_name = {result.item.target_name: result for result in results}
+    assert by_name["prod"].success is False
+    assert "not writable" in (by_name["prod"].error or "")
+    assert by_name["staging"].success is True
+    assert probes == 1
+
+
+def test_lock_acquire_oserror_on_open_fails_item(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock file open OSError is converted to a per-item FAIL result."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    item = enumerate_project_bootstrap_candidates(
+        config,
+        target_filter=frozenset({"prod"}),
+    )[0]
+    plan = plan_bootstrap_items(
+        (item,),
+        transport_factory=lambda t: FakeBootstrapTransport(t),
+    )
+
+    def acquire_oserror(self: TargetLock) -> None:
+        """Simulate open/fsync style OSError during lock acquisition."""
+
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(TargetLock, "acquire", acquire_oserror)
+    results = execute_bootstrap(
+        plan,
+        transport_factory=lambda t: (_ for _ in ()).throw(AssertionError("no factory")),
+    )
+    assert len(results) == 1
+    assert results[0].success is False
+    assert "No space left" in (results[0].error or "")
+
+
+def test_lock_release_oserror_preserves_success(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Release I/O errors after a successful probe do not rewrite the result."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    item = enumerate_project_bootstrap_candidates(
+        config,
+        target_filter=frozenset({"prod"}),
+    )[0]
+    transport = FakeBootstrapTransport(item.target)  # type: ignore[arg-type]
+    plan = plan_bootstrap_items((item,), transport_factory=lambda t: transport)
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Save a valid profile for the successful path."""
+
+        del now
+        return save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    original_release = TargetLock.release
+
+    def release_oserror(self: TargetLock) -> None:
+        """Raise after the real unlock so advisory locks are still cleared."""
+
+        original_release(self)
+        raise OSError("simulated release flush failure")
+
+    monkeypatch.setattr(TargetLock, "release", release_oserror)
+    results = execute_bootstrap(plan, transport_factory=lambda t: transport)
+    assert bootstrap_exit_code(results) == 0
+    assert results[0].success is True
+    assert results[0].profile_path is not None
+
+
+def test_execute_bootstrap_outer_isolation_continues_on_escape(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected escapes from one item become FAIL and later items still run."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    monkeypatch.setenv("FTP_STAGING", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    candidates = tuple(
+        item
+        for item in enumerate_project_bootstrap_candidates(config)
+        if item.target_name in {"prod", "staging"}
+    )
+    plan = plan_bootstrap_items(
+        candidates,
+        transport_factory=lambda t: FakeBootstrapTransport(t),
+    )
+    staging_transport = FakeBootstrapTransport(
+        next(item.target for item in plan if item.target_name == "staging")  # type: ignore[misc]
+    )
+    probes = 0
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Probe the staging survivor only."""
+
+        nonlocal probes
+        del now
+        probes += 1
+        return save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    original = bootstrap_module.execute_bootstrap_item
+
+    def flaky_item(item, *, transport_factory=None):  # noqa: ANN001, ANN202
+        """Raise outside the normal FAIL path for prod only."""
+
+        if item.target_name == "prod":
+            raise RuntimeError("unexpected escape from execute_bootstrap_item")
+        return original(item, transport_factory=transport_factory)
+
+    monkeypatch.setattr(bootstrap_module, "execute_bootstrap_item", flaky_item)
+    results = execute_bootstrap(
+        plan,
+        transport_factory=lambda t: staging_transport if t.name == "staging" else FakeBootstrapTransport(t),
+    )
+    assert bootstrap_exit_code(results) == 1
+    by_name = {result.item.target_name: result for result in results}
+    assert by_name["prod"].success is False
+    assert "unexpected escape" in (by_name["prod"].error or "")
+    assert by_name["staging"].success is True
+    assert probes == 1
+
+
+def test_plan_print_broken_pipe_fails_before_mutation(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Broken plan output refuses confirmation and remote work."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    path = _ftp_hybrid_config(
+        git_project,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-a.example"
+username = "deploy"
+remote_root = "/public_html"
+password_env = "FTP_PROD"
+""",
+    )
+    probes = 0
+
+    def fake_probe(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Count illegal probes after plan output failure."""
+
+        nonlocal probes
+        probes += 1
+        raise AssertionError("must not probe when plan print fails")
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    confirmed = False
+
+    def mark_confirm(items, *, yes):  # noqa: ANN001, ANN202
+        """Detect whether confirmation ran after a broken plan print."""
+
+        nonlocal confirmed
+        del items, yes
+        confirmed = True
+
+    def broken_plan_print(text: object = "", *args: object, **kwargs: object) -> None:
+        """Raise BrokenPipeError on the plan block only."""
+
+        del args, kwargs
+        if "FTP HYBRID BOOTSTRAP PLAN" in str(text):
+            raise BrokenPipeError("plan sink closed")
+
+    with pytest.raises(ConfigError, match="plan output failed"):
+        run_bootstrap(
+            config_path=path,
+            yes=True,
+            transport_factory=lambda t: FakeBootstrapTransport(t),
+            confirm=mark_confirm,
+            print_fn=broken_plan_print,
+        )
+    assert confirmed is False
+    assert probes == 0
+
+
+def test_summary_print_broken_pipe_preserves_exit_code(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Summary stream failures after success do not change the exit code."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    path = _ftp_hybrid_config(
+        git_project,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-a.example"
+username = "deploy"
+remote_root = "/public_html"
+password_env = "FTP_PROD"
+""",
+    )
+    transport = FakeBootstrapTransport(
+        TargetConfig(
+            "prod",
+            "ftp",
+            "ftp-a.example",
+            "deploy",
+            PurePosixPath("/public_html"),
+            21,
+            password_env="FTP_PROD",
+        )
+    )
+    profile_paths: list[Path] = []
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Persist profile and record the path for post-run assertions."""
+
+        del now
+        saved = save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+        profile_paths.append(saved)
+        return saved
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+
+    def summary_pipe(text: object = "", *args: object, **kwargs: object) -> None:
+        """Allow plan output; fail only on summary emission."""
+
+        del args, kwargs
+        rendered = str(text)
+        if "FTP HYBRID BOOTSTRAP SUMMARY" in rendered:
+            raise BrokenPipeError("summary sink closed")
+        if rendered == "":
+            raise OSError("blank line after pipe closed")
+
+    code = run_bootstrap(
+        config_path=path,
+        yes=True,
+        transport_factory=lambda t: transport,
+        print_fn=summary_pipe,
+    )
+    assert code == 0
+    assert profile_paths and profile_paths[0].is_file()
+
+
+def test_summary_print_failure_preserves_nonzero_exit(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed items still return non-zero even when summary printing breaks."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    path = _ftp_hybrid_config(
+        git_project,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-a.example"
+username = "deploy"
+remote_root = "/public_html"
+password_env = "FTP_PROD"
+""",
+    )
+
+    def factory(target: TargetConfig) -> FTPTransport:
+        """Force a connect-time failure so the item is FAIL."""
+
+        del target
+        raise DeployError("synthetic connect failure")
+
+    def summary_pipe(text: object = "", *args: object, **kwargs: object) -> None:
+        """Break only after execution completes."""
+
+        del args, kwargs
+        if "FTP HYBRID BOOTSTRAP SUMMARY" in str(text):
+            raise UnicodeEncodeError("ascii", "路径", 0, 1, "unsupported")
+
+    code = run_bootstrap(
+        config_path=path,
+        yes=True,
+        transport_factory=factory,
+        print_fn=summary_pipe,
+    )
+    assert code == 1
