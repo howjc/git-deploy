@@ -29,31 +29,47 @@ class TargetLock:
         self._handle = None
 
     def acquire(self) -> None:
-        """Acquire the lock or report the current owner without waiting."""
+        """Acquire the lock or report the current owner without waiting.
+
+        After a successful ``flock``, any metadata write/fsync failure unlocks
+        and closes the handle explicitly so a later acquire is not blocked by
+        an orphaned advisory lock waiting on GC.
+        """
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+", encoding="utf-8")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                handle.seek(0)
+                owner = handle.read().strip() or "owner information unavailable"
+                raise PlanError(
+                    f"target {self.target} is already being deployed by another process: {owner}"
+                ) from exc
+            owner = {
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "started_at": int(time.time()),
+                "target": self.target,
+            }
             handle.seek(0)
-            owner = handle.read().strip() or "owner information unavailable"
-            handle.close()
-            raise PlanError(
-                f"target {self.target} is already being deployed by another process: {owner}"
-            ) from exc
-        owner = {
-            "pid": os.getpid(),
-            "host": socket.gethostname(),
-            "started_at": int(time.time()),
-            "target": self.target,
-        }
-        handle.seek(0)
-        handle.truncate()
-        json.dump(owner, handle, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+            handle.truncate()
+            json.dump(owner, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            # Deterministic cleanup for busy-lock, metadata, fsync, and interrupt.
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                handle.close()
+            except Exception:
+                pass
+            raise
         self._handle = handle
 
     def release(self) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -71,3 +72,35 @@ def test_legacy_per_worktree_state_migrates_without_deletion(
     assert common.load("prod") == state
     assert legacy.load("prod") == state
     assert not common.migrate_from(legacy, "prod")
+
+
+def test_partial_acquire_fsync_failure_releases_for_immediate_retry(
+    tmp_path: Path,
+) -> None:
+    """Metadata/fsync failure after flock must unlock so the next acquire works."""
+
+    state_root = tmp_path / "git-deploy"
+    first = TargetLock(state_root, "prod")
+    with patch("git_deploy.lock.os.fsync", side_effect=OSError(28, "No space left")):
+        with pytest.raises(OSError, match="No space left"):
+            first.acquire()
+    assert first._handle is None
+    second = TargetLock(state_root, "prod")
+    second.acquire()
+    second.release()
+
+
+def test_partial_acquire_metadata_write_failure_closes_handle(
+    tmp_path: Path,
+) -> None:
+    """Owner metadata write failure unlocks and closes without leaving _handle."""
+
+    state_root = tmp_path / "git-deploy"
+    lock = TargetLock(state_root, "staging")
+    with patch("git_deploy.lock.json.dump", side_effect=OSError("disk write failed")):
+        with pytest.raises(OSError, match="disk write failed"):
+            lock.acquire()
+    assert lock._handle is None
+    retry = TargetLock(state_root, "staging")
+    retry.acquire()
+    retry.release()
