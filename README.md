@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.6.3/git_deploy-1.6.3-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.7.0/git_deploy-1.7.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -138,15 +138,26 @@ remote_root = "/www/wwwroot/project"
 
 SFTP 使用现有 SFTP Staged Hybrid：目录 Stage/Backup/Swap，中断后先审阅并显式 `--recover`。FTP 使用 FTP In-place Hybrid：所有当前文件先上传到 `.git-deploy/ftp-hybrid/stage/`、RETR 校验并逐文件 Rename Replace；全部发布成功后才删除 Mirror 孤儿和历史受管路径，最后提交 Ownership 与 Local State。FTP 通过 `.git-deploy/ftp-hybrid/pending/` 提供 Forward Resume，不提供目录原子 Swap、旧树回滚或 `after_deploy`。
 
-FTP Hybrid 首次使用前必须显式探测服务器能力：
+FTP Hybrid 首次使用前必须初始化 Capability Profile。推荐对 Project / Workspace 一次性完成：
+
+```bash
+git-deploy bootstrap
+# CI / 非交互环境
+git-deploy bootstrap --yes
+# 强制重新探测
+git-deploy bootstrap --force --yes
+# 只处理指定 Target；缺失 Root 时拒绝创建
+git-deploy bootstrap prod staging --no-create-root --yes
+```
+
+`bootstrap` 枚举全部 FTP Hybrid Target，做只读 Preflight，输出统一 Plan，批次确认一次后顺序 Probe（可创建缺失配置 Root），一个失败继续下一个，最后 Summary；不 Build、不上传业务文件、不写 Ownership/Pending/State。仍可用单 Target Doctor：
 
 ```bash
 git-deploy doctor prod --probe-ftp-hybrid
-# CI / 非交互环境
 git-deploy doctor prod --probe-ftp-hybrid --yes
 ```
 
-Probe 在创建 `.git-deploy/ftp-probe/<随机 ID>` 前先以单层 MLSD 拒绝 `.GIT-DEPLOY` 等未知别名；本地 Capability Profile Schema 3 绑定 Target Fingerprint 与 Server Banner。服务器必须广告 UTF8；客户端会尝试 `OPTS UTF8 ON`，Pure-FTPd 等 always-on 实现对 OPTS 返回 5xx 时仍启用客户端 UTF-8。还需可靠支持中文名、NFC/NFD 精确名称、大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；一旦启用 UTF-8，同一 Transport 的每次重连都重新核对 Banner、FEAT 并再次协商 UTF-8（含 OPTS 或 always-on 兼容路径），任何失败都在业务命令前关闭连接。旧 Profile Schema 1/2 必须重新 Probe，不能无证据迁移。
+Probe 在创建 `.git-deploy/ftp-probe/<随机 ID>` 前先以单层 MLSD 拒绝 `.GIT-DEPLOY` 等未知别名；本地 Capability Profile Schema 3 绑定 Target Fingerprint 与 Server Banner。服务器必须广告 UTF8；客户端会尝试 `OPTS UTF8 ON`，仅当 OPTS 返回明确的 500/501/502/504 时按 Pure-FTPd always-on UTF-8 兼容处理，其它永久错误 Fail Closed。还需可靠支持中文名、NFC/NFD 精确名称、大小写敏感路径、FEAT/MLSD、Binary STOR/RETR、跨目录 Rename、Rename Replace、DELE 和 RMD；一旦启用 UTF-8，同一 Transport 的每次重连都重新核对 Banner、FEAT 并再次协商 UTF-8。Banner 哈希会脱敏会话易变字段（用户数、本地时间）并保留稳定后缀，空身份材料拒绝。旧 Profile Schema 1/2 必须重新 Probe，不能无证据迁移。
 
 无 Ownership Manifest 且当前同名路径已存在时，普通部署会拒绝。先人工审阅，再用 `--full` 只接管当前本地存在的同名路径；未知路径不会被 Adoption。Hybrid 固定要求 `remote = "."`、单 Mapping，并禁止显式 `delete_removed`、本地 Local Root 等于项目根目录、本地/远端符号链接和隐式所有权转移。路径组件必须可稳定枚举：拒绝首尾空格、Tab、控制字符和不可见空白；直接 `.git`、`.deploy`、`.git-deploy` 永远拒绝。FTP Hybrid 会在本地及远端写前统一检查 Source、Incremental、Hybrid Direct、历史受管根和内部 `.git-deploy`。远端仅枚举 Root Direct Entries：精确同名继续既有 Adoption/Ownership 规则，与受管根 NFC + casefold 等价但拼写不同的未知项 Fail Closed，无关未知根保持不读、不改、不删。
 
@@ -222,7 +233,7 @@ TRANSFER SUMMARY
 
 Native 的 Active Time 覆盖整个 Batch/Publish 区间，不能解释为实时网络速率；失败 Attempt 在首尾 Callback 之间发送的部分字节可能不可见。所有进度和 Summary 输出均为 Fail-open：关闭的 Pipe、Stream I/O 或控制台编码错误只会禁用后续显示，不会触发上传 Retry、改变 State/Recovery 或把成功部署报告为失败。Streaming 样本小于 1 MiB 或 1 秒时会标记 `sample too small`；Delete-only/No-op 不显示 Summary，失败部署不显示成功 Summary。Workspace 为每个 Repository 独立汇总。
 
-只构建或诊断：
+只构建、诊断或远端初始化：
 
 ```bash
 git-deploy build
@@ -230,9 +241,12 @@ git-deploy doctor
 git-deploy doctor prod
 git-deploy doctor prod --create-root
 git-deploy doctor prod --probe-ftp-hybrid
+git-deploy bootstrap --yes
 ```
 
 `doctor` 默认只读检查配置、Git、构建命令、Output、State、连接和远端根目录；Hybrid 还报告 `.deploy` Ignore、Local Root、Project ID、Ownership、Recovery、内部目录、Owned Path Type 与 Adoption；FTP 额外报告 Pending/Ownership 阶段矩阵和不自动删除的 Orphan Stage。只有 `--create-root` 才允许创建缺失 Root。Native OpenSSH Doctor 会显示 backend、系统命令绝对路径、Alias 和解析后的 Endpoint，并提示认证可能触发当前 SSH Agent。
+
+`bootstrap` 负责 FTP Hybrid 远端运行时初始化（Capability Profile / 可选 Root），`init` 只负责本地配置模板。两者不合并。
 
 新仓库可先生成无凭据模板：
 
