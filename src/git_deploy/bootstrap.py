@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+from typing import TextIO
 
 from git_deploy.config import Config, TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.errors import ConfigError, DeployError, GitDeployError, PlanError
@@ -757,7 +758,8 @@ def run_bootstrap(
     create_root: bool = True,
     transport_factory=None,  # noqa: ANN001
     confirm=None,  # noqa: ANN001
-    print_fn=print,  # noqa: ANN001
+    output: TextIO | None = None,
+    print_fn=None,  # noqa: ANN001
 ) -> int:
     """Run the full bootstrap workflow and return a process exit code.
 
@@ -770,7 +772,10 @@ def run_bootstrap(
         create_root: Create missing configured remote roots when True.
         transport_factory: Injectable transport factory for tests.
         confirm: Confirmation callback (injectable for tests).
-        print_fn: Output callback (injectable for tests).
+        output: Stream for plan/summary (default ``sys.stdout``). Writes are
+            flushed so pipe failures surface before remote mutation.
+        print_fn: Optional legacy line printer; when set without ``output``,
+            adapted into a stream for older unit tests.
 
     Returns:
         ``0`` on full success; non-zero when any item failed.
@@ -778,6 +783,7 @@ def run_bootstrap(
 
     factory = transport_factory or create_transport
     confirm_fn = confirm or confirm_bootstrap
+    stream = _resolve_bootstrap_output(output=output, print_fn=print_fn)
     filter_set = frozenset(target_filter) if target_filter else None
     if config_path is not None and workspace_path is not None:
         raise ConfigError("--config and --workspace are mutually exclusive")
@@ -837,8 +843,8 @@ def run_bootstrap(
         create_root=create_root,
         transport_factory=factory,
     )
-    # Plan must be visible before any mutation; output failure is fail-closed.
-    if not _emit_bootstrap_output(print_fn, render_bootstrap_plan(plan)):
+    # Plan must reach the consumer before any mutation; flush is mandatory.
+    if not _emit_bootstrap_output(stream, render_bootstrap_plan(plan)):
         raise ConfigError(
             "bootstrap plan output failed; refusing remote mutations"
         )
@@ -847,28 +853,134 @@ def run_bootstrap(
     exit_code = bootstrap_exit_code(results)
     # Summary is observational only: preserve the computed exit code when the
     # pipe closes after successful remote initialization.
-    _emit_bootstrap_output(print_fn, "")
-    _emit_bootstrap_output(print_fn, render_bootstrap_summary(results))
+    _emit_bootstrap_output(stream, "")
+    _emit_bootstrap_output(stream, render_bootstrap_summary(results))
     return exit_code
 
 
-def _emit_bootstrap_output(print_fn, text: str) -> bool:  # noqa: ANN001
-    """Write one bootstrap line and suppress stream failures.
+def _resolve_bootstrap_output(
+    *,
+    output: TextIO | None,
+    print_fn,  # noqa: ANN001
+) -> TextIO:
+    """Choose the bootstrap output stream.
 
     Args:
-        print_fn: Callable used for stdout (usually ``print``).
+        output: Explicit stream when provided.
+        print_fn: Optional legacy printer adapted to a TextIO-like object.
+
+    Returns:
+        Stream used for plan/summary emission.
+    """
+
+    if output is not None:
+        return output
+    if print_fn is not None:
+        return _PrintFnAdapter(print_fn)
+    return sys.stdout
+
+
+def _emit_bootstrap_output(output: TextIO, text: str) -> bool:
+    """Write one bootstrap block, flush, and suppress stream failures.
+
+    Args:
+        output: Destination text stream (usually ``sys.stdout``).
         text: Line or multi-line block to emit.
 
     Returns:
-        ``True`` when the write succeeded; ``False`` when the stream raised a
-        non-fatal output error (broken pipe, encoding, closed file).
+        ``True`` when write and flush both succeeded; ``False`` when the stream
+        raised a non-fatal output error. On failure, real stdout is silenced so
+        interpreter shutdown flush cannot rewrite the process exit code to 120.
     """
 
     try:
-        print_fn(text)
+        output.write(text)
+        if not text.endswith("\n"):
+            output.write("\n")
+        output.flush()
         return True
     except (BrokenPipeError, OSError, UnicodeError, ValueError):
+        _silence_broken_output(output)
         return False
+
+
+def _silence_broken_output(output: TextIO) -> None:
+    """Redirect a broken pipe so interpreter exit cannot report code 120.
+
+    Args:
+        output: Stream that already failed with a pipe/encoding error.
+    """
+
+    try:
+        fileno = output.fileno()
+    except Exception:
+        return
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, fileno)
+        finally:
+            os.close(devnull_fd)
+    except Exception:
+        return
+    # Replace sys.stdout when it is the broken stream so remaining buffered
+    # TextIOWrapper state is not flushed to the original closed pipe.
+    if output is sys.stdout or output is getattr(sys, "__stdout__", None):
+        try:
+            sys.stdout = open(  # noqa: SIM115
+                os.devnull,
+                "w",
+                encoding=getattr(output, "encoding", None) or "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            pass
+
+
+class _PrintFnAdapter:
+    """Adapt a legacy ``print``-style callback into a flushable text stream.
+
+    Used only by older unit tests that inject ``print_fn``. Production CLI uses
+    real ``sys.stdout`` with mandatory flush.
+    """
+
+    def __init__(self, print_fn) -> None:  # noqa: ANN001
+        """Store the line-oriented callback.
+
+        Args:
+            print_fn: Callable invoked with one complete text block.
+        """
+
+        self._print_fn = print_fn
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        """Buffer written text until flush.
+
+        Args:
+            text: Chunk from ``_emit_bootstrap_output``.
+
+        Returns:
+            Number of characters accepted.
+        """
+
+        self._buffer += text
+        return len(text)
+
+    def flush(self) -> None:
+        """Deliver the buffered block through the legacy printer."""
+
+        payload = self._buffer
+        self._buffer = ""
+        if payload.endswith("\n"):
+            payload = payload[:-1]
+        self._print_fn(payload)
+
+    def fileno(self) -> int:
+        """Legacy adapters are not OS streams; silence is a no-op."""
+
+        raise OSError("print_fn adapter has no fileno")
+
 
 
 def _verify_ready_item(item: BootstrapItem, transport: FTPTransport) -> BootstrapResult:

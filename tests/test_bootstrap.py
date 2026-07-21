@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -14,6 +17,7 @@ import git_deploy.bootstrap as bootstrap_module
 from git_deploy.bootstrap import (
     BootstrapAction,
     BootstrapItem,
+    _emit_bootstrap_output,
     bootstrap_exit_code,
     collect_known_target_names,
     collect_workspace_known_target_names,
@@ -1666,3 +1670,291 @@ password_env = "FTP_PROD"
         print_fn=summary_pipe,
     )
     assert code == 1
+
+
+class _FlushBrokenStream:
+    """Stream whose write succeeds but flush always raises BrokenPipeError."""
+
+    def __init__(self) -> None:
+        """Initialize an empty write buffer for inspection."""
+
+        self.chunks: list[str] = []
+
+    def write(self, text: str) -> int:
+        """Accept text into the user-space buffer.
+
+        Args:
+            text: Chunk written by bootstrap emission.
+
+        Returns:
+            Number of characters accepted.
+        """
+
+        self.chunks.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        """Fail only at the OS delivery boundary."""
+
+        raise BrokenPipeError("simulated closed pipe on flush")
+
+
+class _SummaryFlushBrokenStream:
+    """Allow plan flush; fail when the summary block is flushed."""
+
+    def __init__(self) -> None:
+        """Track buffered text across plan and summary phases."""
+
+        self._pending = ""
+        self.plan_flushed = False
+
+    def write(self, text: str) -> int:
+        """Buffer text until flush.
+
+        Args:
+            text: Chunk written by bootstrap emission.
+
+        Returns:
+            Number of characters accepted.
+        """
+
+        self._pending += text
+        return len(text)
+
+    def flush(self) -> None:
+        """Succeed for plan, fail for summary."""
+
+        block = self._pending
+        self._pending = ""
+        if "FTP HYBRID BOOTSTRAP SUMMARY" in block:
+            raise BrokenPipeError("summary flush closed")
+        if "FTP HYBRID BOOTSTRAP PLAN" in block:
+            self.plan_flushed = True
+
+
+def test_plan_flush_broken_pipe_fails_before_mutation(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """write() success + flush BrokenPipe still blocks remote mutation."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    path = _ftp_hybrid_config(
+        git_project,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-a.example"
+username = "deploy"
+remote_root = "/public_html"
+password_env = "FTP_PROD"
+""",
+    )
+    probes = 0
+
+    def fake_probe(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Count illegal probes after plan flush failure."""
+
+        nonlocal probes
+        probes += 1
+        raise AssertionError("must not probe when plan flush fails")
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    confirmed = False
+
+    def mark_confirm(items, *, yes):  # noqa: ANN001, ANN202
+        """Detect confirmation after a broken plan flush."""
+
+        nonlocal confirmed
+        del items, yes
+        confirmed = True
+
+    with pytest.raises(ConfigError, match="plan output failed"):
+        run_bootstrap(
+            config_path=path,
+            yes=True,
+            transport_factory=lambda t: FakeBootstrapTransport(t),
+            confirm=mark_confirm,
+            output=_FlushBrokenStream(),
+        )
+    assert confirmed is False
+    assert probes == 0
+
+
+def test_summary_flush_broken_pipe_preserves_exit_and_profile(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Summary flush failure keeps exit 0 and the saved profile on disk."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    path = _ftp_hybrid_config(
+        git_project,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-a.example"
+username = "deploy"
+remote_root = "/public_html"
+password_env = "FTP_PROD"
+""",
+    )
+    transport = FakeBootstrapTransport(
+        TargetConfig(
+            "prod",
+            "ftp",
+            "ftp-a.example",
+            "deploy",
+            PurePosixPath("/public_html"),
+            21,
+            password_env="FTP_PROD",
+        )
+    )
+    profile_paths: list[Path] = []
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Persist profile after plan has already been flushed."""
+
+        del now
+        saved = save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+        profile_paths.append(saved)
+        return saved
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    stream = _SummaryFlushBrokenStream()
+    code = run_bootstrap(
+        config_path=path,
+        yes=True,
+        transport_factory=lambda t: transport,
+        output=stream,
+    )
+    assert stream.plan_flushed is True
+    assert code == 0
+    assert profile_paths and profile_paths[0].is_file()
+
+
+def test_emit_bootstrap_output_flush_contract() -> None:
+    """_emit returns False when only flush fails, after write buffered data."""
+
+    stream = _FlushBrokenStream()
+    assert _emit_bootstrap_output(stream, "FTP HYBRID BOOTSTRAP PLAN") is False
+    assert any("PLAN" in chunk for chunk in stream.chunks)
+
+
+def test_subprocess_plan_pipe_head_c0_zero_mutation(tmp_path: Path) -> None:
+    """Real stdout pipe with zero-byte consumer must not perform remote mutation.
+
+    Models ``git-deploy bootstrap --yes | head -c 0`` by closing the read end
+    before any bytes are consumed so flush surfaces BrokenPipe immediately.
+    """
+
+    marker = tmp_path / "mutated"
+    driver = tmp_path / "plan_pipe_driver.py"
+    driver.write_text(
+        textwrap.dedent(
+            f"""
+            import sys
+            from pathlib import Path
+            from git_deploy.bootstrap import _emit_bootstrap_output
+
+            marker = Path({str(marker)!r})
+            plan = "FTP HYBRID BOOTSTRAP PLAN\\nline2"
+            if not _emit_bootstrap_output(sys.stdout, plan):
+                raise SystemExit(2)
+            marker.write_text("created", encoding="utf-8")
+            _emit_bootstrap_output(sys.stdout, "FTP HYBRID BOOTSTRAP SUMMARY")
+            raise SystemExit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+    # Literal audit pipeline; pipefail surfaces the Python exit (not head's).
+    shell = subprocess.run(
+        [
+            "bash",
+            "-o",
+            "pipefail",
+            "-c",
+            f"{sys.executable} -u {driver} | head -c 0",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert not marker.exists(), "remote mutation must not run after plan pipe fail"
+    # Fail-closed exit 2, or SIGPIPE 141 if the OS kills before Python handles EPIPE.
+    assert shell.returncode in {2, 141}, (
+        f"expected fail-closed exit 2/141, got {shell.returncode}; stderr={shell.stderr!r}"
+    )
+    assert "BrokenPipeError" not in (shell.stderr or "")
+
+    # Deterministic variant: parent drops the read end immediately (no race with head).
+    marker.unlink(missing_ok=True)
+    child = subprocess.Popen(
+        [sys.executable, "-u", str(driver)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    child.stdout.close()
+    exit_code = child.wait(timeout=10)
+    stderr = child.stderr.read() if child.stderr is not None else ""
+    assert not marker.exists()
+    assert exit_code == 2, f"expected 2, got {exit_code}; stderr={stderr!r}"
+    assert "BrokenPipeError" not in stderr
+
+
+def test_subprocess_summary_pipe_preserves_exit_not_120(tmp_path: Path) -> None:
+    """After mutation, early consumer close must keep exit 0 (not 120)."""
+
+    marker = tmp_path / "mutated"
+    driver = tmp_path / "summary_pipe_driver.py"
+    driver.write_text(
+        textwrap.dedent(
+            f"""
+            import sys
+            from pathlib import Path
+            from git_deploy.bootstrap import _emit_bootstrap_output
+
+            marker = Path({str(marker)!r})
+            plan = "FTP HYBRID BOOTSTRAP PLAN\\nok"
+            assert _emit_bootstrap_output(sys.stdout, plan)
+            marker.write_text("created", encoding="utf-8")
+            # Give the parent a moment to close after reading the plan.
+            import time
+            time.sleep(0.05)
+            _emit_bootstrap_output(sys.stdout, "")
+            _emit_bootstrap_output(sys.stdout, "FTP HYBRID BOOTSTRAP SUMMARY\\nready")
+            raise SystemExit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+    # Parent reads the full plan then closes the pipe before summary.
+    child = subprocess.Popen(
+        [sys.executable, "-u", str(driver)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    collected = child.stdout.read(len("FTP HYBRID BOOTSTRAP PLAN\nok\n"))
+    assert "FTP HYBRID BOOTSTRAP PLAN" in collected
+    child.stdout.close()
+    exit_code = child.wait(timeout=10)
+    stderr = child.stderr.read() if child.stderr is not None else ""
+    assert marker.is_file()
+    assert exit_code == 0, f"expected 0 not {exit_code}; stderr={stderr!r}"
+    assert "BrokenPipeError" not in stderr
