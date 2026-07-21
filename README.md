@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.7.0/git_deploy-1.7.0-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.7.1/git_deploy-1.7.1-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -150,7 +150,7 @@ git-deploy bootstrap --force --yes
 git-deploy bootstrap prod staging --no-create-root --yes
 ```
 
-`bootstrap` 枚举全部 FTP Hybrid Target，做只读 Preflight，输出统一 Plan，批次确认一次后顺序 Probe（可创建缺失配置 Root），一个失败继续下一个，最后 Summary；不 Build、不上传业务文件、不写 Ownership/Pending/State。仍可用单 Target Doctor：
+`bootstrap` 枚举全部 FTP Hybrid Target，做只读 Preflight，输出统一 Plan，批次确认一次后顺序 Probe（可创建缺失配置 Root），一个失败继续下一个，最后 Summary；不 Build、不上传业务文件、不写 Ownership/Pending/State。未知 Target 过滤名在连接前失败；非 Git 工作区不会创建伪 `.git`。Create Root 成功但 Probe 失败时远端 Root 保留，可重跑继续。仍可用单 Target Doctor：
 
 ```bash
 git-deploy doctor prod --probe-ftp-hybrid
