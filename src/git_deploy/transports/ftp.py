@@ -24,21 +24,44 @@ from git_deploy.transports.base import (
 # Pure-FTPd (and similar) welcome banners embed session-volatile fields such as
 # concurrent user counts and wall-clock time. Capability profiles bind to the
 # banner hash; hashing those fields invalidates the profile every connect.
-_VOLATILE_BANNER_BODY = re.compile(
-    r"(?is)"
-    r"(?:you are user number\s+\d+\s+of\s+\d+\s+allowed\.?|"
-    r"local time is now\b.*)"
+# Redact only the volatile values so stable suffixes on the same line (port,
+# node id, policy text) still participate in server identity.
+_VOLATILE_USER_NUMBER = re.compile(
+    r"(?i)(you are user number\s+)\d+(\s+of\s+)\d+(\s+allowed\.?)"
 )
+_VOLATILE_LOCAL_TIME = re.compile(r"(?i)(local time is now\s+)[^.]*")
+
+# Permanent OPTS replies that mean "command unknown / not implemented".
+# Other 5xx (auth, permission, policy) must fail closed for sticky reconnect.
+_OPTS_UTF8_UNSUPPORTED_CODES = frozenset({"500", "501", "502", "504"})
+
+
+def _is_opts_utf8_unsupported(exc: BaseException) -> bool:
+    """Return whether an OPTS permanent error means the command is unsupported.
+
+    Args:
+        exc: Raised ``ftplib.error_perm`` (or reply text beginning with a code).
+
+    Returns:
+        ``True`` only for 500/501/502/504; other permanent codes fail closed.
+    """
+
+    code = str(exc).partition(" ")[0]
+    return code in _OPTS_UTF8_UNSUPPORTED_CODES
 
 
 def normalize_ftp_server_banner(welcome: str) -> str:
-    """Drop session-volatile FTP welcome lines before identity hashing.
+    """Redact session-volatile fields from an FTP welcome before identity hashing.
+
+    User counts and local wall-clock times are replaced with placeholders so
+    reconnects keep a stable hash, while line structure and stable suffixes
+    (for example port or node identity on the same line) remain.
 
     Args:
         welcome: Raw multi-line server greeting from ``FTP.getwelcome()``.
 
     Returns:
-        Newline-joined stable banner lines. Empty input yields an empty string.
+        Newline-joined redacted banner lines. Empty input yields an empty string.
     """
 
     kept: list[str] = []
@@ -46,12 +69,15 @@ def normalize_ftp_server_banner(welcome: str) -> str:
         line = raw_line.strip()
         if not line:
             continue
-        body = line
         if len(line) >= 4 and line[:3].isdigit() and line[3] in "- ":
-            body = line[4:].strip()
-        if _VOLATILE_BANNER_BODY.fullmatch(body):
-            continue
-        kept.append(line)
+            prefix = line[:4]
+            body = line[4:]
+        else:
+            prefix = ""
+            body = line
+        body = _VOLATILE_USER_NUMBER.sub(r"\1<n>\2<n>\3", body)
+        body = _VOLATILE_LOCAL_TIME.sub(r"\1<time>", body)
+        kept.append(f"{prefix}{body}")
     return "\n".join(kept)
 
 
@@ -230,11 +256,16 @@ class FTPTransport(Transport):
 
         Returns:
             Lowercase SHA256 of the normalized welcome response. Session-volatile
-            Pure-FTPd fields (user count, local time) are stripped so Hybrid
+            Pure-FTPd fields (user count, local time) are redacted so Hybrid
             Capability Profiles remain valid across reconnects.
+
+        Raises:
+            DeployError: When the redacted banner has no stable identity material.
         """
 
         welcome = normalize_ftp_server_banner(self._require_ftp().getwelcome() or "")
+        if not welcome.strip():
+            raise DeployError("FTP server banner lacks stable identity material")
         return hashlib.sha256(welcome.encode("utf-8", errors="replace")).hexdigest()
 
     def features(self) -> frozenset[str]:
@@ -283,8 +314,9 @@ class FTPTransport(Transport):
 
         Returns:
             ``None`` after FEAT UTF8 is present and the client encoding is utf-8.
-            ``OPTS UTF8 ON`` is attempted when supported; permanent 5xx rejection
-            is accepted for always-on servers such as Pure-FTPd.
+            ``OPTS UTF8 ON`` is attempted when supported; only permanent replies
+            that mean the command is unsupported (500/501/502/504) are accepted
+            as always-on UTF-8 (Pure-FTPd). Other permanent errors fail closed.
         """
 
         actual_banner_hash = self.server_banner_hash()
@@ -300,18 +332,19 @@ class FTPTransport(Transport):
         ftp = self._require_ftp()
         try:
             response = ftp.sendcmd("OPTS UTF8 ON")
-        except ftplib.error_perm:
+        except ftplib.error_perm as exc:
             # Pure-FTPd advertises FEAT UTF8 but returns 504 Unknown command for
-            # OPTS; UTF-8 is always active when advertised. Temporary/network
-            # errors still fail closed via other ftplib.Error subclasses.
-            pass
+            # OPTS; UTF-8 is always active when advertised. Other permanent codes
+            # (auth, permission, policy) and temporary/network errors fail closed.
+            if not _is_opts_utf8_unsupported(exc):
+                raise DeployError(f"FTP OPTS UTF8 ON failed: {exc}") from exc
         except ftplib.Error as exc:
             raise DeployError(f"FTP OPTS UTF8 ON failed: {exc}") from exc
         else:
             if response.startswith("2"):
                 pass
-            elif response[:1] == "5":
-                # Permanent rejection without raising (rare, but same always-on case).
+            elif _is_opts_utf8_unsupported(response):
+                # Permanent unsupported reply without raising (rare always-on case).
                 pass
             else:
                 raise DeployError(f"FTP OPTS UTF8 ON was not accepted: {response}")

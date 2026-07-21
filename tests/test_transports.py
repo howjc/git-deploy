@@ -451,6 +451,53 @@ def test_ftp_pureftpd_opts_rejection_still_enables_utf8(
     assert second.encoding == "utf-8"
 
 
+@pytest.mark.parametrize("reply", ("500 Syntax error", "501 Bad args", "502 Not implemented"))
+def test_ftp_opts_unsupported_codes_enable_always_on_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+    reply: str,
+) -> None:
+    """Only 500/501/502/504 permanent OPTS replies are treated as always-on UTF-8."""
+
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(
+        ftplib,
+        "FTP",
+        lambda: ConnectableFTPSession(opts_error=True, opts_error_reply=reply),
+    )
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+    transport.enable_utf8()
+    assert isinstance(transport.ftp, ConnectableFTPSession)
+    assert transport.ftp.encoding == "utf-8"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    (
+        "530 Not logged in",
+        "532 Need account for login",
+        "550 Permission denied",
+        "553 Filename not allowed",
+    ),
+)
+def test_ftp_opts_other_permanent_errors_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    reply: str,
+) -> None:
+    """Auth/permission/policy 5xx on OPTS must not be treated as always-on UTF-8."""
+
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(
+        ftplib,
+        "FTP",
+        lambda: ConnectableFTPSession(opts_error=True, opts_error_reply=reply),
+    )
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+    with pytest.raises(DeployError, match="OPTS UTF8 ON failed"):
+        transport.enable_utf8()
+
+
 def test_ftp_reconnect_opts_temp_failure_stops_before_business_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -488,8 +535,8 @@ def test_ftp_enable_utf8_requires_feat_advertisement(
         transport.enable_utf8()
 
 
-def test_normalize_ftp_server_banner_strips_pureftpd_volatile_fields() -> None:
-    """User-count and local-time lines must not affect banner identity."""
+def test_normalize_ftp_server_banner_redacts_pureftpd_volatile_fields() -> None:
+    """User-count and local-time values must not affect banner identity."""
 
     from git_deploy.transports.ftp import normalize_ftp_server_banner
 
@@ -507,10 +554,41 @@ def test_normalize_ftp_server_banner_strips_pureftpd_volatile_fields() -> None:
         "220-This is a private system - No anonymous login\n"
         "220 You will be disconnected after 15 minutes of inactivity."
     )
-    assert normalize_ftp_server_banner(morning) == normalize_ftp_server_banner(evening)
-    assert "user number" not in normalize_ftp_server_banner(morning).lower()
-    assert "local time" not in normalize_ftp_server_banner(morning).lower()
-    assert "Welcome to Pure-FTPd" in normalize_ftp_server_banner(morning)
+    redacted = normalize_ftp_server_banner(morning)
+    assert redacted == normalize_ftp_server_banner(evening)
+    # Field redaction keeps structure and stable suffixes; volatile numbers go.
+    assert "user number <n> of <n> allowed" in redacted.lower()
+    assert "local time is now <time>" in redacted.lower()
+    assert "Server port: 21" in redacted
+    assert "09:01" not in redacted
+    assert "18:48" not in redacted
+    assert "Welcome to Pure-FTPd" in redacted
+
+
+def test_normalize_ftp_server_banner_keeps_stable_suffix_on_volatile_line() -> None:
+    """Stable tokens on a local-time line must still participate in identity."""
+
+    from git_deploy.transports.ftp import normalize_ftp_server_banner
+
+    a = "220-Local time is now 09:01. Server port: 21. Node: ftp-a."
+    b = "220-Local time is now 18:48. Server port: 21. Node: ftp-a."
+    c = "220-Local time is now 18:48. Server port: 21. Node: ftp-b."
+    assert normalize_ftp_server_banner(a) == normalize_ftp_server_banner(b)
+    assert "Node: ftp-a" in normalize_ftp_server_banner(a)
+    assert normalize_ftp_server_banner(a) != normalize_ftp_server_banner(c)
+
+
+def test_ftp_server_banner_hash_rejects_empty_stable_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty or whitespace-only welcome must fail closed for identity."""
+
+    monkeypatch.setenv("PASSWORD", "secret")
+    monkeypatch.setattr(ftplib, "FTP", lambda: ConnectableFTPSession(banner=""))
+    transport = FTPTransport(ftp_target())
+    transport.connect()
+    with pytest.raises(DeployError, match="lacks stable identity material"):
+        transport.server_banner_hash()
 
 
 def test_ftp_server_banner_hash_stable_across_pureftpd_volatile_fields(
