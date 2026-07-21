@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.7.1/git_deploy-1.7.1-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.7.2/git_deploy-1.7.2-py3-none-any.whl
 git-deploy --version
 ```
 
