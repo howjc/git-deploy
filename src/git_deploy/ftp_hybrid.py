@@ -272,6 +272,97 @@ def load_capability_profile(
     return profile
 
 
+class CapabilityProfileStatus(str, Enum):
+    """Classify the local FTP Hybrid Capability Profile without raising."""
+
+    MISSING = "missing"
+    VALID = "valid"
+    OLD_SCHEMA = "old-schema"
+    CORRUPT = "corrupt"
+    TARGET_DRIFT = "target-drift"
+    BANNER_DRIFT = "banner-drift"
+    INCOMPLETE = "incomplete"
+
+
+def inspect_capability_profile(
+    runtime_base: Path,
+    target: TargetConfig,
+    *,
+    server_banner_hash: str,
+) -> CapabilityProfileStatus:
+    """Classify the local profile for bootstrap/doctor without raising.
+
+    Args:
+        runtime_base: ``<git-common-dir>/git-deploy`` state directory.
+        target: Resolved FTP target whose fingerprint names the profile.
+        server_banner_hash: Current non-secret banner hash from the live connection.
+
+    Returns:
+        Status describing whether the profile is ready or must be (re)probed.
+    """
+
+    path = capability_profile_path(runtime_base, target)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return CapabilityProfileStatus.MISSING
+    except OSError:
+        return CapabilityProfileStatus.CORRUPT
+    try:
+        profile = parse_capabilities(data)
+    except PlanError as exc:
+        message = str(exc).lower()
+        if "obsolete" in message:
+            return CapabilityProfileStatus.OLD_SCHEMA
+        return CapabilityProfileStatus.CORRUPT
+    if profile.target_fingerprint != target.fingerprint:
+        return CapabilityProfileStatus.TARGET_DRIFT
+    if profile.server_banner_hash != server_banner_hash:
+        return CapabilityProfileStatus.BANNER_DRIFT
+    if not all(
+        (
+            profile.mlsd,
+            profile.case_sensitive_paths,
+            profile.rename_cross_directory,
+            profile.rename_replace_file,
+            profile.retr,
+            profile.delete_file,
+            profile.remove_directory,
+            profile.utf8,
+            profile.unicode_paths,
+            profile.normalization_preserving,
+        )
+    ):
+        return CapabilityProfileStatus.INCOMPLETE
+    return CapabilityProfileStatus.VALID
+
+
+def probe_and_save_ftp_hybrid_capabilities(
+    transport: FTPTransport,
+    target: TargetConfig,
+    runtime_base: Path,
+    *,
+    now: int | None = None,
+) -> Path:
+    """Run the protected FTP Hybrid probe and atomically persist the profile.
+
+    Shared by Doctor ``--probe-ftp-hybrid`` and ``git-deploy bootstrap`` so both
+    paths use the same probe root, Alias Gate, and profile identity rules.
+
+    Args:
+        transport: Connected FTP transport for the confirmed target.
+        target: Resolved FTP target bound into the profile.
+        runtime_base: ``<git-common-dir>/git-deploy`` state directory.
+        now: Optional deterministic timestamp for tests.
+
+    Returns:
+        Final non-secret capability profile path.
+    """
+
+    profile = probe_ftp_hybrid_capabilities(transport, target, now=now)
+    return save_capability_profile(runtime_base, profile)
+
+
 def probe_ftp_hybrid_capabilities(
     transport: FTPTransport,
     target: TargetConfig,
@@ -1006,17 +1097,20 @@ __all__ = [
     "MAX_PENDING_BYTES",
     "MAX_SCAN_DEPTH",
     "MAX_SCAN_ENTRIES",
+    "CapabilityProfileStatus",
     "FTPHybridCapabilities",
     "FTPHybridPending",
     "FTPPendingPhase",
     "FTPRemoteTree",
     "capability_profile_path",
+    "inspect_capability_profile",
     "load_capability_profile",
     "local_manifest_hash",
     "parse_capabilities",
     "parse_pending",
     "pending_path",
     "publish_verified_bytes",
+    "probe_and_save_ftp_hybrid_capabilities",
     "probe_ftp_hybrid_capabilities",
     "read_pending",
     "save_capability_profile",

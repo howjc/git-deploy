@@ -13,7 +13,7 @@ from tests.conftest import write_config
 
 
 def test_help_exposes_only_lite_workflow(capsys: pytest.CaptureFixture[str]) -> None:
-    """Help names default deploy, build, and doctor without old state commands."""
+    """Help names default deploy, build, doctor, and bootstrap without old state commands."""
 
     with pytest.raises(SystemExit) as raised:
         cli.main(["--help"])
@@ -22,12 +22,110 @@ def test_help_exposes_only_lite_workflow(capsys: pytest.CaptureFixture[str]) -> 
     output = capsys.readouterr().out
     assert "build" in output
     assert "doctor" in output
+    assert "bootstrap" in output
     assert "--probe-ftp-hybrid" in output
     assert "replace the" in output
     assert "local capability profile" in output
+    assert "--force" in output
+    assert "--no-create-root" in output
     assert "--reprobe" not in output
     assert "rollback" not in output
-    assert "bootstrap" not in output
+
+
+def test_bootstrap_cli_flags_and_rejects_deploy_only_options(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Bootstrap accepts --yes/--force/--no-create-root and rejects deploy flags."""
+
+    from git_deploy.config import load_config
+    from tests.test_bootstrap import FakeBootstrapTransport, _ftp_hybrid_config, _valid_profile
+    from git_deploy.ftp_hybrid import save_capability_profile
+    import git_deploy.bootstrap as bootstrap_module
+
+    path = _ftp_hybrid_config(
+        git_project,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-a.example"
+username = "deploy"
+remote_root = "/public_html"
+password_env = "FTP_PROD"
+""",
+    )
+    monkeypatch.setenv("FTP_PROD", "secret")
+    transport = FakeBootstrapTransport(load_config(path).target("prod"))
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Persist a profile for the CLI bootstrap path."""
+
+        del now
+        return save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    monkeypatch.setattr(
+        bootstrap_module,
+        "create_transport",
+        lambda target: transport,
+    )
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(path),
+                "bootstrap",
+                "prod",
+                "--yes",
+                "--force",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "FTP HYBRID BOOTSTRAP PLAN" in out
+    assert "REPROBE" in out or "PROBE" in out or "READY" in out
+
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(path),
+                "bootstrap",
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+
+
+def test_init_and_doctor_parsing_unchanged_with_extra_nargs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """init still rejects targets; doctor still accepts one target positional."""
+
+    from git_deploy.doctor import DoctorResult
+
+    assert cli.main(["init", "prod"]) == 2
+
+    path = write_config(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "run_doctor",
+        lambda *a, **k: (DoctorResult("config", True, "ok"),),
+    )
+    # Non-git project doctor still returns after local checks.
+    code = cli.main(["--config", str(path), "doctor", "dev"])
+    assert code in {0, 1}
 
 
 def test_dry_run_never_calls_deployer(

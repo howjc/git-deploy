@@ -11,9 +11,8 @@ from git_deploy.config import Config, TargetConfig, resolve_target_for_plan
 from git_deploy.errors import PlanError
 from git_deploy.ftp_hybrid import (
     load_capability_profile,
-    probe_ftp_hybrid_capabilities,
+    probe_and_save_ftp_hybrid_capabilities,
     read_pending,
-    save_capability_profile,
     scan_ftp_tree,
     validate_pending_ownership_phase,
 )
@@ -209,8 +208,11 @@ def run_doctor(
                 if not isinstance(transport, FTPTransport):
                     raise TypeError("FTP Hybrid Doctor requires FTPTransport semantics")
                 if probe_ftp_hybrid:
-                    profile = probe_ftp_hybrid_capabilities(transport, resolved_target)
-                    profile_path = save_capability_profile(state_store.base, profile)
+                    profile_path = probe_and_save_ftp_hybrid_capabilities(
+                        transport,
+                        resolved_target,
+                        state_store.base,
+                    )
                     results.append(
                         DoctorResult(
                             "FTP Hybrid Capability Probe",

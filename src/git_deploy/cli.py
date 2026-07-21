@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from git_deploy import __version__
+from git_deploy.bootstrap import run_bootstrap
 from git_deploy.builder import run_build
 from git_deploy.config import Config, discover_config, load_config
 from git_deploy.doctor import DoctorResult, run_doctor
@@ -47,8 +48,19 @@ def build_parser() -> argparse.ArgumentParser:
         prog="git-deploy",
         description="Git-aware local build and FTP/SFTP file synchronization",
     )
-    parser.add_argument("action", nargs="?", help="target name, 'build', 'doctor', or 'init'")
-    parser.add_argument("doctor_target", nargs="?", help="optional target for doctor/workspace build")
+    parser.add_argument(
+        "action",
+        nargs="?",
+        help="target name, 'build', 'doctor', 'init', or 'bootstrap'",
+    )
+    parser.add_argument(
+        "extra",
+        nargs="*",
+        help=(
+            "doctor/workspace-build target, or bootstrap target filter names "
+            "(bootstrap only)"
+        ),
+    )
     planning = parser.add_mutually_exclusive_group()
     planning.add_argument(
         "--dry-run",
@@ -71,7 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="upload all managed content, rebuild state, and allow reviewed Hybrid adoption",
     )
-    parser.add_argument("--yes", action="store_true", help="deploy without interactive confirmation")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="deploy/bootstrap without interactive confirmation",
+    )
     parser.add_argument("--config", type=Path, help="path to one project's deploy.toml")
     parser.add_argument("--workspace", type=Path, help="path to deploy.workspace.toml")
     parser.add_argument("--verbose", action="store_true", help="show detailed upload progress")
@@ -79,6 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--create-root",
         action="store_true",
         help="allow doctor to create a missing remote root",
+    )
+    parser.add_argument(
+        "--no-create-root",
+        action="store_true",
+        help="bootstrap: refuse to create a missing remote root",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="bootstrap: re-probe even when the capability profile is valid",
     )
     parser.add_argument(
         "--probe-ftp-hybrid",
@@ -107,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "init":
             return _initialize(args)
+        if args.action == "bootstrap":
+            return _bootstrap(args)
         mode, input_path = _select_input(args.config, args.workspace)
         if mode == "workspace":
             workspace = load_workspace(input_path)
@@ -134,6 +162,47 @@ def _initialize(args: argparse.Namespace) -> int:
     created = initialize_project(Path.cwd(), destination)
     print(f"Created {created}; edit target settings, then run git-deploy --dry-run.")
     return 0
+
+
+def _bootstrap(args: argparse.Namespace) -> int:
+    """Initialize FTP Hybrid capability profiles for Project or Workspace mode.
+
+    Args:
+        args: Parsed CLI namespace for the bootstrap command.
+
+    Returns:
+        Zero when every non-SKIP item succeeds; non-zero on any failure.
+    """
+
+    _validate_bootstrap_args(args)
+    config_path = args.config.expanduser().resolve() if args.config is not None else None
+    workspace_path = (
+        args.workspace.expanduser().resolve() if args.workspace is not None else None
+    )
+    return run_bootstrap(
+        config_path=config_path,
+        workspace_path=workspace_path,
+        target_filter=tuple(args.extra),
+        yes=args.yes,
+        force=args.force,
+        create_root=not args.no_create_root,
+    )
+
+
+def _optional_single_extra(args: argparse.Namespace, *, command: str) -> str | None:
+    """Return at most one extra positional for doctor/build, or reject multi-filter.
+
+    Args:
+        args: Parsed CLI namespace.
+        command: Command name used in error messages.
+
+    Returns:
+        The single extra positional, or ``None`` when absent.
+    """
+
+    if len(args.extra) > 1:
+        raise ConfigError(f"{command} accepts at most one TARGET positional argument")
+    return args.extra[0] if args.extra else None
 
 
 def _select_input(config: Path | None, workspace: Path | None) -> tuple[InputMode, Path]:
@@ -183,8 +252,14 @@ def _run_project(
             doctor_git_dir = repository.common_dir()
         except PlanError:
             doctor_git_dir = config.project_root / ".git"
-        return _doctor(config, args.doctor_target, args, repository, StateStore(doctor_git_dir))
-    if args.doctor_target is not None:
+        return _doctor(
+            config,
+            _optional_single_extra(args, command="doctor"),
+            args,
+            repository,
+            StateStore(doctor_git_dir),
+        )
+    if args.extra:
         parser.error("deployment accepts at most one TARGET positional argument")
     return _deploy_project(config, args.action, args)
 
@@ -198,13 +273,17 @@ def _run_workspace(
 
     if args.action == "build":
         _validate_build_args(args, allow_target=True)
-        run_workspace_build(workspace, args.doctor_target)
+        run_workspace_build(workspace, _optional_single_extra(args, command="build"))
         print("Workspace build completed successfully.")
         return 0
     if args.action == "doctor":
         _validate_doctor_args(args)
-        return _doctor_workspace(workspace, args.doctor_target, args)
-    if args.doctor_target is not None:
+        return _doctor_workspace(
+            workspace,
+            _optional_single_extra(args, command="doctor"),
+            args,
+        )
+    if args.extra:
         parser.error("deployment accepts at most one TARGET positional argument")
     return _deploy_workspace(workspace, args.action, args)
 
@@ -227,6 +306,10 @@ def _deploy_project(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
+    if args.no_create_root:
+        raise ConfigError("--no-create-root is only valid with bootstrap")
+    if args.force:
+        raise ConfigError("--force is only valid with bootstrap")
     if args.probe_ftp_hybrid:
         raise ConfigError("--probe-ftp-hybrid is only valid with doctor")
     if args.recover and args.full:
@@ -319,6 +402,10 @@ def _deploy_workspace(
 
     if args.create_root:
         raise ConfigError("--create-root is only valid with doctor")
+    if args.no_create_root:
+        raise ConfigError("--no-create-root is only valid with bootstrap")
+    if args.force:
+        raise ConfigError("--force is only valid with bootstrap")
     if args.probe_ftp_hybrid:
         raise ConfigError("--probe-ftp-hybrid is only valid with doctor")
     if args.recover and args.full:
@@ -569,7 +656,7 @@ def _confirm_ftp_probe(target: str) -> None:
 def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> None:
     """Reject deploy-only options accidentally passed to the build command."""
 
-    if args.doctor_target is not None and not allow_target:
+    if args.extra and not allow_target:
         raise ConfigError("build does not accept a target")
     if (
         args.dry_run
@@ -579,6 +666,8 @@ def _validate_build_args(args: argparse.Namespace, *, allow_target: bool) -> Non
         or args.full
         or args.yes
         or args.create_root
+        or args.no_create_root
+        or args.force
         or args.probe_ftp_hybrid
     ):
         raise ConfigError("build does not accept deploy-only flags")
@@ -593,6 +682,8 @@ def _validate_doctor_args(args: argparse.Namespace) -> None:
         or args.recover
         or args.skip_build
         or args.full
+        or args.no_create_root
+        or args.force
         or (args.yes and not args.probe_ftp_hybrid)
     ):
         raise ConfigError("doctor does not accept deploy-only flags")
@@ -601,7 +692,7 @@ def _validate_doctor_args(args: argparse.Namespace) -> None:
 def _validate_init_args(args: argparse.Namespace) -> None:
     """Reject flags that would imply build, remote, or mutation behavior for init."""
 
-    if args.doctor_target is not None:
+    if args.extra:
         raise ConfigError("init does not accept a target")
     if (
         args.dry_run
@@ -612,9 +703,28 @@ def _validate_init_args(args: argparse.Namespace) -> None:
         or args.yes
         or args.verbose
         or args.create_root
+        or args.no_create_root
+        or args.force
         or args.probe_ftp_hybrid
     ):
         raise ConfigError("init does not accept deploy or doctor flags")
+
+
+def _validate_bootstrap_args(args: argparse.Namespace) -> None:
+    """Reject flags that would imply build, deploy, or doctor-only behavior."""
+
+    if (
+        args.dry_run
+        or args.remote_plan
+        or args.recover
+        or args.skip_build
+        or args.full
+        or args.verbose
+        or args.create_root
+        or args.probe_ftp_hybrid
+    ):
+        raise ConfigError("bootstrap does not accept deploy or doctor-only flags")
+
 
 
 if __name__ == "__main__":
