@@ -97,6 +97,63 @@ def hybrid_output_name(config: Config) -> str | None:
     return None
 
 
+def collect_known_target_names(config: Config) -> frozenset[str]:
+    """Return every target name declared in one project configuration.
+
+    Args:
+        config: Loaded project configuration.
+
+    Returns:
+        Frozen set of target names for filter validation.
+    """
+
+    return frozenset(config.targets)
+
+
+def collect_workspace_known_target_names(workspace: WorkspaceConfig) -> frozenset[str]:
+    """Union target names across workspace repositories that load successfully.
+
+    Args:
+        workspace: Loaded thin workspace configuration.
+
+    Returns:
+        Names present in at least one repository config. Broken configs are
+        skipped for name discovery and surface later as FAIL rows.
+    """
+
+    known: set[str] = set()
+    for repository in workspace.repositories:
+        try:
+            config = load_config(repository.config_path)
+        except ConfigError:
+            continue
+        known.update(config.targets)
+    return frozenset(known)
+
+
+def validate_bootstrap_target_filter(
+    target_filter: frozenset[str] | None,
+    known_targets: frozenset[str],
+) -> None:
+    """Reject unknown target filter names before any remote connection.
+
+    Args:
+        target_filter: Optional set of requested target names.
+        known_targets: Names present in Project or Workspace configs.
+
+    Raises:
+        ConfigError: When any requested name is absent from ``known_targets``.
+    """
+
+    if not target_filter:
+        return
+    unknown = sorted(target_filter - known_targets)
+    if unknown:
+        raise ConfigError(
+            "unknown bootstrap target filter(s): " + ", ".join(unknown)
+        )
+
+
 def enumerate_project_bootstrap_candidates(
     config: Config,
     *,
@@ -111,16 +168,22 @@ def enumerate_project_bootstrap_candidates(
         repository_name: Display name; defaults to the project directory name.
 
     Returns:
-        Stable-sorted candidates (eligible and skipped) for preflight.
+        Stable-sorted candidates (eligible and skipped) for preflight. Invalid
+        Git worktrees produce FAIL_PRECHECK rows without creating a pseudo
+        ``.git`` directory.
     """
 
     name = repository_name or config.project_root.name
     repository = GitRepository(config.project_root)
+    git_error: str | None = None
     try:
+        repository.validate()
         git_dir = repository.common_dir()
-    except PlanError:
-        git_dir = config.project_root / ".git"
-    state_base = StateStore(git_dir).base
+        state_base = StateStore(git_dir).base
+    except PlanError as exc:
+        git_error = str(exc)
+        # Never invent ``<root>/.git``; state_base is unused for FAIL rows.
+        state_base = config.project_root / ".git-deploy-invalid-worktree"
     hybrid = has_hybrid_output(config)
     mapping = hybrid_output_name(config)
     items: list[BootstrapItem] = []
@@ -178,6 +241,23 @@ def enumerate_project_bootstrap_candidates(
                 )
             )
             continue
+        if git_error is not None:
+            items.append(
+                BootstrapItem(
+                    name,
+                    config.project_root,
+                    config.path,
+                    target_name,
+                    target,
+                    state_base,
+                    BootstrapAction.FAIL_PRECHECK,
+                    git_error,
+                    endpoint=endpoint,
+                    project_id=config.project_id,
+                    hybrid_mapping=mapping,
+                )
+            )
+            continue
         items.append(
             BootstrapItem(
                 name,
@@ -208,12 +288,30 @@ def enumerate_workspace_bootstrap_candidates(
         target_filter: Optional target-name filter applied per repository.
 
     Returns:
-        Stable-sorted items across repository order then target name.
+        Stable-sorted items across repository order then target name. A single
+        repository with invalid config or Git metadata becomes FAIL rows while
+        later repositories continue.
     """
 
     items: list[BootstrapItem] = []
     for repository in workspace.repositories:
-        config = load_config(repository.config_path)
+        try:
+            config = load_config(repository.config_path)
+        except ConfigError as exc:
+            items.append(
+                BootstrapItem(
+                    repository.name,
+                    repository.path,
+                    repository.config_path,
+                    "<config>",
+                    None,
+                    repository.path / ".git-deploy-invalid-config",
+                    BootstrapAction.FAIL_PRECHECK,
+                    str(exc),
+                    endpoint="",
+                )
+            )
+            continue
         items.extend(
             enumerate_project_bootstrap_candidates(
                 config,
@@ -246,6 +344,8 @@ def preflight_bootstrap_item(
     factory = transport_factory or create_transport
     if item.action is BootstrapAction.SKIP:
         return item
+    if item.action is BootstrapAction.FAIL_PRECHECK:
+        return item
     if item.target is None:
         return replace(
             item,
@@ -274,75 +374,76 @@ def preflight_bootstrap_item(
             reason=str(exc),
             target=target,
         )
-    transport = factory(resolved)
-    if not isinstance(transport, FTPTransport):
-        return replace(
-            item,
-            action=BootstrapAction.FAIL_PRECHECK,
-            reason="FTP Hybrid bootstrap requires FTPTransport",
-            target=resolved,
-        )
+    transport: FTPTransport | None = None
     try:
-        transport.connect()
-        try:
-            banner_hash = transport.server_banner_hash()
-            root_exists = transport.root_exists()
-            if not root_exists:
-                if create_root:
-                    return replace(
-                        item,
-                        action=BootstrapAction.CREATE_ROOT_AND_PROBE,
-                        reason="remote root missing",
-                        target=resolved,
-                        endpoint=_endpoint_label(resolved),
-                    )
-                return replace(
-                    item,
-                    action=BootstrapAction.FAIL_PRECHECK,
-                    reason="remote root missing; pass without --no-create-root to create it",
-                    target=resolved,
-                    endpoint=_endpoint_label(resolved),
-                )
-            status = inspect_capability_profile(
-                item.state_base,
-                resolved,
-                server_banner_hash=banner_hash,
-            )
-            if force:
-                return replace(
-                    item,
-                    action=BootstrapAction.REPROBE,
-                    reason="forced reprobe",
-                    target=resolved,
-                    endpoint=_endpoint_label(resolved),
-                )
-            if status is CapabilityProfileStatus.VALID:
-                pending_reason = _pending_block_reason(transport, item, resolved)
-                if pending_reason is not None:
-                    return replace(
-                        item,
-                        action=BootstrapAction.FAIL_PRECHECK,
-                        reason=pending_reason,
-                        target=resolved,
-                        endpoint=_endpoint_label(resolved),
-                    )
-                return replace(
-                    item,
-                    action=BootstrapAction.READY,
-                    reason="existing profile valid",
-                    target=resolved,
-                    endpoint=_endpoint_label(resolved),
-                )
-            action, reason = _status_to_action(status)
+        built = factory(resolved)
+        if not isinstance(built, FTPTransport):
             return replace(
                 item,
-                action=action,
-                reason=reason,
+                action=BootstrapAction.FAIL_PRECHECK,
+                reason="FTP Hybrid bootstrap requires FTPTransport",
+                target=resolved,
+            )
+        transport = built
+        transport.connect()
+        banner_hash = transport.server_banner_hash()
+        root_exists = transport.root_exists()
+        if not root_exists:
+            if create_root:
+                return replace(
+                    item,
+                    action=BootstrapAction.CREATE_ROOT_AND_PROBE,
+                    reason="remote root missing",
+                    target=resolved,
+                    endpoint=_endpoint_label(resolved),
+                )
+            return replace(
+                item,
+                action=BootstrapAction.FAIL_PRECHECK,
+                reason="remote root missing; pass without --no-create-root to create it",
                 target=resolved,
                 endpoint=_endpoint_label(resolved),
             )
-        finally:
-            transport.close()
+        status = inspect_capability_profile(
+            item.state_base,
+            resolved,
+            server_banner_hash=banner_hash,
+        )
+        if force:
+            return replace(
+                item,
+                action=BootstrapAction.REPROBE,
+                reason="forced reprobe; pending checked at execution",
+                target=resolved,
+                endpoint=_endpoint_label(resolved),
+            )
+        if status is CapabilityProfileStatus.VALID:
+            pending_reason = _pending_block_reason(transport, item, resolved)
+            if pending_reason is not None:
+                return replace(
+                    item,
+                    action=BootstrapAction.FAIL_PRECHECK,
+                    reason=pending_reason,
+                    target=resolved,
+                    endpoint=_endpoint_label(resolved),
+                )
+            return replace(
+                item,
+                action=BootstrapAction.READY,
+                reason="existing profile valid",
+                target=resolved,
+                endpoint=_endpoint_label(resolved),
+            )
+        action, reason = _status_to_action(status)
+        if action is BootstrapAction.REPROBE:
+            reason = f"{reason}; pending checked at execution"
+        return replace(
+            item,
+            action=action,
+            reason=reason,
+            target=resolved,
+            endpoint=_endpoint_label(resolved),
+        )
     except Exception as exc:
         return replace(
             item,
@@ -351,6 +452,9 @@ def preflight_bootstrap_item(
             target=resolved,
             endpoint=_endpoint_label(resolved),
         )
+    finally:
+        if transport is not None:
+            transport.close()
 
 
 def plan_bootstrap_items(
@@ -495,12 +599,12 @@ def execute_bootstrap_item(
 
     Returns:
         Per-item success/failure result; never raises for probe failures.
+        READY rows re-verify profile and Pending under the target lock so a
+        confirmation-window drift cannot report a false success.
     """
 
     factory = transport_factory or create_transport
     if item.action is BootstrapAction.SKIP:
-        return BootstrapResult(item, True, None, None, detail=item.reason)
-    if item.action is BootstrapAction.READY:
         return BootstrapResult(item, True, None, None, detail=item.reason)
     if item.action is BootstrapAction.FAIL_PRECHECK:
         return BootstrapResult(item, False, None, item.reason, detail=item.reason)
@@ -513,34 +617,45 @@ def execute_bootstrap_item(
     except PlanError as exc:
         return BootstrapResult(item, False, None, str(exc))
 
-    transport = factory(item.target)
+    transport: FTPTransport | None = None
     try:
-        if not isinstance(transport, FTPTransport):
-            return BootstrapResult(item, False, None, "FTP Hybrid bootstrap requires FTPTransport")
+        built = factory(item.target)
+        if not isinstance(built, FTPTransport):
+            return BootstrapResult(
+                item,
+                False,
+                None,
+                "FTP Hybrid bootstrap requires FTPTransport",
+            )
+        transport = built
         transport.connect()
-        try:
-            if item.action is BootstrapAction.CREATE_ROOT_AND_PROBE:
-                if not transport.root_exists():
-                    transport.ensure_root()
-            pending_reason = _pending_block_reason(transport, item, item.target)
-            if pending_reason is not None:
-                return BootstrapResult(item, False, None, pending_reason)
-            profile_path = probe_and_save_ftp_hybrid_capabilities(
-                transport,
-                item.target,
-                item.state_base,
-            )
-            detail = (
-                "root created; profile saved"
-                if item.action is BootstrapAction.CREATE_ROOT_AND_PROBE
-                else "profile saved"
-            )
-            return BootstrapResult(item, True, profile_path, None, detail=detail)
-        finally:
-            transport.close()
+        if item.action is BootstrapAction.READY:
+            return _verify_ready_item(item, transport)
+        if item.action is BootstrapAction.CREATE_ROOT_AND_PROBE:
+            if not transport.root_exists():
+                transport.ensure_root()
+        pending_reason = _pending_block_reason(transport, item, item.target)
+        if pending_reason is not None:
+            return BootstrapResult(item, False, None, pending_reason)
+        profile_path = probe_and_save_ftp_hybrid_capabilities(
+            transport,
+            item.target,
+            item.state_base,
+        )
+        detail = (
+            "root created; profile saved"
+            if item.action is BootstrapAction.CREATE_ROOT_AND_PROBE
+            else "profile saved"
+        )
+        return BootstrapResult(item, True, profile_path, None, detail=detail)
     except Exception as exc:
         return BootstrapResult(item, False, None, str(exc))
     finally:
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
         lock.release()
 
 
@@ -654,12 +769,17 @@ def run_bootstrap(
         raise ConfigError("--config and --workspace are mutually exclusive")
     if workspace_path is not None:
         workspace = load_workspace(workspace_path)
+        validate_bootstrap_target_filter(
+            filter_set,
+            collect_workspace_known_target_names(workspace),
+        )
         candidates = enumerate_workspace_bootstrap_candidates(
             workspace,
             target_filter=filter_set,
         )
     elif config_path is not None:
         config = load_config(config_path)
+        validate_bootstrap_target_filter(filter_set, collect_known_target_names(config))
         candidates = enumerate_project_bootstrap_candidates(
             config,
             target_filter=filter_set,
@@ -673,6 +793,10 @@ def run_bootstrap(
             )
         if local_workspace.is_file():
             workspace = load_workspace(local_workspace.resolve())
+            validate_bootstrap_target_filter(
+                filter_set,
+                collect_workspace_known_target_names(workspace),
+            )
             candidates = enumerate_workspace_bootstrap_candidates(
                 workspace,
                 target_filter=filter_set,
@@ -681,6 +805,10 @@ def run_bootstrap(
             from git_deploy.config import discover_config
 
             config = load_config(discover_config(None))
+            validate_bootstrap_target_filter(
+                filter_set,
+                collect_known_target_names(config),
+            )
             candidates = enumerate_project_bootstrap_candidates(
                 config,
                 target_filter=filter_set,
@@ -701,6 +829,44 @@ def run_bootstrap(
     print_fn("")
     print_fn(render_bootstrap_summary(results))
     return bootstrap_exit_code(results)
+
+
+def _verify_ready_item(item: BootstrapItem, transport: FTPTransport) -> BootstrapResult:
+    """Re-validate a planned READY item under lock before reporting success.
+
+    Args:
+        item: Preflighted READY item with a resolved target.
+        transport: Connected FTP transport for the same target.
+
+    Returns:
+        Success when the profile is still valid and Pending is absent; otherwise
+        FAIL so confirmation-window drift is not reported as READY.
+    """
+
+    if item.target is None:
+        return BootstrapResult(item, False, None, "missing target configuration")
+    try:
+        banner_hash = transport.server_banner_hash()
+        status = inspect_capability_profile(
+            item.state_base,
+            item.target,
+            server_banner_hash=banner_hash,
+        )
+    except Exception as exc:
+        return BootstrapResult(item, False, None, str(exc))
+    if status is not CapabilityProfileStatus.VALID:
+        action, reason = _status_to_action(status)
+        del action
+        return BootstrapResult(
+            item,
+            False,
+            None,
+            f"profile no longer valid after plan confirmation: {reason}",
+        )
+    pending_reason = _pending_block_reason(transport, item, item.target)
+    if pending_reason is not None:
+        return BootstrapResult(item, False, None, pending_reason)
+    return BootstrapResult(item, True, None, None, detail=item.reason)
 
 
 def _endpoint_label(target: TargetConfig) -> str:

@@ -15,17 +15,22 @@ from git_deploy.bootstrap import (
     BootstrapAction,
     BootstrapItem,
     bootstrap_exit_code,
+    collect_known_target_names,
+    collect_workspace_known_target_names,
     confirm_bootstrap,
     enumerate_project_bootstrap_candidates,
     enumerate_workspace_bootstrap_candidates,
     execute_bootstrap,
+    execute_bootstrap_item,
     mutation_count,
     plan_bootstrap_items,
     preflight_bootstrap_item,
     render_bootstrap_plan,
     render_bootstrap_summary,
     run_bootstrap,
+    validate_bootstrap_target_filter,
 )
+from git_deploy.lock import TargetLock
 from git_deploy.config import TargetConfig, load_config
 from git_deploy.errors import ConfigError, DeployError
 from git_deploy.ftp_hybrid import (
@@ -883,3 +888,408 @@ def test_doctor_still_uses_probe_and_save(
     )
     assert next(item for item in results if item.name == "target").ok
     assert transport.created == 1
+
+
+def test_unknown_target_filter_fails_before_connect(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown filter names fail with ConfigError and zero remote connections."""
+
+    path = _ftp_hybrid_config(git_project)
+    config = load_config(path)
+    validate_bootstrap_target_filter(None, collect_known_target_names(config))
+    validate_bootstrap_target_filter(
+        frozenset({"prod"}),
+        collect_known_target_names(config),
+    )
+    with pytest.raises(ConfigError, match="unknown bootstrap target filter") as raised:
+        validate_bootstrap_target_filter(
+            frozenset({"prdo"}),
+            collect_known_target_names(config),
+        )
+    assert "prdo" in str(raised.value)
+    with pytest.raises(ConfigError, match="typo") as mixed:
+        validate_bootstrap_target_filter(
+            frozenset({"prod", "typo"}),
+            collect_known_target_names(config),
+        )
+    assert "prod" not in str(mixed.value) or "typo" in str(mixed.value)
+    assert "typo" in str(mixed.value)
+
+    connects = 0
+
+    def forbidden(target: TargetConfig) -> FTPTransport:
+        """Record illegal connect attempts for unknown filters."""
+
+        nonlocal connects
+        connects += 1
+        raise AssertionError("must not connect for unknown filters")
+
+    with pytest.raises(ConfigError, match="prdo"):
+        run_bootstrap(
+            config_path=path,
+            target_filter=("prdo",),
+            yes=True,
+            transport_factory=forbidden,
+        )
+    assert connects == 0
+
+    with pytest.raises(ConfigError, match="typo"):
+        run_bootstrap(
+            config_path=path,
+            target_filter=("prod", "typo"),
+            yes=True,
+            transport_factory=forbidden,
+        )
+    assert connects == 0
+
+
+def test_workspace_unknown_filter_fails_before_connect(tmp_path: Path) -> None:
+    """Workspace rejects filters absent from every repository before connect."""
+
+    import subprocess
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    root = ws / "frontend"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Tests"], cwd=root, check=True)
+    (root / "app.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    _ftp_hybrid_config(
+        root,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp.example"
+username = "deploy"
+remote_root = "/pub"
+password_env = "FTP_PROD"
+""",
+    )
+    (ws / "deploy.workspace.toml").write_text(
+        'default_target = "prod"\n\n[[repositories]]\nname = "frontend"\npath = "frontend"\n',
+        encoding="utf-8",
+    )
+    workspace = load_workspace(ws / "deploy.workspace.toml")
+    known = collect_workspace_known_target_names(workspace)
+    assert "prod" in known
+    with pytest.raises(ConfigError, match="missing-target"):
+        validate_bootstrap_target_filter(frozenset({"missing-target"}), known)
+
+
+def test_project_non_git_fails_without_creating_dot_git(tmp_path: Path) -> None:
+    """Non-Git projects fail precheck and never create a pseudo ``.git`` tree."""
+
+    root = tmp_path / "not-git"
+    root.mkdir()
+    path = _ftp_hybrid_config(root)
+    config = load_config(path)
+    items = enumerate_project_bootstrap_candidates(
+        config,
+        target_filter=frozenset({"prod"}),
+    )
+    prod = next(item for item in items if item.target_name == "prod")
+    assert prod.action is BootstrapAction.FAIL_PRECHECK
+    assert "git" in prod.reason.lower()
+    assert not (root / ".git").exists()
+    assert not (root / ".git-deploy-invalid-worktree").exists()
+
+    connects = 0
+
+    def forbidden(target: TargetConfig) -> FTPTransport:
+        """Forbid remote work for invalid worktrees."""
+
+        nonlocal connects
+        connects += 1
+        raise AssertionError("non-git project must not connect")
+
+    code = run_bootstrap(config_path=path, yes=True, transport_factory=forbidden)
+    assert code != 0
+    assert connects == 0
+    assert not (root / ".git").exists()
+
+
+def test_workspace_one_non_git_repo_fails_while_others_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace keeps bootstrapping later repos when one is not a Git worktree."""
+
+    import subprocess
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    bad = ws / "broken"
+    bad.mkdir()
+    _ftp_hybrid_config(
+        bad,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-broken.example"
+username = "deploy"
+remote_root = "/broken"
+password_env = "FTP_BROKEN"
+""",
+        project_id="github.com/acme/broken",
+    )
+    good = ws / "frontend"
+    good.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=good, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=good,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Tests"], cwd=good, check=True)
+    (good / "app.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=good, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=good, check=True)
+    _ftp_hybrid_config(
+        good,
+        targets="""
+[targets.prod]
+protocol = "ftp"
+host = "ftp-frontend.example"
+username = "deploy"
+remote_root = "/frontend"
+password_env = "FTP_FRONTEND"
+""",
+        project_id="github.com/acme/frontend",
+    )
+    (ws / "deploy.workspace.toml").write_text(
+        'default_target = "prod"\n\n'
+        '[[repositories]]\nname = "broken"\npath = "broken"\n\n'
+        '[[repositories]]\nname = "frontend"\npath = "frontend"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FTP_BROKEN", "secret")
+    monkeypatch.setenv("FTP_FRONTEND", "secret")
+    workspace = load_workspace(ws / "deploy.workspace.toml")
+    items = enumerate_workspace_bootstrap_candidates(workspace)
+    by_repo = {item.repository_name: item for item in items if item.target_name == "prod"}
+    assert by_repo["broken"].action is BootstrapAction.FAIL_PRECHECK
+    assert by_repo["frontend"].action is BootstrapAction.PROBE
+    assert not (bad / ".git").exists()
+
+    good_item = by_repo["frontend"]
+    transport = FakeBootstrapTransport(good_item.target)  # type: ignore[arg-type]
+    probes = 0
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Count probes for the healthy repository only."""
+
+        nonlocal probes
+        del now
+        probes += 1
+        return save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+
+    def factory(target: TargetConfig) -> FTPTransport:
+        """Serve only the healthy frontend target."""
+
+        if target.name != "prod" or "frontend" not in str(target.remote_root):
+            raise AssertionError("broken repo must not reach factory")
+        return transport
+
+    plan = plan_bootstrap_items(items, transport_factory=factory)
+    results = execute_bootstrap(plan, transport_factory=factory)
+    assert bootstrap_exit_code(results) == 1
+    assert probes == 1
+    assert any(
+        result.item.repository_name == "broken" and not result.success for result in results
+    )
+    assert any(
+        result.item.repository_name == "frontend" and result.success for result in results
+    )
+
+
+def test_factory_exception_releases_lock_and_continues(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Factory errors become per-item FAIL, release locks, and keep the batch going."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    monkeypatch.setenv("FTP_STAGING", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    candidates = tuple(
+        item
+        for item in enumerate_project_bootstrap_candidates(config)
+        if item.target_name in {"prod", "staging"}
+    )
+    plan = plan_bootstrap_items(
+        candidates,
+        transport_factory=lambda t: FakeBootstrapTransport(t),
+    )
+    staging_transport = FakeBootstrapTransport(
+        next(item.target for item in plan if item.target_name == "staging")  # type: ignore[misc]
+    )
+    probes = 0
+
+    def fake_probe(transport, target, runtime_base, *, now=None):  # noqa: ANN001, ANN202
+        """Probe only the surviving target."""
+
+        nonlocal probes
+        del now
+        probes += 1
+        return save_capability_profile(
+            runtime_base,
+            _valid_profile(target, transport.server_banner_hash()),
+        )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    calls = 0
+
+    def factory(target: TargetConfig) -> FTPTransport:
+        """Fail construction for prod; succeed for staging."""
+
+        nonlocal calls
+        calls += 1
+        if target.name == "prod":
+            raise RuntimeError("synthetic factory failure")
+        return staging_transport
+
+    results = execute_bootstrap(plan, transport_factory=factory)
+    assert bootstrap_exit_code(results) == 1
+    by_name = {result.item.target_name: result for result in results}
+    assert by_name["prod"].success is False
+    assert "factory failure" in (by_name["prod"].error or "")
+    assert by_name["staging"].success is True
+    assert probes == 1
+    # Lock must be re-acquirable immediately after the failed item.
+    prod_item = next(item for item in plan if item.target_name == "prod")
+    lock = TargetLock(prod_item.state_base, "prod")
+    lock.acquire()
+    lock.release()
+
+
+def test_ready_revalidates_after_plan_profile_deleted(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """READY fails when the profile disappears between plan and execution."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    item = enumerate_project_bootstrap_candidates(
+        config,
+        target_filter=frozenset({"prod"}),
+    )[0]
+    transport = FakeBootstrapTransport(item.target)  # type: ignore[arg-type]
+    banner = transport.server_banner_hash()
+    path = save_capability_profile(
+        item.state_base,
+        _valid_profile(item.target, banner),  # type: ignore[arg-type]
+    )
+    plan = plan_bootstrap_items((item,), transport_factory=lambda t: transport)
+    assert plan[0].action is BootstrapAction.READY
+    path.unlink()
+    results = execute_bootstrap(plan, transport_factory=lambda t: transport)
+    assert bootstrap_exit_code(results) == 1
+    assert results[0].success is False
+    assert "no longer valid" in (results[0].error or "")
+
+
+def test_ready_revalidates_pending_after_plan(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """READY fails when Pending appears after the plan confirmation window."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    item = enumerate_project_bootstrap_candidates(
+        config,
+        target_filter=frozenset({"prod"}),
+    )[0]
+    transport = FakeBootstrapTransport(item.target)  # type: ignore[arg-type]
+    save_capability_profile(
+        item.state_base,
+        _valid_profile(item.target, transport.server_banner_hash()),  # type: ignore[arg-type]
+    )
+    plan = plan_bootstrap_items((item,), transport_factory=lambda t: transport)
+    assert plan[0].action is BootstrapAction.READY
+
+    def pending_block(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Simulate Pending appearing after confirmation."""
+
+        return "FTP Hybrid Pending phase PREPARED; finish deploy/recover before bootstrap"
+
+    monkeypatch.setattr(bootstrap_module, "_pending_block_reason", pending_block)
+    results = execute_bootstrap(plan, transport_factory=lambda t: transport)
+    assert bootstrap_exit_code(results) == 1
+    assert results[0].success is False
+    assert "Pending" in (results[0].error or "")
+
+
+def test_force_reprobe_does_not_bypass_pending(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--force`` still refuses probe when Pending is present at execution."""
+
+    monkeypatch.setenv("FTP_PROD", "secret")
+    config = load_config(_ftp_hybrid_config(git_project))
+    item = enumerate_project_bootstrap_candidates(
+        config,
+        target_filter=frozenset({"prod"}),
+    )[0]
+    transport = FakeBootstrapTransport(item.target)  # type: ignore[arg-type]
+    save_capability_profile(
+        item.state_base,
+        _valid_profile(item.target, transport.server_banner_hash()),  # type: ignore[arg-type]
+    )
+    plan = plan_bootstrap_items(
+        (item,),
+        force=True,
+        transport_factory=lambda t: transport,
+    )
+    assert plan[0].action is BootstrapAction.REPROBE
+    assert "pending" in plan[0].reason.lower()
+
+    def pending_block(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Block force reprobe when Pending exists."""
+
+        return "FTP Hybrid Pending phase FILES_PUBLISHED; finish deploy/recover before bootstrap"
+
+    monkeypatch.setattr(bootstrap_module, "_pending_block_reason", pending_block)
+    probes = 0
+
+    def fake_probe(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Count illegal probes under Pending."""
+
+        nonlocal probes
+        probes += 1
+        raise AssertionError("must not probe over Pending")
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "probe_and_save_ftp_hybrid_capabilities",
+        fake_probe,
+    )
+    results = execute_bootstrap(plan, transport_factory=lambda t: transport)
+    assert bootstrap_exit_code(results) == 1
+    assert probes == 0
+    assert "Pending" in (results[0].error or "")
