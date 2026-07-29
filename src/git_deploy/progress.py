@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -86,6 +87,8 @@ class ProgressReporter:
     _summary: TransferSummary | None = field(default=None, init=False)
     _finished: bool = field(default=False, init=False)
     _render_disabled: bool = field(default=False, init=False)
+    # Protects counters and TTY rendering under parallel FTP Hybrid workers.
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def callback(self, path: str, total: int) -> Callable[[int, int | None], None]:
         """Register one upload without starting its active-time clock.
@@ -97,54 +100,62 @@ class ProgressReporter:
         Returns:
             A transport-compatible cumulative-byte callback. Its first call
             activates timing after transport-specific setup has completed.
+            Safe for concurrent callbacks from distinct paths (FTP workers).
         """
 
-        if self._finished:
-            raise RuntimeError("cannot register an upload after transfer reporting finished")
-        expected_total = max(0, total)
-        known_total = self._totals.setdefault(path, expected_total)
-        if known_total != expected_total:
-            raise ValueError(f"upload size changed across attempts for {path!r}")
-        self._register_attempt(path)
-        attempt = self._attempts[path]
+        with self._lock:
+            if self._finished:
+                raise RuntimeError("cannot register an upload after transfer reporting finished")
+            expected_total = max(0, total)
+            known_total = self._totals.setdefault(path, expected_total)
+            if known_total != expected_total:
+                raise ValueError(f"upload size changed across attempts for {path!r}")
+            self._register_attempt(path)
 
         def report(transferred: int, reported_total: int | None = None) -> None:
             """Record cumulative bytes and render a throttled progress line."""
 
-            nonlocal attempt
-            effective_total = expected_total
-            if reported_total is not None and max(0, reported_total) == expected_total:
-                effective_total = max(0, reported_total)
-            current = min(effective_total, max(0, transferred))
-            if (
-                attempt.state is TransferAttemptState.COMPLETED
-                and current >= attempt.last_transferred
-            ):
-                return
-            now = self.clock()
-            if current < attempt.last_transferred:
-                self._close_attempt(path, attempt, now)
-                self._retries += 1
-                self._completed.discard(path)
-                attempt = self._new_attempt(path)
-            if attempt.state is TransferAttemptState.REGISTERED:
-                self._activate_attempt(attempt, now)
-            delta = max(0, current - attempt.last_transferred)
-            if delta:
-                attempt.attempt_bytes += delta
-                self._attempt_bytes += delta
-                self._file_attempt_bytes[path] = self._file_attempt_bytes.get(path, 0) + delta
-            attempt.last_transferred = current
-            attempt.last_at = now
-            attempt.samples.append((now, attempt.attempt_bytes))
-            self._trim_samples(attempt, now)
-            complete = effective_total == 0 or current >= effective_total
-            if complete:
-                self._close_attempt(path, attempt, now)
-                self._completed.add(path)
-            if complete or (self._is_tty() and now - self._last_render_at >= self.refresh_interval):
-                self._render_progress(path, current, effective_total, attempt, complete=complete)
-                self._last_render_at = now
+            with self._lock:
+                attempt = self._attempts[path]
+                effective_total = expected_total
+                if reported_total is not None and max(0, reported_total) == expected_total:
+                    effective_total = max(0, reported_total)
+                current = min(effective_total, max(0, transferred))
+                if (
+                    attempt.state is TransferAttemptState.COMPLETED
+                    and current >= attempt.last_transferred
+                ):
+                    return
+                now = self.clock()
+                if current < attempt.last_transferred:
+                    self._close_attempt(path, attempt, now)
+                    self._retries += 1
+                    self._completed.discard(path)
+                    attempt = self._new_attempt(path)
+                if attempt.state is TransferAttemptState.REGISTERED:
+                    self._activate_attempt(attempt, now)
+                delta = max(0, current - attempt.last_transferred)
+                if delta:
+                    attempt.attempt_bytes += delta
+                    self._attempt_bytes += delta
+                    self._file_attempt_bytes[path] = (
+                        self._file_attempt_bytes.get(path, 0) + delta
+                    )
+                attempt.last_transferred = current
+                attempt.last_at = now
+                attempt.samples.append((now, attempt.attempt_bytes))
+                self._trim_samples(attempt, now)
+                complete = effective_total == 0 or current >= effective_total
+                if complete:
+                    self._close_attempt(path, attempt, now)
+                    self._completed.add(path)
+                if complete or (
+                    self._is_tty() and now - self._last_render_at >= self.refresh_interval
+                ):
+                    self._render_progress(
+                        path, current, effective_total, attempt, complete=complete
+                    )
+                    self._last_render_at = now
 
         return report
 
@@ -158,13 +169,14 @@ class ProgressReporter:
             ``None`` after preserving partial attempt bytes and active time.
         """
 
-        if self._finished:
-            return
-        attempt = self._attempts.get(path)
-        if attempt is not None and attempt.state is not TransferAttemptState.COMPLETED:
-            self._close_attempt(path, attempt, self.clock())
-        self._retries += 1
-        self._retry_credits[path] = self._retry_credits.get(path, 0) + 1
+        with self._lock:
+            if self._finished:
+                return
+            attempt = self._attempts.get(path)
+            if attempt is not None and attempt.state is not TransferAttemptState.COMPLETED:
+                self._close_attempt(path, attempt, self.clock())
+            self._retries += 1
+            self._retry_credits[path] = self._retry_credits.get(path, 0) + 1
 
     def finish(self) -> TransferSummary | None:
         """Freeze and return final metrics without rendering them.
@@ -173,25 +185,26 @@ class ProgressReporter:
             A summary when at least one upload callback was registered, otherwise ``None``.
         """
 
-        if self._finished:
+        with self._lock:
+            if self._finished:
+                return self._summary
+            now = self.clock()
+            for path, attempt in tuple(self._attempts.items()):
+                if attempt.state is not TransferAttemptState.COMPLETED:
+                    self._close_attempt(path, attempt, now)
+            self._finished = True
+            if not self._attempt_counts:
+                return None
+            completed = self._completed
+            self._summary = TransferSummary(
+                files=len(completed),
+                payload_bytes=sum(self._totals[path] for path in completed),
+                attempt_bytes=self._attempt_bytes,
+                active_seconds=self._active_seconds,
+                retries=self._retries,
+                measurement_mode=self.measurement_mode,
+            )
             return self._summary
-        now = self.clock()
-        for path, attempt in tuple(self._attempts.items()):
-            if attempt.state is not TransferAttemptState.COMPLETED:
-                self._close_attempt(path, attempt, now)
-        self._finished = True
-        if not self._attempt_counts:
-            return None
-        completed = self._completed
-        self._summary = TransferSummary(
-            files=len(completed),
-            payload_bytes=sum(self._totals[path] for path in completed),
-            attempt_bytes=self._attempt_bytes,
-            active_seconds=self._active_seconds,
-            retries=self._retries,
-            measurement_mode=self.measurement_mode,
-        )
-        return self._summary
 
     def render_summary(self) -> None:
         """Render the frozen final summary without affecting deployment success.

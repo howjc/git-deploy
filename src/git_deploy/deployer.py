@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import queue
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
@@ -567,16 +569,20 @@ def _execute_ftp_hybrid_plan(
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
-        for upload in ftp_plan.uploads:
-            _stage_ftp_hybrid_file(
+        _run_ftp_hybrid_file_jobs(
+            ftp_plan.uploads,
+            transport,
+            connections=config.deploy.ftp_connections,
+            job=lambda upload, worker: _stage_ftp_hybrid_file(
                 upload,
                 frozen[upload.path],
                 stage_root,
-                transport,
+                worker,
                 progress,
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
-            )
+            ),
+        )
         reviewed = replace(
             plan,
             hybrid=replace(hybrid, ftp=replace(ftp_plan, pending=pending)),
@@ -584,16 +590,20 @@ def _execute_ftp_hybrid_plan(
         validate_remote_freshness(reviewed, config, transport)
         for directory in ftp_plan.create_directories:
             transport.make_directory(directory)
-        for upload in ftp_plan.uploads:
-            _publish_ftp_hybrid_file(
+        _run_ftp_hybrid_file_jobs(
+            ftp_plan.uploads,
+            transport,
+            connections=config.deploy.ftp_connections,
+            job=lambda upload, worker: _publish_ftp_hybrid_file(
                 upload,
                 frozen[upload.path],
                 stage_root,
-                transport,
+                worker,
                 progress,
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
-            )
+            ),
+        )
         pending = pending.with_phase(FTPPendingPhase.FILES_PUBLISHED)
         _write_ftp_pending(transport, pending)
         phase = pending.phase
@@ -714,6 +724,144 @@ def _cleanup_ftp_hybrid_pending(
         # A sibling Stage belongs to another or interrupted deployment. Its
         # presence must not resurrect the marker that just completed.
         pass
+
+
+def _run_ftp_hybrid_file_jobs(
+    uploads: Sequence[FTPHybridFileUpload],
+    primary: FTPTransport,
+    *,
+    connections: int,
+    job: Callable[[FTPHybridFileUpload, FTPTransport], None],
+) -> None:
+    """Run Stage or Publish jobs over one or more FTP control sessions.
+
+    Args:
+        uploads: Frozen Hybrid file operations in plan order.
+        primary: Already connected primary Hybrid transport (not closed here).
+        connections: Desired parallel FTP sessions (clamped to job count, max 16).
+        job: Per-file action bound to one worker-owned transport.
+
+    Returns:
+        ``None`` after every job succeeds.
+
+    Raises:
+        DeployError: When any worker fails; remaining queued jobs are skipped.
+    """
+
+    if not uploads:
+        return
+    workers = max(1, min(connections, len(uploads), 16))
+    if workers == 1:
+        for upload in uploads:
+            job(upload, primary)
+        return
+
+    work: queue.Queue[FTPHybridFileUpload | None] = queue.Queue()
+    for upload in uploads:
+        work.put(upload)
+    for _ in range(workers):
+        work.put(None)
+
+    errors: list[BaseException] = []
+    error_lock = threading.Lock()
+    stop = threading.Event()
+    extras: list[FTPTransport] = []
+
+    def run_worker(transport: FTPTransport, *, owns_transport: bool) -> None:
+        """Drain the shared job queue on one dedicated FTP session."""
+
+        try:
+            while not stop.is_set():
+                item = work.get()
+                try:
+                    if item is None:
+                        return
+                    if stop.is_set():
+                        return
+                    job(item, transport)
+                except BaseException as exc:
+                    with error_lock:
+                        if not errors:
+                            errors.append(exc)
+                    stop.set()
+                    return
+                finally:
+                    work.task_done()
+        finally:
+            if owns_transport:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+
+    threads: list[threading.Thread] = []
+    try:
+        try:
+            for index in range(workers):
+                if index == 0:
+                    worker_transport = primary
+                    owns = False
+                else:
+                    worker_transport = _open_ftp_hybrid_worker(primary)
+                    extras.append(worker_transport)
+                    owns = True
+                thread = threading.Thread(
+                    target=run_worker,
+                    args=(worker_transport,),
+                    kwargs={"owns_transport": owns},
+                    name=f"ftp-hybrid-{index}",
+                    daemon=True,
+                )
+                threads.append(thread)
+                thread.start()
+        except BaseException:
+            # Startup failed after some workers began; stop them before re-raising.
+            stop.set()
+            for _ in threads:
+                try:
+                    work.put_nowait(None)
+                except Exception:
+                    pass
+            for thread in threads:
+                thread.join(timeout=primary.target.timeout + 5)
+            raise
+        for thread in threads:
+            thread.join()
+    finally:
+        for transport in extras:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+    if errors:
+        raise DeployError(
+            f"FTP Hybrid parallel transfer failed: {errors[0]}"
+        ) from errors[0]
+
+
+def _open_ftp_hybrid_worker(primary: FTPTransport) -> FTPTransport:
+    """Open one additional UTF-8 FTP session matching the primary Hybrid contract.
+
+    Args:
+        primary: Connected Hybrid transport whose target and UTF-8 policy to mirror.
+
+    Returns:
+        A connected sibling transport owned by the caller.
+
+    Raises:
+        DeployError: When connect or UTF-8 activation fails.
+    """
+
+    sibling = FTPTransport(primary.target)
+    # Inherit the Hybrid UTF-8 session contract before connect so login retry
+    # paths re-apply OPTS/encoding the same way as the primary transport.
+    sibling._require_utf8 = primary._require_utf8
+    sibling._required_server_banner_hash = primary._required_server_banner_hash
+    sibling.connect()
+    if primary._require_utf8 and not sibling._require_utf8:
+        sibling.enable_utf8()
+    return sibling
 
 
 def _stage_ftp_hybrid_file(

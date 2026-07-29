@@ -126,10 +126,12 @@ class ResolvedSSHConfig:
 
 @dataclass(frozen=True, slots=True)
 class DeployConfig:
-    """Configure per-file retry behavior."""
+    """Configure per-file retry and FTP Hybrid parallelism."""
 
     retries: int = 3
     retry_delay: float = 2.0
+    # Parallel FTP control sessions for Hybrid Stage/Publish (1 = serial).
+    ftp_connections: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,17 +826,25 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
 
 
 def _parse_deploy(raw: Any) -> DeployConfig:
-    """Validate retry count and delay."""
+    """Validate retry count, delay, and FTP Hybrid connection parallelism."""
 
     table = _table(raw, "deploy")
-    _reject_unknown(table, {"retries", "retry_delay"}, "deploy")
+    _reject_unknown(table, {"retries", "retry_delay", "ftp_connections"}, "deploy")
     retries = table.get("retries", 3)
     delay = table.get("retry_delay", 2)
+    ftp_connections = table.get("ftp_connections", 4)
     if not isinstance(retries, int) or isinstance(retries, bool) or retries < 1:
         raise ConfigError("deploy.retries must be a positive integer")
     if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
         raise ConfigError("deploy.retry_delay must be a non-negative number")
-    return DeployConfig(retries, float(delay))
+    if (
+        not isinstance(ftp_connections, int)
+        or isinstance(ftp_connections, bool)
+        or ftp_connections < 1
+        or ftp_connections > 16
+    ):
+        raise ConfigError("deploy.ftp_connections must be an integer from 1 to 16")
+    return DeployConfig(retries, float(delay), ftp_connections)
 
 
 def _table(value: Any, name: str) -> dict[str, Any]:

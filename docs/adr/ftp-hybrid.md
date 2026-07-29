@@ -33,6 +33,10 @@ FTP In-place 对 Mirror Directory 内每个文件单独 Stage/Publish，因此 L
 
 每个业务上传文件的内容证明发生在 **Stage STOR 之后的整文件 RETR SHA256**（含 Publish 重试时的 restage）。Publish 仅执行已 Probe 的 Rename Replace，并检查 Stage 源路径已被消费、最终路径类型为 File；**不再对最终路径做整文件 RETR**，以去掉约三分之一的数据连接。该取舍依赖：Capability Probe 证明 Rename Replace、单发布器契约、以及 Stage 校验已绑定冻结字节。Pending Marker 与 Ownership 等小元数据仍使用 `publish_verified_bytes`（Stage RETR + Final RETR）。
 
+## 并行 FTP 会话
+
+`deploy.ftp_connections`（默认 4，范围 1–16）控制 Hybrid **Stage** 与 **Publish** 阶段各自使用的并行控制会话数。每个 worker 持有独立 `FTPTransport`（独立控制连接与 PASV 数据连接），继承主会话的 UTF-8/Banner 契约；主连接不关闭。仍是单发布器进程内并行，不允许多机器并发发布。`1` 退化为串行。普通 Source/Incremental 队列、目录 MKD、Prune、Ownership/Pending 元数据仍走主连接串行路径。
+
 ## 为什么不做 FTP Directory Swap
 
 FTP 没有跨服务器一致的目录原子替换、目录备份恢复和符号链接类型契约。模拟 SFTP 目录 Swap 会产生更大的不可恢复窗口。首版只对每个文件做经过 Probe 证明的 Rename Replace；所有当前文件发布完成后才清理孤儿。

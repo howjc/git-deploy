@@ -53,6 +53,49 @@ remote_root = "/public_html"
         load_config(path)
 
 
+def test_deploy_ftp_connections_defaults_and_bounds(git_project: Path) -> None:
+    """FTP Hybrid parallelism defaults to 4 and rejects out-of-range values."""
+
+    defaulted = load_config(write_config(git_project))
+    assert defaulted.deploy.ftp_connections == 4
+
+    configured = load_config(
+        write_config(
+            git_project,
+            """
+[targets.dev]
+protocol = "sftp"
+host = "example.invalid"
+username = "deploy"
+remote_root = "/srv/app"
+
+[deploy]
+ftp_connections = 8
+""",
+            create_outputs=False,
+        )
+    )
+    assert configured.deploy.ftp_connections == 8
+
+    with pytest.raises(ConfigError, match="ftp_connections"):
+        load_config(
+            write_config(
+                git_project,
+                """
+[targets.dev]
+protocol = "sftp"
+host = "example.invalid"
+username = "deploy"
+remote_root = "/srv/app"
+
+[deploy]
+ftp_connections = 0
+""",
+                create_outputs=False,
+            )
+        )
+
+
 def test_sftp_after_deploy_commands_and_timeout_are_frozen(git_project: Path) -> None:
     """Validated commands preserve reviewed shell text and bounded timeout policy."""
 

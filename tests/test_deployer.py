@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -702,6 +704,97 @@ def test_ftp_recovery_state_save_failure_does_not_cleanup_pending(
     with pytest.raises(OSError, match="disk full"):
         execute_recovery_plan(plan, store, transport, verbose=False)
     assert not cleaned
+
+
+def test_run_ftp_hybrid_file_jobs_uses_parallel_worker_transports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel Stage/Publish opens sibling sessions and fans work across them."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    opened: list[FTPTransport] = []
+    seen: dict[int, set[str]] = {}
+    lock = threading.Lock()
+
+    def fake_open(source: FTPTransport) -> FTPTransport:
+        """Create a distinct sibling transport for each parallel worker."""
+
+        del source
+        sibling = FTPTransport(target)
+        sibling.ftp = object()  # type: ignore[assignment]
+        opened.append(sibling)
+        return sibling
+
+    monkeypatch.setattr(deployer_module, "_open_ftp_hybrid_worker", fake_open)
+
+    uploads = tuple(
+        FTPHybridFileUpload(f"f{i}.js", Path(f"/tmp/f{i}.js"), "a" * 64, 1)
+        for i in range(8)
+    )
+
+    def job(upload: FTPHybridFileUpload, transport: FTPTransport) -> None:
+        """Record which transport identity handled each path."""
+
+        # Slow enough that sibling workers share the queue under load.
+        time.sleep(0.02)
+        with lock:
+            seen.setdefault(id(transport), set()).add(upload.path)
+
+    deployer_module._run_ftp_hybrid_file_jobs(
+        uploads,
+        primary,
+        connections=4,
+        job=job,
+    )
+
+    assert len(opened) == 3
+    assert sum(len(paths) for paths in seen.values()) == 8
+    assert id(primary) in seen
+    assert len(seen) >= 2
+
+
+def test_run_ftp_hybrid_file_jobs_serial_when_connections_is_one() -> None:
+    """ftp_connections=1 keeps work on the primary transport only."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    transports: list[int] = []
+    uploads = (
+        FTPHybridFileUpload("a.js", Path("/tmp/a.js"), "a" * 64, 1),
+        FTPHybridFileUpload("b.js", Path("/tmp/b.js"), "b" * 64, 1),
+    )
+
+    def job(upload: FTPHybridFileUpload, transport: FTPTransport) -> None:
+        """Record the worker transport for each serial job."""
+
+        del upload
+        transports.append(id(transport))
+
+    deployer_module._run_ftp_hybrid_file_jobs(
+        uploads,
+        primary,
+        connections=1,
+        job=job,
+    )
+    assert transports == [id(primary), id(primary)]
 
 
 def test_ftp_hybrid_publish_skips_final_retr_after_stage_verified(tmp_path: Path) -> None:
