@@ -389,3 +389,9 @@ tmp/release-smoke/bin/git-deploy --help
 ```
 
 WSL、1Password、OpenSSH Config、Windows Hello 人工验收与故障排查见 [Native OpenSSH / WSL 指南](docs/native-openssh-wsl.md)。详细范围和实施记录见 [OpenSSH/Workspace 总方案](docs/git-deploy-v1-lite-audit-workspace-openssh-master-plan.md)。
+
+## 许可证
+
+本项目以 [MIT License](LICENSE) 发布。
+
+运行时依赖 [paramiko](https://github.com/paramiko/paramiko)（LGPL-2.1）由 pip/uv 单独安装，未捆绑进本仓库的源码分发物。使用、修改或再分发时请同时遵守各依赖自身的许可证条款。

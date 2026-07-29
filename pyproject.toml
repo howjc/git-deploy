@@ -4,9 +4,30 @@ version = "1.7.3"
 description = "Git-aware local build and FTP/SFTP file synchronization"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jack" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "paramiko>=5.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/howjc/git-deploy"
+Repository = "https://github.com/howjc/git-deploy"
+Issues = "https://github.com/howjc/git-deploy/issues"
+Changelog = "https://github.com/howjc/git-deploy/blob/main/docs/release-notes-v1.7.3.md"
 
 [project.scripts]
 git-deploy = "git_deploy.cli:main"
