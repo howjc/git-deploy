@@ -39,6 +39,7 @@ from git_deploy.hybrid import (
     HybridRecoveryOutcome,
     HybridRecoveryRecord,
     RecoveryPhase,
+    hybrid_content_manifest,
     inspect_recovery,
     make_ownership,
     ownership_hash,
@@ -439,7 +440,16 @@ def create_plan(
     operations = _merge_operations((*source_operations, *output_operations), config)
     manifest = {path: item.entry for path, item in current_outputs.items()}
     if hybrid_local is not None:
-        manifest.update({item.name: item.entry for item in hybrid_local.root_files})
+        # Persist Mirror file hashes in Local State so FTP In-place can skip
+        # unchanged nested files (Root Files already used this path).
+        hybrid_entries = hybrid_content_manifest(hybrid_local)
+        overlap = sorted(set(manifest) & set(hybrid_entries))
+        if overlap:
+            raise PlanError(
+                "incremental output path collides with hybrid content path: "
+                + ", ".join(overlap[:10])
+            )
+        manifest.update(hybrid_entries)
     ftp_root_namespace: tuple[tuple[str, str], ...] = ()
     if hybrid_local is not None and resolved_target.protocol == "ftp":
         historical_source: set[str] = set()
@@ -933,15 +943,29 @@ def _complete_ftp_remote_plan(
                     )
                 )
         for directory in hybrid.local.directories:
+            tree = remote_trees[directory.name]
+            adopt_directory = directory.name in adoptions
             for relative, scanned in sorted(directory.files.items()):
-                uploads.append(
-                    FTPHybridFileUpload(
-                        f"{directory.name}/{relative}",
-                        scanned.local_path,
-                        scanned.entry.sha256,
-                        scanned.entry.size,
+                path = f"{directory.name}/{relative}"
+                previous = hybrid.previous_outputs.get(path)
+                # Same trust model as Root Files: Local State hash is content
+                # proof; remote Size/Modify is not. Missing remote members and
+                # adoption/full/pending still force a republish.
+                if (
+                    pending is not None
+                    or plan.full
+                    or previous != scanned.entry
+                    or relative not in tree.files
+                    or adopt_directory
+                ):
+                    uploads.append(
+                        FTPHybridFileUpload(
+                            path,
+                            scanned.local_path,
+                            scanned.entry.sha256,
+                            scanned.entry.size,
+                        )
                     )
-                )
 
     create_directories: set[str] = set()
     if publish_needed:

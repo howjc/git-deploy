@@ -25,6 +25,14 @@ FTP Hybrid 强制要求大小写敏感且保留 Unicode normalization 的 UTF-8 
 
 Incremental 的本地 State 只描述上次在当前 Git Common Dir 成功部署的文件。它不能作为换机器、State 损坏或历史目录删除的远端所有权证据，也不能可靠枚举 Mirror Directory 内的孤儿。因此 FTP Hybrid 必须使用 Remote Ownership 和 MLSD Typed Scan。
 
+## Mirror 文件增量（Local State）
+
+FTP In-place 对 Mirror Directory 内每个文件单独 Stage/Publish，因此 Local State 必须持久化 `<directory>/<relative>` 的 SHA256/Size（与 Root File 同一内容契约）。普通部署仅在以下情况上传 Mirror 文件：Local State 缺失或 hash 变化、远端树中缺失该文件、目录 Adoption、`--full`、或存在需重新发布的 Pending。远端 Size/Modify 仍不可作为内容证明。孤儿清理继续依赖 MLSD Typed Scan，与上传增量无关。升级后若旧 State 没有嵌套路径，下一次部署会按「previous 缺失」重传 Mirror 文件一次并写入完整 State。
+
+## 业务文件校验边界（Stage RETR，无 Final RETR）
+
+每个业务上传文件的内容证明发生在 **Stage STOR 之后的整文件 RETR SHA256**（含 Publish 重试时的 restage）。Publish 仅执行已 Probe 的 Rename Replace，并检查 Stage 源路径已被消费、最终路径类型为 File；**不再对最终路径做整文件 RETR**，以去掉约三分之一的数据连接。该取舍依赖：Capability Probe 证明 Rename Replace、单发布器契约、以及 Stage 校验已绑定冻结字节。Pending Marker 与 Ownership 等小元数据仍使用 `publish_verified_bytes`（Stage RETR + Final RETR）。
+
 ## 为什么不做 FTP Directory Swap
 
 FTP 没有跨服务器一致的目录原子替换、目录备份恢复和符号链接类型契约。模拟 SFTP 目录 Swap 会产生更大的不可恢复窗口。首版只对每个文件做经过 Probe 证明的 Rename Replace；所有当前文件发布完成后才清理孤儿。

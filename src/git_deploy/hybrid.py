@@ -234,6 +234,32 @@ def scan_hybrid_output(output: OutputConfig) -> HybridLocalManifest:
     )
 
 
+def hybrid_content_manifest(local: HybridLocalManifest) -> dict[str, ManifestEntry]:
+    """Map every Hybrid Root File and Mirror file to its content identity.
+
+    Args:
+        local: Frozen current Hybrid Aggregation Root scan.
+
+    Returns:
+        Paths relative to the Hybrid remote root. Mirror files use
+        ``<directory>/<relative>`` keys so Local State can skip unchanged
+        FTP In-place uploads without trusting remote Size/Modify.
+    """
+
+    entries: dict[str, ManifestEntry] = {
+        item.name: item.entry for item in local.root_files
+    }
+    for directory in local.directories:
+        for relative, scanned in directory.files.items():
+            path = f"{directory.name}/{relative}"
+            if path in entries:
+                raise PlanError(
+                    f"hybrid content path collides between root and mirror: {path!r}"
+                )
+            entries[path] = scanned.entry
+    return entries
+
+
 def make_ownership(
     local: HybridLocalManifest,
     project_id: str,

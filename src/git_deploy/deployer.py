@@ -762,17 +762,24 @@ def _publish_ftp_hybrid_file(
     attempts: int,
     delay: float,
 ) -> None:
-    """Rename-replace and final-verify one file, restaging before a retry."""
+    """Rename-replace one stage-verified file; restage with RETR if Stage is gone.
+
+    Content identity is proven only on Stage (or restage) via full RETR SHA256.
+    Publish trusts the probed Rename Replace contract plus Stage consumption and
+    a final-path type check, avoiding a second full-file RETR per payload file.
+    Pending/Ownership metadata still uses ``publish_verified_bytes`` (stage + final).
+    """
 
     staged_path = f"{stage_root}/files/{operation.path}"
     upload_attempted = False
 
     def action() -> None:
-        """Publish one staged file and prove final content and source consumption."""
+        """Publish one stage-verified file and prove Stage consumption."""
 
         nonlocal upload_attempted
         upload_attempted = False
         if transport.lstat(staged_path) is RemotePathType.MISSING:
+            # Retry/resume path: Stage bytes may be gone; restage and re-verify.
             upload_attempted = True
             transport.upload(
                 local_path,
@@ -780,14 +787,18 @@ def _publish_ftp_hybrid_file(
                 progress.callback(operation.path, operation.size),
             )
             staged = transport.read_file(staged_path, max_bytes=operation.size)
-            if hashlib.sha256(staged).hexdigest() != operation.sha256:
+            if (
+                len(staged) != operation.size
+                or hashlib.sha256(staged).hexdigest() != operation.sha256
+            ):
                 raise DeployError(f"FTP restaged verification mismatch for {operation.path}")
         transport.rename_replace(staged_path, operation.path)
-        final = transport.read_file(operation.path, max_bytes=operation.size)
-        if len(final) != operation.size or hashlib.sha256(final).hexdigest() != operation.sha256:
-            raise DeployError(f"FTP final verification mismatch for {operation.path}")
         if transport.lstat(staged_path) is not RemotePathType.MISSING:
             raise DeployError(f"FTP Stage was not consumed for {operation.path}")
+        if transport.lstat(operation.path) is not RemotePathType.FILE:
+            raise DeployError(
+                f"FTP publish did not leave a regular file at {operation.path}"
+            )
 
     def record_upload_retry() -> None:
         """Close transfer timing only when this publish attempt restaged bytes."""

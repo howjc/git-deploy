@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 import git_deploy.deployer as deployer_module
-from git_deploy.config import load_config
+from git_deploy.config import TargetConfig, load_config
 from git_deploy.deployer import execute_plan, execute_recovery_plan
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.ftp_hybrid import FTP_PENDING_SCHEMA, FTPHybridPending, FTPPendingPhase
 from git_deploy.git import GitRepository
 from git_deploy.manifest import ManifestEntry, StateStore, TargetState
-from git_deploy.planner import FTPRecoveryPlan, create_plan
+from git_deploy.planner import FTPHybridFileUpload, FTPRecoveryPlan, create_plan
 from git_deploy.progress import ProgressReporter
-from git_deploy.transports.base import ProgressCallback, Transport
+from git_deploy.transports.base import ProgressCallback, RemotePathType, Transport
 from git_deploy.transports.base import TransferMeasurementMode
 from git_deploy.transports.ftp import FTPTransport
 from tests.conftest import commit_all, write_config
@@ -701,3 +702,200 @@ def test_ftp_recovery_state_save_failure_does_not_cleanup_pending(
     with pytest.raises(OSError, match="disk full"):
         execute_recovery_plan(plan, store, transport, verbose=False)
     assert not cleaned
+
+
+def test_ftp_hybrid_publish_skips_final_retr_after_stage_verified(tmp_path: Path) -> None:
+    """Business publish trusts Stage SHA256 + rename; no final-path RETR."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    payload = b"stage-verified-payload"
+    local_path = tmp_path / "asset.js"
+    local_path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    operation = FTPHybridFileUpload(
+        "assets/app.js",
+        local_path,
+        digest,
+        len(payload),
+    )
+    stage_root = ".git-deploy/ftp-hybrid/stage/deployment-1"
+    staged_path = f"{stage_root}/files/{operation.path}"
+
+    class PublishFTP(FTPTransport):
+        """Record RETR targets while modeling rename-replace consumption."""
+
+        def __init__(self) -> None:
+            """Seed one already stage-verified payload file."""
+
+            super().__init__(target)
+            self.files: dict[str, bytes] = {staged_path: payload}
+            self.retr_paths: list[str] = []
+            self.ftp = self  # type: ignore[assignment]
+
+        def lstat(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> RemotePathType:
+            """Classify synthetic Stage/final paths."""
+
+            del allow_case_collisions
+            if remote_path in self.files:
+                return RemotePathType.FILE
+            return RemotePathType.MISSING
+
+        def read_file(
+            self,
+            remote_path: str,
+            *,
+            max_bytes: int,
+            allow_case_collisions: bool = False,
+        ) -> bytes:
+            """Record every RETR and return configured bytes."""
+
+            del allow_case_collisions
+            self.retr_paths.append(remote_path)
+            data = self.files[remote_path]
+            if len(data) > max_bytes:
+                raise DeployError(f"exceeds {max_bytes}")
+            return data
+
+        def rename_replace(self, source: str, destination: str) -> None:
+            """Move staged bytes to the final path like a replace rename."""
+
+            self.files[destination] = self.files.pop(source)
+
+        def upload(
+            self,
+            local_path: Path,
+            remote_path: str,
+            callback: ProgressCallback,
+            *,
+            executable: bool = False,
+        ) -> None:
+            """Unexpected restage in the happy path fails the test."""
+
+            del local_path, remote_path, callback, executable
+            raise AssertionError("publish happy path must not restage")
+
+    transport = PublishFTP()
+    progress = ProgressReporter(verbose=False)
+    deployer_module._publish_ftp_hybrid_file(
+        operation,
+        local_path,
+        stage_root,
+        transport,
+        progress,
+        attempts=1,
+        delay=0,
+    )
+
+    assert transport.files[operation.path] == payload
+    assert staged_path not in transport.files
+    assert transport.retr_paths == []
+
+
+def test_ftp_hybrid_publish_restage_still_retr_verifies_stage(tmp_path: Path) -> None:
+    """When Stage is missing, publish restages and RETR-verifies Stage only."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    payload = b"restage-me"
+    local_path = tmp_path / "chunk.js"
+    local_path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    operation = FTPHybridFileUpload("assets/chunk.js", local_path, digest, len(payload))
+    stage_root = ".git-deploy/ftp-hybrid/stage/deployment-2"
+    staged_path = f"{stage_root}/files/{operation.path}"
+
+    class RestageFTP(FTPTransport):
+        """Start with an empty Stage so publish must restage."""
+
+        def __init__(self) -> None:
+            """Create an empty remote file map."""
+
+            super().__init__(target)
+            self.files: dict[str, bytes] = {}
+            self.retr_paths: list[str] = []
+            self.ftp = self  # type: ignore[assignment]
+
+        def lstat(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> RemotePathType:
+            """Classify synthetic paths."""
+
+            del allow_case_collisions
+            if remote_path in self.files:
+                return RemotePathType.FILE
+            return RemotePathType.MISSING
+
+        def read_file(
+            self,
+            remote_path: str,
+            *,
+            max_bytes: int,
+            allow_case_collisions: bool = False,
+        ) -> bytes:
+            """Record RETR of Stage bytes only."""
+
+            del allow_case_collisions
+            self.retr_paths.append(remote_path)
+            data = self.files[remote_path]
+            if len(data) > max_bytes:
+                raise DeployError(f"exceeds {max_bytes}")
+            return data
+
+        def rename_replace(self, source: str, destination: str) -> None:
+            """Consume the staged file into the final path."""
+
+            self.files[destination] = self.files.pop(source)
+
+        def upload(
+            self,
+            local_path: Path,
+            remote_path: str,
+            callback: ProgressCallback,
+            *,
+            executable: bool = False,
+        ) -> None:
+            """Store restaged payload and report transfer completion."""
+
+            del executable
+            data = local_path.read_bytes()
+            self.files[remote_path] = data
+            callback(len(data), len(data))
+
+    transport = RestageFTP()
+    progress = ProgressReporter(verbose=False)
+    deployer_module._publish_ftp_hybrid_file(
+        operation,
+        local_path,
+        stage_root,
+        transport,
+        progress,
+        attempts=1,
+        delay=0,
+    )
+
+    assert transport.files[operation.path] == payload
+    assert transport.retr_paths == [staged_path]
+    assert operation.path not in transport.retr_paths
