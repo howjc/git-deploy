@@ -5,11 +5,20 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from git_deploy import __version__
 from git_deploy.bootstrap import run_bootstrap
 from git_deploy.builder import run_build
+from git_deploy.completion import (
+    ensure_shell_completion_installed,
+    format_install_report,
+    install_shell_completion,
+    list_action_completions,
+    list_extra_completions,
+    list_target_names,
+    load_completion_script,
+)
 from git_deploy.config import Config, discover_config, load_config
 from git_deploy.doctor import DoctorResult, run_doctor
 from git_deploy.errors import ConfigError, GitDeployError, PlanError
@@ -48,19 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="git-deploy",
         description="Git-aware local build and FTP/SFTP file synchronization",
     )
-    parser.add_argument(
+    action = parser.add_argument(
         "action",
         nargs="?",
-        help="target name, 'build', 'doctor', 'init', or 'bootstrap'",
+        help="target name, 'build', 'doctor', 'init', 'bootstrap', or 'completion'",
     )
-    parser.add_argument(
+    setattr(action, "completer", _complete_action)
+    extra = parser.add_argument(
         "extra",
         nargs="*",
         help=(
-            "doctor/workspace-build target, or bootstrap target filter names "
-            "(bootstrap only)"
+            "doctor/workspace-build target, bootstrap target filter names, "
+            "or completion {bash,zsh,targets,install}"
         ),
     )
+    setattr(extra, "completer", _complete_extra)
     planning = parser.add_mutually_exclusive_group()
     planning.add_argument(
         "--dry-run",
@@ -88,8 +99,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="deploy/bootstrap without interactive confirmation",
     )
-    parser.add_argument("--config", type=Path, help="path to one project's deploy.toml")
-    parser.add_argument("--workspace", type=Path, help="path to deploy.workspace.toml")
+    config_arg = parser.add_argument(
+        "--config",
+        type=Path,
+        help="path to one project's deploy.toml",
+    )
+    workspace_arg = parser.add_argument(
+        "--workspace",
+        type=Path,
+        help="path to deploy.workspace.toml",
+    )
+    try:
+        from argcomplete.completers import FilesCompleter
+
+        setattr(config_arg, "completer", FilesCompleter(["toml"]))
+        setattr(workspace_arg, "completer", FilesCompleter(["toml"]))
+    except ImportError:
+        pass
     parser.add_argument("--verbose", action="store_true", help="show detailed upload progress")
     parser.add_argument(
         "--create-root",
@@ -118,6 +144,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def enable_argcomplete(parser: argparse.ArgumentParser) -> None:
+    """Register argcomplete when the optional runtime dependency is present.
+
+    Args:
+        parser: Fully constructed argument parser with completers attached.
+    """
+
+    try:
+        import argcomplete
+    except ImportError:
+        return
+    argcomplete.autocomplete(parser)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a stable user-facing exit code.
 
@@ -129,12 +169,19 @@ def main(argv: list[str] | None = None) -> int:
     """
 
     parser = build_parser()
+    # Only auto-complete when using real process argv (argcomplete reads env + sys.argv).
+    if argv is None:
+        # uv/pip cannot run post-install RC edits; install once per package version.
+        ensure_shell_completion_installed()
+        enable_argcomplete(parser)
     args = parser.parse_args(argv)
     try:
         if args.action == "init":
             return _initialize(args)
         if args.action == "bootstrap":
             return _bootstrap(args)
+        if args.action == "completion":
+            return _completion_command(args)
         mode, input_path = _select_input(args.config, args.workspace)
         if mode == "workspace":
             workspace = load_workspace(input_path)
@@ -147,6 +194,84 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("error: interrupted", file=sys.stderr)
         return 130
+
+
+def _complete_action(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **kwargs: Any,
+) -> list[str]:
+    """Argcomplete hook for the first positional (action or target).
+
+    Args:
+        prefix: Current incomplete token.
+        parsed_args: Partially parsed namespace (may include ``--config``).
+        **kwargs: Unused argcomplete extras.
+
+    Returns:
+        Matching fixed actions and discovered target names.
+    """
+
+    del kwargs
+    return list_action_completions(
+        config=getattr(parsed_args, "config", None),
+        workspace=getattr(parsed_args, "workspace", None),
+        prefix=prefix,
+    )
+
+
+def _complete_extra(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **kwargs: Any,
+) -> list[str]:
+    """Argcomplete hook for trailing positionals (target filters / shell names).
+
+    Args:
+        prefix: Current incomplete token.
+        parsed_args: Partially parsed namespace including ``action`` when known.
+        **kwargs: Unused argcomplete extras.
+
+    Returns:
+        Matching completion shells or target names.
+    """
+
+    del kwargs
+    return list_extra_completions(
+        getattr(parsed_args, "action", None),
+        config=getattr(parsed_args, "config", None),
+        workspace=getattr(parsed_args, "workspace", None),
+        prefix=prefix,
+    )
+
+
+def _completion_command(args: argparse.Namespace) -> int:
+    """Print scripts/targets or install user-local shell completion files.
+
+    Args:
+        args: Parsed CLI namespace; ``extra[0]`` is ``bash``, ``zsh``, ``targets``,
+            or ``install``.
+
+    Returns:
+        Zero after writing the script, target list, or install report to stdout.
+    """
+
+    _validate_completion_args(args)
+    kind = args.extra[0]
+    if kind == "install":
+        try:
+            results = install_shell_completion(force=args.force)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        print(format_install_report(results))
+        return 0
+    if kind in {"bash", "zsh"}:
+        sys.stdout.write(load_completion_script(kind))
+        return 0
+    # targets: one name per line for static shell scripts
+    for name in list_target_names(config=args.config, workspace=args.workspace):
+        print(name)
+    return 0
 
 
 def _initialize(args: argparse.Namespace) -> int:
@@ -725,6 +850,35 @@ def _validate_bootstrap_args(args: argparse.Namespace) -> None:
     ):
         raise ConfigError("bootstrap does not accept deploy or doctor-only flags")
 
+
+def _validate_completion_args(args: argparse.Namespace) -> None:
+    """Reject deploy-only flags and require exactly one completion kind."""
+
+    if len(args.extra) != 1 or args.extra[0] not in {"bash", "zsh", "targets", "install"}:
+        raise ConfigError("usage: git-deploy completion {bash,zsh,targets,install}")
+    if args.config is not None and args.workspace is not None:
+        raise ConfigError("--config and --workspace are mutually exclusive")
+    if args.extra[0] in {"bash", "zsh", "install"} and (
+        args.config is not None or args.workspace is not None
+    ):
+        raise ConfigError(
+            f"completion {args.extra[0]} does not accept --config or --workspace"
+        )
+    if args.force and args.extra[0] != "install":
+        raise ConfigError("--force is only valid with: git-deploy completion install")
+    if (
+        args.dry_run
+        or args.remote_plan
+        or args.recover
+        or args.skip_build
+        or args.full
+        or args.yes
+        or args.verbose
+        or args.create_root
+        or args.no_create_root
+        or args.probe_ftp_hybrid
+    ):
+        raise ConfigError("completion does not accept deploy or doctor flags")
 
 
 if __name__ == "__main__":

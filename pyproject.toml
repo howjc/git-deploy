@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
+    "argcomplete>=3.7.0",
     "paramiko>=5.0.0",
 ]
 

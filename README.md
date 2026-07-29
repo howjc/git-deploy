@@ -27,6 +27,44 @@ uv sync --all-groups
 uv tool install --editable .
 ```
 
+## Shell Tab 补全
+
+安装后会在**首次运行** `git-deploy` 时按 `$SHELL` 自动写入用户级补全（pip / `uv tool`
+没有可靠的 post-install hook，因此用首次启动补上）。也可显式安装或重装：
+
+```bash
+git-deploy completion install          # 检测 $SHELL，写入脚本 + RC
+git-deploy completion install --force  # 强制覆盖
+```
+
+默认写入位置：
+
+| Shell | 补全脚本 | RC 片段 |
+|-------|----------|---------|
+| bash | `~/.local/share/bash-completion/completions/git-deploy` | `~/.bashrc` 中带标记的 `source` |
+| zsh | `~/.local/share/zsh/site-functions/_git-deploy` | `~/.zshrc` 中 `fpath` + `source` |
+
+RC 片段用 `# >>> git-deploy shell completion >>>` 标记，可重复执行、不重复追加。
+装好后**重新打开终端**（或 `source ~/.bashrc`），再试 `git-deploy <Tab>`。
+
+跳过自动安装：设置环境变量 `GIT_DEPLOY_SKIP_COMPLETION_INSTALL=1`。
+
+### 可选：argcomplete 动态补全
+
+依赖已包含 `argcomplete`。若更想用 Python 侧动态补全，可额外：
+
+```bash
+eval "$(register-python-argcomplete git-deploy)"
+```
+
+### 调试 / 手工加载
+
+```bash
+git-deploy completion bash      # 打印 bash 脚本
+git-deploy completion zsh       # 打印 zsh 脚本
+git-deploy completion targets   # 列出当前可补全 target（只读本地 TOML）
+```
+
 ## 配置
 
 在项目根目录创建不提交到 Git 的 `deploy.toml`：
