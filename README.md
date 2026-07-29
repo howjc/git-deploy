@@ -163,7 +163,7 @@ Probe 在创建 `.git-deploy/ftp-probe/<随机 ID>` 前先以单层 MLSD 拒绝 
 
 FTP In-place Hybrid 还要求单发布器：部署期间不得由 CI、另一台机器、面板或手工 FTP 修改受管路径。FTP Rename Replace 无法保证 Planned-Missing 路径最后一刻不覆盖。受管直接路径的 File→Directory / Directory→File 会被拒绝；先从聚合视图移除旧类型并完成一次删除部署，再添加新类型并用 `--full` 审阅。
 
-`examples/aggregate_frontend_builds.py` 展示显式 Sources/Destination、重复路径与文件/目录冲突检测、符号链接拒绝和本地原子替换。完整迁移步骤见 [Hybrid 迁移指南](docs/migrate-to-hybrid-output.md)，架构边界见 [Hybrid ADR](docs/adr-hybrid-output.md)。
+`examples/aggregate_frontend_builds.py` 展示显式 Sources/Destination、重复路径与文件/目录冲突检测、符号链接拒绝和本地原子替换。完整迁移步骤见 [Hybrid 迁移指南](docs/migrate-to-hybrid-output.md)，架构边界见 [Hybrid ADR](docs/adr/hybrid-output.md)。
 
 ## After-deploy 命令
 
@@ -369,7 +369,7 @@ git-deploy prod --yes
 
 `--recover` 与 `--dry-run`、`--remote-plan`、`--full` 互斥，并且一次只处理当前配置中的一个可证明记录。它不是历史或自动回滚系统。
 
-Native OpenSSH 若在临时文件上传完成后、正式 rename 前发生连接中断，当前进程会尝试删除已知的 `.git-deploy-<uuid>.tmp`；连接已死亡时该清理可能失败。工具不会扫描或删除未知历史临时文件，以免越过文件所有权边界。跨独立仓库命令的本机物理目标锁取舍见 [ADR](docs/adr-physical-target-lock.md)。
+Native OpenSSH 若在临时文件上传完成后、正式 rename 前发生连接中断，当前进程会尝试删除已知的 `.git-deploy-<uuid>.tmp`；连接已死亡时该清理可能失败。工具不会扫描或删除未知历史临时文件，以免越过文件所有权边界。跨独立仓库命令的本机物理目标锁取舍见 [ADR](docs/adr/physical-target-lock.md)。
 
 ## 开发、测试与发布
 
@@ -388,7 +388,7 @@ tmp/release-smoke/bin/git-deploy --version
 tmp/release-smoke/bin/git-deploy --help
 ```
 
-WSL、1Password、OpenSSH Config、Windows Hello 人工验收与故障排查见 [Native OpenSSH / WSL 指南](docs/native-openssh-wsl.md)。详细范围和实施记录见 [OpenSSH/Workspace 总方案](docs/git-deploy-v1-lite-audit-workspace-openssh-master-plan.md)。
+WSL、1Password、OpenSSH Config、Windows Hello 人工验收与故障排查见 [Native OpenSSH / WSL 指南](docs/native-openssh-wsl.md)。更多文档（产品边界、迁移、ADR、版本说明）见 [docs/](docs/README.md)。
 
 ## 许可证
 

@@ -1,6 +1,6 @@
 # ADR：单 Hybrid Output 与远端所有权
 
-状态：Accepted for SFTP；FTP 限制由 v1.5.0 [FTP Hybrid ADR](adr-ftp-hybrid.md) 扩展
+状态：Accepted for SFTP；FTP 限制由 v1.5.0 [FTP Hybrid ADR](ftp-hybrid.md) 扩展
 
 日期：2026-07-17
 

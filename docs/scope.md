@@ -12,7 +12,8 @@ v1-lite 的长期产品边界是“构建、找差异、上传”。
 - 失败恢复方式是重新执行同一条命令。
 - Thin Workspace 只编排独立仓库的顺序与统一 Target；每仓保留自己的配置、Git、State 和 Lock。
 - SFTP Hybrid 只支持一个本地聚合根：直接文件增量、直接目录完整 Mirror，未知远端内容永不处理；
-- Recovery Record 只服务当前 Hybrid Stage/Swap 的恢复或清理，不形成历史和回滚系统。
+- FTP In-place Hybrid 在协议限制下提供等价的直接子项 Ownership（无 Stage/Swap 原子语义）；
+- Recovery Record 只服务当前 Hybrid 可证明阶段的恢复或清理，不形成历史和回滚系统。
 
 明确不做：
 
@@ -21,7 +22,7 @@ v1-lite 的长期产品边界是“构建、找差异、上传”。
 - History、Verify、通用 Recover、自动 Rollback；
 - Workspace 全局 State、跨仓事务、依赖图、Target Map 或默认并行；
 - Docker/1Password Build Provider、构建缓存或沙箱；
-- FTPS、FTP Hybrid、通用远端 Hook、Health URL、Owner/Group 管理；
+- FTPS、通用远端 Hook、Health URL、Owner/Group 管理；
 - Root Mirror、完整远端扫描、多 Hybrid 同根协调和发布事务。
 
 旧 v0.3 实现保存在 `legacy/v0.3` 分支和 v0.3.x tags，新主线不提供运行时兼容层。
