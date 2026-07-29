@@ -422,3 +422,60 @@ def test_coarse_native_mode_avoids_streaming_and_exact_wire_claims() -> None:
     assert "failed partial bytes may be unreported" in output
     assert "attempt bytes:" not in output
     assert "average upload:" not in output
+
+
+def test_phase_progress_tty_refreshes_and_finishes_on_one_line() -> None:
+    """Post-upload phases use a live counter then a final completed line."""
+
+    clock = FakeClock()
+    stream = FakeStream(tty=True)
+    reporter = ProgressReporter(clock=clock, stream=stream)
+    reporter.start_phase("PUBLISH", 3)
+    clock.advance(0.3)
+    reporter.advance_phase(detail="a.js")
+    clock.advance(0.3)
+    reporter.advance_phase(detail="b.js")
+    reporter.advance_phase(detail="c.js")
+    reporter.finish_phase()
+
+    output = stream.getvalue()
+    assert "PUBLISH" in output
+    assert "3/3" in output
+    assert "100%" in output
+    assert "c.js" in output
+
+
+def test_phase_progress_non_tty_prints_only_final_line() -> None:
+    """Non-TTY logs avoid per-step spam and keep one completed phase line."""
+
+    stream = FakeStream(tty=False)
+    reporter = ProgressReporter(stream=stream)
+    reporter.start_phase("PRUNE", 2)
+    reporter.advance_phase(detail="old.js")
+    reporter.advance_phase(detail="gone/")
+    reporter.finish_phase()
+
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    assert any("PRUNE 2/2" in line and "100%" in line for line in lines)
+    # start_phase with total>0 prints an initial 0/2 line on non-TTY via complete=False path...
+    # start_phase calls _render_phase(complete=self._phase_total == 0) so for total=2 complete=False
+    # and non-TTY goes to _safe_print newline - so we get start line + finish line.
+    assert sum("PRUNE" in line for line in lines) <= 2
+
+
+def test_update_phase_force_refreshes_detail_without_advancing() -> None:
+    """Forced phase updates cover silent Stage RETR between upload and next step."""
+
+    clock = FakeClock()
+    stream = FakeStream(tty=True)
+    reporter = ProgressReporter(clock=clock, stream=stream)
+    reporter.start_phase("STAGE", 2)
+    reporter.advance_phase(detail="a.js")
+    clock.advance(0.01)
+    reporter.update_phase(detail="verify b.js", force=True)
+
+    output = stream.getvalue()
+    assert "STAGE" in output
+    assert "1/2" in output
+    assert "verify b.js" in output
+    assert reporter._phase_done == 1

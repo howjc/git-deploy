@@ -89,6 +89,10 @@ class ProgressReporter:
     _render_disabled: bool = field(default=False, init=False)
     # Protects counters and TTY rendering under parallel FTP Hybrid workers.
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _phase_name: str | None = field(default=None, init=False)
+    _phase_total: int = field(default=0, init=False)
+    _phase_done: int = field(default=0, init=False)
+    _phase_detail: str = field(default="", init=False)
 
     def callback(self, path: str, total: int) -> Callable[[int, int | None], None]:
         """Register one upload without starting its active-time clock.
@@ -178,6 +182,95 @@ class ProgressReporter:
             self._retries += 1
             self._retry_credits[path] = self._retry_credits.get(path, 0) + 1
 
+    def start_phase(self, name: str, total: int) -> None:
+        """Begin a discrete post-upload phase with a known step count.
+
+        Args:
+            name: Short upper-case phase label (for example ``PUBLISH``).
+            total: Expected step count; zero skips rendering until finish.
+
+        Returns:
+            ``None`` after the phase counters are reset and an initial line is shown.
+        """
+
+        with self._lock:
+            if self._finished or self._render_disabled:
+                return
+            label = name.strip() or "PHASE"
+            self._phase_name = label
+            self._phase_total = max(0, total)
+            self._phase_done = 0
+            self._phase_detail = ""
+            self._render_phase(complete=self._phase_total == 0)
+            self._last_render_at = self.clock()
+
+    def advance_phase(self, detail: str = "") -> None:
+        """Advance the active phase by one step and refresh progress output.
+
+        Args:
+            detail: Optional path or note shown beside the counter.
+
+        Returns:
+            ``None`` after counters update. Thread-safe for parallel workers.
+        """
+
+        with self._lock:
+            if self._finished or self._render_disabled or self._phase_name is None:
+                return
+            self._phase_done += 1
+            if self._phase_total > 0:
+                self._phase_done = min(self._phase_done, self._phase_total)
+            self._phase_detail = detail
+            now = self.clock()
+            # Keep ticks on the in-progress line; finish_phase emits the final line.
+            if self.verbose or (
+                self._is_tty() and now - self._last_render_at >= self.refresh_interval
+            ):
+                self._render_phase(complete=False)
+                self._last_render_at = now
+
+    def update_phase(self, detail: str = "", *, force: bool = False) -> None:
+        """Refresh the active phase detail without advancing the counter.
+
+        Args:
+            detail: Path or status note (for example ``verify path.js``).
+            force: When true, render immediately even inside the refresh throttle.
+                Used after STOR finishes so Stage RETR does not look stuck.
+
+        Returns:
+            ``None`` after the phase line is optionally redrawn.
+        """
+
+        with self._lock:
+            if self._finished or self._render_disabled or self._phase_name is None:
+                return
+            self._phase_detail = detail
+            now = self.clock()
+            if force or self.verbose or (
+                self._is_tty() and now - self._last_render_at >= self.refresh_interval
+            ):
+                self._render_phase(complete=False)
+                self._last_render_at = now
+
+    def finish_phase(self) -> None:
+        """Mark the active phase complete and clear phase state.
+
+        Returns:
+            ``None`` after a final progress line when a phase was open.
+        """
+
+        with self._lock:
+            if self._finished or self._render_disabled or self._phase_name is None:
+                return
+            if self._phase_total > 0:
+                self._phase_done = self._phase_total
+            self._render_phase(complete=True)
+            self._phase_name = None
+            self._phase_total = 0
+            self._phase_done = 0
+            self._phase_detail = ""
+            self._last_render_at = self.clock()
+
     def finish(self) -> TransferSummary | None:
         """Freeze and return final metrics without rendering them.
 
@@ -188,6 +281,11 @@ class ProgressReporter:
         with self._lock:
             if self._finished:
                 return self._summary
+            if self._phase_name is not None:
+                if self._phase_total > 0:
+                    self._phase_done = self._phase_total
+                self._render_phase(complete=True)
+                self._phase_name = None
             now = self.clock()
             for path, attempt in tuple(self._attempts.items()):
                 if attempt.state is not TransferAttemptState.COMPLETED:
@@ -331,6 +429,31 @@ class ProgressReporter:
                     f"UPLOAD {path} {percent:3d}%  {format_bytes(transferred)} / "
                     f"{format_bytes(total)}  {format_rate(self._window_rate(attempt))}"
                 )
+        self._emit_progress_line(line, complete=complete)
+
+    def _render_phase(self, *, complete: bool) -> None:
+        """Render the active discrete phase counter through safe output."""
+
+        if self._render_disabled or self._phase_name is None:
+            return
+        name = self._phase_name
+        if self.label:
+            name = f"[{self.label}] {name}"
+        total = self._phase_total
+        done = self._phase_done
+        if total > 0:
+            percent = min(100, int(done * 100 / total))
+            line = f"{name} {done}/{total}  {percent:3d}%"
+        else:
+            line = f"{name} ..."
+        detail = self._phase_detail.strip()
+        if detail:
+            line = f"{line}  {detail}"
+        self._emit_progress_line(line, complete=complete)
+
+    def _emit_progress_line(self, line: str, *, complete: bool) -> None:
+        """Write one TTY-refresh or newline progress line without raising."""
+
         tty = self._is_tty()
         if tty and not complete:
             padding = " " * max(0, self._render_width - len(line))

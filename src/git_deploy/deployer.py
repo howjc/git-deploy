@@ -569,46 +569,85 @@ def _execute_ftp_hybrid_plan(
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
-        _run_ftp_hybrid_file_jobs(
-            ftp_plan.uploads,
-            transport,
-            connections=config.deploy.ftp_connections,
-            job=lambda upload, worker: _stage_ftp_hybrid_file(
-                upload,
-                frozen[upload.path],
-                stage_root,
-                worker,
-                progress,
-                attempts=config.deploy.retries,
-                delay=config.deploy.retry_delay,
-            ),
-        )
+        if ftp_plan.uploads:
+            # STAGE counts completed STOR+RETR units. Upload lines only cover STOR;
+            # without this bar the last UPLOAD 100% is followed by silent RETR work.
+            progress.start_phase("STAGE", len(ftp_plan.uploads))
+
+            def stage_one(
+                upload: FTPHybridFileUpload, worker: FTPTransport
+            ) -> None:
+                """Stage one file completely, then advance the STAGE counter."""
+
+                _stage_ftp_hybrid_file(
+                    upload,
+                    frozen[upload.path],
+                    stage_root,
+                    worker,
+                    progress,
+                    attempts=config.deploy.retries,
+                    delay=config.deploy.retry_delay,
+                )
+                progress.advance_phase(detail=upload.path)
+
+            _run_ftp_hybrid_file_jobs(
+                ftp_plan.uploads,
+                transport,
+                connections=config.deploy.ftp_connections,
+                job=stage_one,
+            )
+            progress.finish_phase()
         reviewed = replace(
             plan,
             hybrid=replace(hybrid, ftp=replace(ftp_plan, pending=pending)),
         )
+        progress.start_phase("VERIFY", 1)
         validate_remote_freshness(reviewed, config, transport)
-        for directory in ftp_plan.create_directories:
-            transport.make_directory(directory)
-        _run_ftp_hybrid_file_jobs(
-            ftp_plan.uploads,
-            transport,
-            connections=config.deploy.ftp_connections,
-            job=lambda upload, worker: _publish_ftp_hybrid_file(
-                upload,
-                frozen[upload.path],
-                stage_root,
-                worker,
-                progress,
-                attempts=config.deploy.retries,
-                delay=config.deploy.retry_delay,
-            ),
-        )
+        progress.advance_phase(detail="remote freshness")
+        progress.finish_phase()
+        if ftp_plan.create_directories:
+            progress.start_phase("MKDIR", len(ftp_plan.create_directories))
+            for directory in ftp_plan.create_directories:
+                transport.make_directory(directory)
+                progress.advance_phase(detail=directory)
+            progress.finish_phase()
+        if ftp_plan.uploads:
+            progress.start_phase("PUBLISH", len(ftp_plan.uploads))
+
+            def publish_one(
+                upload: FTPHybridFileUpload, worker: FTPTransport
+            ) -> None:
+                """Publish one staged file and advance the shared phase bar."""
+
+                _publish_ftp_hybrid_file(
+                    upload,
+                    frozen[upload.path],
+                    stage_root,
+                    worker,
+                    progress,
+                    attempts=config.deploy.retries,
+                    delay=config.deploy.retry_delay,
+                )
+                progress.advance_phase(detail=upload.path)
+
+            _run_ftp_hybrid_file_jobs(
+                ftp_plan.uploads,
+                transport,
+                connections=config.deploy.ftp_connections,
+                job=publish_one,
+            )
+            progress.finish_phase()
+        progress.start_phase("PENDING", 1)
         pending = pending.with_phase(FTPPendingPhase.FILES_PUBLISHED)
         _write_ftp_pending(transport, pending)
+        progress.advance_phase(detail="FILES_PUBLISHED")
+        progress.finish_phase()
         phase = pending.phase
 
     if phase is FTPPendingPhase.FILES_PUBLISHED:
+        prune_total = len(ftp_plan.delete_files) + len(ftp_plan.remove_directories)
+        if prune_total:
+            progress.start_phase("PRUNE", prune_total)
         for path in ftp_plan.delete_files:
             _retry_ftp_mutation(
                 path,
@@ -618,6 +657,8 @@ def _execute_ftp_hybrid_plan(
                 delay=config.deploy.retry_delay,
             )
             print(f"DELETE {path}")
+            if prune_total:
+                progress.advance_phase(detail=path)
         for path in ftp_plan.remove_directories:
             _retry_ftp_mutation(
                 path,
@@ -627,11 +668,19 @@ def _execute_ftp_hybrid_plan(
                 delay=config.deploy.retry_delay,
             )
             print(f"RMD {path}/")
+            if prune_total:
+                progress.advance_phase(detail=f"{path}/")
+        if prune_total:
+            progress.finish_phase()
+        progress.start_phase("PENDING", 1)
         pending = pending.with_phase(FTPPendingPhase.PRUNED)
         _write_ftp_pending(transport, pending)
+        progress.advance_phase(detail="PRUNED")
+        progress.finish_phase()
         phase = pending.phase
 
     if phase is FTPPendingPhase.PRUNED:
+        progress.start_phase("OWNERSHIP", 2)
         ownership_data = serialize_ownership(ftp_plan.next_ownership)
         current_hash = _ftp_remote_record_hash(
             transport,
@@ -646,28 +695,39 @@ def _execute_ftp_hybrid_plan(
                 final_path=ownership_path(hybrid.local.mapping),
                 data=ownership_data,
             )
+        progress.advance_phase(detail="ownership")
         pending = pending.with_phase(FTPPendingPhase.OWNERSHIP_COMMITTED)
         _write_ftp_pending(transport, pending)
+        progress.advance_phase(detail="OWNERSHIP_COMMITTED")
+        progress.finish_phase()
         phase = pending.phase
 
     if phase is FTPPendingPhase.OWNERSHIP_COMMITTED:
         # The marker's frozen State is authoritative after Ownership commit;
         # current HEAD/build may only be used after this resume has completed.
+        progress.start_phase("STATE", 2)
         state_store.save(pending.next_state)
+        progress.advance_phase(detail="local state")
         pending = pending.with_phase(FTPPendingPhase.STATE_COMPLETE)
         _write_ftp_pending(transport, pending)
+        progress.advance_phase(detail="STATE_COMPLETE")
+        progress.finish_phase()
         phase = pending.phase
 
     if phase is FTPPendingPhase.STATE_COMPLETE:
+        progress.start_phase("CLEANUP", 1)
         try:
             _cleanup_ftp_hybrid_pending(transport, pending)
+            progress.advance_phase(detail="stage")
         except Exception as exc:
+            progress.advance_phase(detail="pending")
             print(
                 "WARNING: FTP Hybrid cleanup is pending; run Doctor and rerun the "
                 f"deployment: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
+        progress.finish_phase()
     progress.render_summary()
 
 
@@ -886,6 +946,8 @@ def _stage_ftp_hybrid_file(
             staged_path,
             progress.callback(operation.path, operation.size),
         )
+        # STOR progress ends here; RETR is often the silent gap users call "stuck".
+        progress.update_phase(detail=f"verify {operation.path}", force=True)
         actual = transport.read_file(staged_path, max_bytes=operation.size)
         if len(actual) != operation.size or hashlib.sha256(actual).hexdigest() != operation.sha256:
             raise DeployError(f"FTP staged verification mismatch for {operation.path}")
@@ -934,12 +996,14 @@ def _publish_ftp_hybrid_file(
                 staged_path,
                 progress.callback(operation.path, operation.size),
             )
+            progress.update_phase(detail=f"verify {operation.path}", force=True)
             staged = transport.read_file(staged_path, max_bytes=operation.size)
             if (
                 len(staged) != operation.size
                 or hashlib.sha256(staged).hexdigest() != operation.sha256
             ):
                 raise DeployError(f"FTP restaged verification mismatch for {operation.path}")
+        progress.update_phase(detail=f"rename {operation.path}", force=True)
         transport.rename_replace(staged_path, operation.path)
         if transport.lstat(staged_path) is not RemotePathType.MISSING:
             raise DeployError(f"FTP Stage was not consumed for {operation.path}")
