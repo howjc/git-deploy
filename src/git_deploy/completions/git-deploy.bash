@@ -1,6 +1,9 @@
 # bash completion for git-deploy
 # Enable: eval "$(git-deploy completion bash)"
 # Or: source this file after git-deploy is on PATH.
+#
+# Dynamic target names never enter ``compgen -W`` (Bash re-expands that word
+# list). Fixed actions/flags stay on static word lists only.
 
 _git_deploy() {
   local cur prev
@@ -45,13 +48,20 @@ _git_deploy() {
     esac
   done
 
-  local targets=""
+  # Line-oriented target list — no word-split / second expansion of target text.
+  local -a targets=()
+  local candidate
   if command -v git-deploy >/dev/null 2>&1; then
-    targets=$("${target_cmd[@]}" completion targets 2>/dev/null | tr '\n' ' ')
+    mapfile -t targets < <("${target_cmd[@]}" completion targets 2>/dev/null)
   fi
 
   if ((${#positionals[@]} == 0)); then
-    COMPREPLY=( $(compgen -W "$actions $targets" -- "$cur") )
+    COMPREPLY=( $(compgen -W "$actions" -- "$cur") )
+    for candidate in "${targets[@]}"; do
+      if [[ -n "$candidate" && "$candidate" == "$cur"* ]]; then
+        COMPREPLY+=("$candidate")
+      fi
+    done
     return 0
   fi
 
@@ -60,11 +70,12 @@ _git_deploy() {
       completion)
         COMPREPLY=( $(compgen -W "$completion_kinds" -- "$cur") )
         ;;
-      doctor|bootstrap|build)
-        COMPREPLY=( $(compgen -W "$targets" -- "$cur") )
-        ;;
-      *)
-        COMPREPLY=( $(compgen -W "$targets" -- "$cur") )
+      doctor|bootstrap|build|*)
+        for candidate in "${targets[@]}"; do
+          if [[ -n "$candidate" && "$candidate" == "$cur"* ]]; then
+            COMPREPLY+=("$candidate")
+          fi
+        done
         ;;
     esac
     return 0

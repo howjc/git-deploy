@@ -2,10 +2,12 @@
 # zsh completion for git-deploy
 # Enable: eval "$(git-deploy completion zsh)"
 # Or place as _git-deploy on fpath (compinit maps via #compdef).
+#
+# Dynamic targets stay in a true line-array and never pass through word-split
+# paths that re-expand target text.
 
 _git_deploy() {
-  local -a opts actions completion_kinds
-  local targets=""
+  local -a opts actions completion_kinds targets
   local -a target_cmd=(git-deploy)
   local i
 
@@ -41,7 +43,7 @@ _git_deploy() {
   done
 
   if (( $+commands[git-deploy] )); then
-    targets="${(j: :)${(f)$("${target_cmd[@]}" completion targets 2>/dev/null)}}"
+    targets=("${(@f)$("${target_cmd[@]}" completion targets 2>/dev/null)}")
   fi
 
   local -a positionals=()
@@ -73,8 +75,8 @@ _git_deploy() {
   if (( ${#positionals} == 0 )); then
     local -a first
     first=($actions)
-    if [[ -n "$targets" ]]; then
-      first+=(${=targets})
+    if (( ${#targets} > 0 )); then
+      first+=("${targets[@]}")
     fi
     _describe -t commands 'command or target' first
     return
@@ -86,10 +88,8 @@ _git_deploy() {
         _describe -t shells 'completion kind' completion_kinds
         ;;
       doctor|bootstrap|build|*)
-        if [[ -n "$targets" ]]; then
-          local -a t
-          t=(${=targets})
-          _describe -t targets 'target' t
+        if (( ${#targets} > 0 )); then
+          _describe -t targets 'target' targets
         fi
         ;;
     esac

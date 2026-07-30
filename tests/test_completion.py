@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -21,6 +25,7 @@ from git_deploy.completion import (
     list_target_names,
     load_completion_script,
 )
+from git_deploy.errors import ConfigError
 from tests.conftest import write_config
 
 
@@ -330,3 +335,172 @@ def test_help_mentions_completion(capsys: pytest.CaptureFixture[str]) -> None:
         cli.main(["--help"])
     assert raised.value.code == 0
     assert "completion" in capsys.readouterr().out
+
+
+def test_list_target_names_filters_unsafe_toml_keys(tmp_path: Path) -> None:
+    """Raw TOML reader applies the same safe-name rule as full config load."""
+
+    config = tmp_path / "deploy.toml"
+    config.write_text(
+        textwrap.dedent(
+            """
+            [targets.dev]
+            protocol = "sftp"
+            host = "dev.example"
+            username = "deploy"
+            remote_root = "/srv/dev"
+
+            [targets."$(touch completion-proof)"]
+            protocol = "sftp"
+            host = "evil.example"
+            username = "deploy"
+            remote_root = "/srv/evil"
+
+            [targets."`touch completion-proof-2`"]
+            protocol = "sftp"
+            host = "evil2.example"
+            username = "deploy"
+            remote_root = "/srv/evil2"
+
+            [targets."has space"]
+            protocol = "sftp"
+            host = "sp.example"
+            username = "deploy"
+            remote_root = "/srv/sp"
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    assert list_target_names(config=config) == ("dev",)
+
+
+def test_bash_script_never_uses_compgen_w_for_dynamic_targets() -> None:
+    """Shipped bash completion must not feed dynamic targets into ``compgen -W``."""
+
+    bash = load_completion_script("bash")
+    assert "compgen -W" in bash  # fixed actions/flags may still use it
+    assert "mapfile -t targets" in bash
+    # Dynamic targets join COMPREPLY by prefix match, not via word-list expansion.
+    assert 'COMPREPLY+=("$candidate")' in bash
+    assert 'compgen -W "$actions $targets"' not in bash
+    assert 'compgen -W "$targets"' not in bash
+
+
+def test_zsh_script_uses_line_array_for_targets() -> None:
+    """Zsh loads targets as a line array instead of word-splitting a string."""
+
+    zsh = load_completion_script("zsh")
+    assert 'targets=("${(@f)$(' in zsh
+    assert "t=(${=targets})" not in zsh
+    assert "first+=(${=targets})" not in zsh
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_bash_completion_does_not_execute_malicious_target_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real bash completion must not run command substitution from target text.
+
+    Even if a raw malicious key reached the shell (defense in depth), the
+    completion function must not re-expand it. This test forces the target
+    helper to emit a marker payload and asserts the marker file is never created.
+    """
+
+    marker = tmp_path / "completion-proof"
+    marker2 = tmp_path / "completion-proof-2"
+    assert not marker.exists()
+    assert not marker2.exists()
+
+    # Stub ``git-deploy completion targets`` so the shell receives hostile text
+    # without depending on TOML allowing the key after the config filter.
+    stub = tmp_path / "git-deploy"
+    stub.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/bin/bash
+            if [[ "$1" == "completion" && "$2" == "targets" ]]; then
+              printf '%s\\n' '$(touch {marker})' '`touch {marker2}`' 'dev'
+              exit 0
+            fi
+            exit 1
+            """
+        ),
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    script = load_completion_script("bash")
+    script_path = tmp_path / "git-deploy.bash"
+    script_path.write_text(script, encoding="utf-8")
+
+    probe = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        source {script_path}
+        COMP_WORDS=(git-deploy "")
+        COMP_CWORD=1
+        COMP_LINE='git-deploy '
+        COMP_POINT=${{#COMP_LINE}}
+        _git_deploy
+        # Print replies for diagnostics (should include safe 'dev' if any).
+        printf '%s\\n' "${{COMPREPLY[@]-}}"
+        """
+    )
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), "bash completion executed $(touch …) from target text"
+    assert not marker2.exists(), "bash completion executed backtick target text"
+
+
+def test_install_preserves_rc_symlink(
+    tmp_path: Path,
+) -> None:
+    """Atomic RC install follows a symlink and never replaces the link node."""
+
+    real_rc = tmp_path / "dotfiles" / "bashrc"
+    real_rc.parent.mkdir(parents=True)
+    real_rc.write_text("# user bashrc\n", encoding="utf-8")
+    link = tmp_path / ".bashrc"
+    link.symlink_to(real_rc)
+
+    results = install_shell_completion("bash", home=tmp_path)
+    assert results[0].rc_updated is True
+    assert link.is_symlink()
+    assert link.resolve() == real_rc.resolve()
+    body = real_rc.read_text(encoding="utf-8")
+    assert "# >>> git-deploy shell completion >>>" in body
+    assert "# user bashrc" in body
+
+
+def test_install_preserves_zsh_rc_symlink(tmp_path: Path) -> None:
+    """Zsh RC symlink install updates the target file, not the link node."""
+
+    real_rc = tmp_path / "dotfiles" / "zshrc"
+    real_rc.parent.mkdir(parents=True)
+    real_rc.write_text("# user zshrc\n", encoding="utf-8")
+    link = tmp_path / ".zshrc"
+    link.symlink_to(real_rc)
+
+    results = install_shell_completion("zsh", home=tmp_path)
+    assert results[0].rc_updated is True
+    assert link.is_symlink()
+    assert "# >>> git-deploy shell completion >>>" in real_rc.read_text(encoding="utf-8")
+
+
+def test_install_rejects_dangling_rc_symlink(tmp_path: Path) -> None:
+    """Dangling RC symlink fails with a clear error instead of replacing the link."""
+
+    link = tmp_path / ".bashrc"
+    link.symlink_to(tmp_path / "missing-bashrc")
+    with pytest.raises(ConfigError, match="dangling|unresolvable symlink"):
+        install_shell_completion("bash", home=tmp_path)
+    assert link.is_symlink()

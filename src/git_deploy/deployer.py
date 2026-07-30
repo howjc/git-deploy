@@ -824,12 +824,14 @@ def _run_ftp_hybrid_file_jobs(
         return 1
 
     # Build the full session pool before enqueueing work or starting workers.
+    # Only expected connection failures degrade; KeyboardInterrupt/SystemExit
+    # must propagate with already-opened siblings closed and zero remote jobs.
     pool: list[tuple[FTPTransport, bool]] = [(primary, False)]
     extras: list[FTPTransport] = []
     for index in range(1, desired):
         try:
             sibling = _open_ftp_hybrid_worker(primary)
-        except BaseException as exc:
+        except Exception as exc:
             print(
                 "WARNING: FTP Hybrid could not open parallel session "
                 f"{index + 1}/{desired} ({exc}); continuing with {len(pool)} "
@@ -837,6 +839,14 @@ def _run_ftp_hybrid_file_jobs(
                 file=sys.stderr,
             )
             break
+        except BaseException:
+            for transport in extras:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+            extras.clear()
+            raise
         extras.append(sibling)
         pool.append((sibling, True))
 

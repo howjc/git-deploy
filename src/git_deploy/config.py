@@ -15,8 +15,56 @@ from git_deploy.errors import ConfigError
 Protocol = Literal["sftp", "ftp"]
 OutputMode = Literal["incremental", "hybrid"]
 RESERVED_TARGET_NAMES = frozenset({"build", "doctor", "init"})
+# Safe target names for config, CLI, and shell completion (no shell metacharacters).
+TARGET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_AFTER_DEPLOY_COMMANDS = 16
 MAX_AFTER_DEPLOY_COMMAND_LENGTH = 4096
+
+
+def is_valid_target_name(name: str) -> bool:
+    """Return whether ``name`` is a safe, non-reserved deploy target identifier.
+
+    Args:
+        name: Candidate target table key from TOML or user input.
+
+    Returns:
+        ``True`` when the name matches the safe-name rule and is not a CLI
+        reserved action word.
+    """
+
+    if not isinstance(name, str) or not name:
+        return False
+    if name in RESERVED_TARGET_NAMES:
+        return False
+    return TARGET_NAME_PATTERN.fullmatch(name) is not None
+
+
+def validate_target_name(name: str) -> str:
+    """Validate a target name for config load and reject unsafe keys.
+
+    Args:
+        name: Candidate target table key.
+
+    Returns:
+        The same name when valid.
+
+    Raises:
+        ConfigError: When the name is empty, reserved, or fails the safe-name
+            rule (shell metacharacters, whitespace, control chars, leading ``-``).
+    """
+
+    if not isinstance(name, str) or not name:
+        raise ConfigError(f"invalid target name: {name!r}")
+    if name in RESERVED_TARGET_NAMES:
+        raise ConfigError(
+            f"target name {name!r} is reserved by the flat CLI; choose another name"
+        )
+    if not TARGET_NAME_PATTERN.fullmatch(name):
+        raise ConfigError(
+            f"invalid target name: {name!r}; "
+            "use 1–64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*"
+        )
+    return name
 
 DEFAULT_EXCLUDE = (
     ".git/**",
@@ -684,14 +732,8 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
         raise ConfigError("at least one [targets.NAME] table is required")
     targets: dict[str, TargetConfig] = {}
     for name, value in table.items():
-        if not isinstance(name, str) or not name or "/" in name or "\\" in name or name in {".", ".."}:
-            raise ConfigError(f"invalid target name: {name!r}")
-        # The intentionally flat CLI dispatches these words as actions, so
-        # accepting them as targets would create an unreachable configuration.
-        if name in RESERVED_TARGET_NAMES:
-            raise ConfigError(
-                f"target name {name!r} is reserved by the flat CLI; choose another name"
-            )
+        # Shared safe-name rule used by completion raw readers as well.
+        validate_target_name(name if isinstance(name, str) else "")
         item = _table(value, f"targets.{name}")
         _reject_unknown(
             item,

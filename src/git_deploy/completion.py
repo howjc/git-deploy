@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from git_deploy import __version__
+from git_deploy.config import is_valid_target_name
+from git_deploy.errors import ConfigError
 
 # Fixed first-position words (not deploy targets).
 FIXED_ACTIONS: tuple[str, ...] = (
@@ -519,22 +521,36 @@ def _write_install_state(home: Path, version: str) -> None:
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write UTF-8 text via temp file, fsync, and ``os.replace``.
 
+    When ``path`` is a symlink, follow it and write the resolved destination so
+    the symlink node is never replaced by a regular file. Dangling symlinks
+    fail with a clear error instead of being silently unlinked.
+
     Args:
-        path: Final destination path.
+        path: Final destination path (may be a symlink to the real RC file).
         content: Full file body.
 
     Raises:
+        ConfigError: When ``path`` is a dangling symlink or cannot be resolved.
         OSError: When the temporary write or replace fails.
     """
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    destination = path
+    if path.is_symlink():
+        try:
+            destination = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ConfigError(
+                f"RC path {path} is a dangling or unresolvable symlink; "
+                "add the completion block manually or fix the link target"
+            ) from exc
+    destination.parent.mkdir(parents=True, exist_ok=True)
     previous_mode: int | None = None
-    if path.is_file():
-        previous_mode = stat.S_IMODE(path.stat().st_mode)
+    if destination.is_file():
+        previous_mode = stat.S_IMODE(destination.stat().st_mode)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
+        prefix=f".{destination.name}.",
         suffix=".tmp",
-        dir=str(path.parent),
+        dir=str(destination.parent),
     )
     tmp_path = Path(tmp_name)
     try:
@@ -546,7 +562,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
             os.chmod(tmp_path, previous_mode)
         else:
             os.chmod(tmp_path, 0o644)
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, destination)
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -617,7 +633,11 @@ def _target_keys_from_project(path: Path) -> tuple[str, ...]:
     targets = raw.get("targets")
     if not isinstance(targets, dict):
         return ()
-    names = [str(key) for key in targets if isinstance(key, str) and key.strip()]
+    names = [
+        str(key)
+        for key in targets
+        if isinstance(key, str) and is_valid_target_name(key)
+    ]
     return tuple(sorted(set(names)))
 
 
@@ -630,7 +650,7 @@ def _target_keys_from_workspace(path: Path) -> tuple[str, ...]:
         return ()
     names: set[str] = set()
     default = raw.get("default_target")
-    if isinstance(default, str) and default.strip():
+    if isinstance(default, str) and is_valid_target_name(default.strip()):
         names.add(default.strip())
     entries = raw.get("repositories")
     if not isinstance(entries, list):

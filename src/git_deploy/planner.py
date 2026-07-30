@@ -918,7 +918,10 @@ def _complete_ftp_remote_plan(
             )
 
     phase = pending.phase if pending is not None else None
+    # FILES_PUBLISHED: executor trusts the marker and only prunes — Plan must
+    # not advertise Hybrid uploads that will never run.
     publish_needed = phase not in {
+        FTPPendingPhase.FILES_PUBLISHED,
         FTPPendingPhase.PRUNED,
         FTPPendingPhase.OWNERSHIP_COMMITTED,
         FTPPendingPhase.STATE_COMPLETE,
@@ -1003,10 +1006,13 @@ def _complete_ftp_remote_plan(
                 remove_directories.add(name)
 
     if phase in {
+        FTPPendingPhase.FILES_PUBLISHED,
         FTPPendingPhase.PRUNED,
         FTPPendingPhase.OWNERSHIP_COMMITTED,
         FTPPendingPhase.STATE_COMPLETE,
     }:
+        # Fail-closed: marker claims publish complete; missing current files abort
+        # rather than prune without re-upload (Plan no longer advertises uploads).
         for item in hybrid.local.root_files:
             if transport.lstat(item.name) is not RemotePathType.FILE:
                 raise PlanError(f"FTP Hybrid resume cannot verify published file: {item.name}")
@@ -1018,6 +1024,13 @@ def _complete_ftp_remote_plan(
                     "FTP Hybrid resume cannot verify published mirror files: "
                     + ", ".join(f"{directory.name}/{path}" for path in missing[:10])
                 )
+    if phase in {
+        FTPPendingPhase.PRUNED,
+        FTPPendingPhase.OWNERSHIP_COMMITTED,
+        FTPPendingPhase.STATE_COMPLETE,
+    }:
+        for directory in hybrid.local.directories:
+            tree = remote_trees[directory.name]
             orphan_files = sorted(set(tree.files) - set(directory.files))
             orphan_directories = sorted(set(tree.directories) - set(directory.directories))
             if orphan_files or orphan_directories:

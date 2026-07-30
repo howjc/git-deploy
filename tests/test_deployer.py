@@ -908,6 +908,118 @@ def test_run_ftp_hybrid_file_jobs_degrades_when_sibling_connect_fails(
     assert "continuing with 1" in err
 
 
+def test_run_ftp_hybrid_file_jobs_propagates_keyboard_interrupt_on_first_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl+C during first sibling open aborts with zero remote jobs."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    jobs = 0
+
+    def interrupt_open(source: FTPTransport) -> FTPTransport:
+        """Simulate user interrupt while opening the first sibling."""
+
+        del source
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(deployer_module, "_open_ftp_hybrid_worker", interrupt_open)
+    uploads = (
+        FTPHybridFileUpload("a.js", Path("/tmp/a.js"), "a" * 64, 1),
+        FTPHybridFileUpload("b.js", Path("/tmp/b.js"), "b" * 64, 1),
+    )
+
+    def job(upload: FTPHybridFileUpload, transport: FTPTransport) -> None:
+        """Count jobs — must stay zero when interrupt aborts pool setup."""
+
+        del upload, transport
+        nonlocal jobs
+        jobs += 1
+
+    with pytest.raises(KeyboardInterrupt):
+        deployer_module._run_ftp_hybrid_file_jobs(
+            uploads,
+            primary,
+            connections=4,
+            job=job,
+        )
+    assert jobs == 0
+
+
+def test_run_ftp_hybrid_file_jobs_closes_siblings_on_later_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupt on a later sibling closes already-open sessions and starts no jobs."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    jobs = 0
+    closed: list[int] = []
+    opens = 0
+
+    def open_then_interrupt(source: FTPTransport) -> FTPTransport:
+        """Open one sibling, then interrupt on the second sibling open."""
+
+        del source
+        nonlocal opens
+        opens += 1
+        if opens >= 2:
+            raise KeyboardInterrupt
+        sibling = FTPTransport(target)
+        sibling.ftp = object()  # type: ignore[assignment]
+
+        def track_close() -> None:
+            """Record that the opened sibling was closed on interrupt."""
+
+            closed.append(id(sibling))
+            sibling.ftp = None
+
+        sibling.close = track_close  # type: ignore[method-assign]
+        return sibling
+
+    monkeypatch.setattr(deployer_module, "_open_ftp_hybrid_worker", open_then_interrupt)
+    uploads = tuple(
+        FTPHybridFileUpload(f"f{i}.js", Path(f"/tmp/f{i}.js"), "a" * 64, 1)
+        for i in range(4)
+    )
+
+    def job(upload: FTPHybridFileUpload, transport: FTPTransport) -> None:
+        """Count jobs — must stay zero after interrupt during pool setup."""
+
+        del upload, transport
+        nonlocal jobs
+        jobs += 1
+
+    with pytest.raises(KeyboardInterrupt):
+        deployer_module._run_ftp_hybrid_file_jobs(
+            uploads,
+            primary,
+            connections=4,
+            job=job,
+        )
+    assert jobs == 0
+    assert opens == 2
+    assert len(closed) == 1
+
+
 def test_ftp_hybrid_publish_skips_final_retr_after_stage_verified(tmp_path: Path) -> None:
     """Business publish trusts Stage SHA256 + rename; no final-path RETR."""
 

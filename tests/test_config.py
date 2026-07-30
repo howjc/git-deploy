@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from git_deploy.config import is_source_managed, load_config, path_matches
+from git_deploy.config import (
+    is_source_managed,
+    is_valid_target_name,
+    load_config,
+    path_matches,
+    validate_target_name,
+)
 from git_deploy.errors import ConfigError
 from tests.conftest import write_config
 
@@ -345,6 +351,56 @@ remote_root = "/srv/app"
 
     with pytest.raises(ConfigError, match="reserved by the flat CLI"):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "$(touch completion-proof)",
+        "`touch completion-proof-2`",
+        "has space",
+        "semi;colon",
+        "lead\ning",
+        "-leading-dash",
+        "with/slash",
+        "with\\backslash",
+        ".",
+        "..",
+        "",
+        "a" * 65,
+    ],
+)
+def test_rejects_unsafe_target_names(git_project: Path, name: str) -> None:
+    """Shell metacharacters, whitespace, control chars, and reserved forms fail load."""
+
+    assert not is_valid_target_name(name)
+    with pytest.raises(ConfigError, match="invalid target name|reserved"):
+        validate_target_name(name)
+
+    # TOML quoted keys for names that are not bare identifiers.
+    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\n" in name:
+        # Empty / path-like / control: assert pure validator only (config path varies).
+        return
+    path = write_config(
+        git_project,
+        f"""
+[targets.{name!r}]
+protocol = "sftp"
+host = "host"
+username = "deploy"
+remote_root = "/srv/app"
+""",
+    )
+    with pytest.raises(ConfigError, match="invalid target name|reserved"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("name", ["dev", "prod", "a", "A1._-z", "x" * 64])
+def test_accepts_safe_target_names(name: str) -> None:
+    """Audit safe-name rule accepts alphanumeric/dot/underscore/hyphen identifiers."""
+
+    assert is_valid_target_name(name)
+    assert validate_target_name(name) == name
 
 
 @pytest.mark.parametrize(
