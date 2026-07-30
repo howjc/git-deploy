@@ -24,6 +24,6 @@
 
 按版本分文件存放在 [releases/](releases/)。最新版：
 
-- [v1.7.3](releases/v1.7.3.md)
+- [v1.8.0](releases/v1.8.0.md)
 
 完整列表见 [releases/README.md](releases/README.md)。

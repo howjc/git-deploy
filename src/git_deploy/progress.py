@@ -223,9 +223,8 @@ class ProgressReporter:
             self._phase_detail = detail
             now = self.clock()
             # Keep ticks on the in-progress line; finish_phase emits the final line.
-            if self.verbose or (
-                self._is_tty() and now - self._last_render_at >= self.refresh_interval
-            ):
+            # Non-TTY samples every ~2s (or verbose) to avoid 10k-line CI spam.
+            if self._should_render_phase(now, force=False):
                 self._render_phase(complete=False)
                 self._last_render_at = now
 
@@ -234,8 +233,9 @@ class ProgressReporter:
 
         Args:
             detail: Path or status note (for example ``verify path.js``).
-            force: When true, render immediately even inside the refresh throttle.
-                Used after STOR finishes so Stage RETR does not look stuck.
+            force: On a TTY, render immediately (covers silent Stage RETR). On
+                non-TTY, ``force`` is demoted to the same 2s sample cadence so
+                CI logs do not grow one line per file.
 
         Returns:
             ``None`` after the phase line is optionally redrawn.
@@ -246,9 +246,7 @@ class ProgressReporter:
                 return
             self._phase_detail = detail
             now = self.clock()
-            if force or self.verbose or (
-                self._is_tty() and now - self._last_render_at >= self.refresh_interval
-            ):
+            if self._should_render_phase(now, force=force):
                 self._render_phase(complete=False)
                 self._last_render_at = now
 
@@ -265,11 +263,46 @@ class ProgressReporter:
             if self._phase_total > 0:
                 self._phase_done = self._phase_total
             self._render_phase(complete=True)
-            self._phase_name = None
-            self._phase_total = 0
-            self._phase_done = 0
-            self._phase_detail = ""
+            self._clear_phase()
             self._last_render_at = self.clock()
+
+    def abort_phase(self, detail: str = "FAILED") -> None:
+        """Close the active phase without forcing a 100% completion line.
+
+        Args:
+            detail: Status note (for example ``pending`` after cleanup failure).
+
+        Returns:
+            ``None`` after emitting a non-success phase status line.
+        """
+
+        with self._lock:
+            if self._finished or self._render_disabled or self._phase_name is None:
+                return
+            self._phase_detail = detail
+            self._render_phase(complete=True, status="PENDING")
+            self._clear_phase()
+            self._last_render_at = self.clock()
+
+    def note(self, message: str) -> None:
+        """Emit a durable one-line log note without raising.
+
+        Args:
+            message: Full line text (for example ``DELETE path``).
+
+        Returns:
+            ``None`` after writing a newline-terminated note. Flushes any
+            in-progress TTY phase line first so DELETE/RMD does not interleave
+            mid-counter.
+        """
+
+        with self._lock:
+            if self._finished or self._render_disabled:
+                return
+            if self._is_tty() and self._render_width:
+                self._safe_print("", flush=True)
+                self._render_width = 0
+            self._safe_print(message, flush=True)
 
     def finish(self) -> TransferSummary | None:
         """Freeze and return final metrics without rendering them.
@@ -431,14 +464,56 @@ class ProgressReporter:
                 )
         self._emit_progress_line(line, complete=complete)
 
-    def _render_phase(self, *, complete: bool) -> None:
-        """Render the active discrete phase counter through safe output."""
+    def _clear_phase(self) -> None:
+        """Reset discrete phase counters after finish or abort."""
+
+        self._phase_name = None
+        self._phase_total = 0
+        self._phase_done = 0
+        self._phase_detail = ""
+
+    def _should_render_phase(self, now: float, *, force: bool) -> bool:
+        """Decide whether to emit a phase progress line under TTY / CI rules.
+
+        Args:
+            now: Monotonic clock reading for throttle comparison.
+            force: Caller requested an immediate refresh (TTY-only full force).
+
+        Returns:
+            ``True`` when a render should run.
+        """
+
+        if self.verbose:
+            return True
+        if self._is_tty():
+            if force:
+                return True
+            return now - self._last_render_at >= self.refresh_interval
+        # Non-TTY: never force per-file spam; sample about every 2 seconds.
+        non_tty_interval = max(self.refresh_interval, 2.0)
+        return now - self._last_render_at >= non_tty_interval
+
+    def _render_phase(self, *, complete: bool, status: str | None = None) -> None:
+        """Render the active discrete phase counter through safe output.
+
+        Args:
+            complete: Whether this is a durable final line for the phase.
+            status: Optional non-success label (for example ``PENDING``) that
+                replaces the ``done/total 100%`` completion form.
+        """
 
         if self._render_disabled or self._phase_name is None:
             return
         name = self._phase_name
         if self.label:
             name = f"[{self.label}] {name}"
+        detail = self._phase_detail.strip()
+        if status is not None:
+            line = f"{name} {status}"
+            if detail:
+                line = f"{line}  {detail}"
+            self._emit_progress_line(line, complete=complete)
+            return
         total = self._phase_total
         done = self._phase_done
         if total > 0:
@@ -446,7 +521,6 @@ class ProgressReporter:
             line = f"{name} {done}/{total}  {percent:3d}%"
         else:
             line = f"{name} ..."
-        detail = self._phase_detail.strip()
         if detail:
             line = f"{line}  {detail}"
         self._emit_progress_line(line, complete=complete)

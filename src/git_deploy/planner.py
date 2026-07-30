@@ -160,6 +160,10 @@ class FTPHybridPlan:
     remote_trees: tuple[FTPRemoteTree, ...]
     ownership_update: bool
     resume_phase: FTPPendingPhase | None = None
+    # Local-state skip vs upload-all-current Hybrid files (see deploy.ftp_incremental_mirror).
+    incremental_mirror: bool = True
+    # Final-path RETR SHA256 after Rename (see deploy.ftp_verify_final).
+    verify_final: bool = False
 
 
 HybridOperation = (
@@ -925,12 +929,16 @@ def _complete_ftp_remote_plan(
         FTPPendingPhase.STATE_COMPLETE,
     }
     uploads: list[FTPHybridFileUpload] = []
+    # Strong Mirror (ftp_incremental_mirror=false) and --full always republish
+    # every current Hybrid file. Incremental mode skips only when Local State
+    # hash matches and the remote path still exists (content is not re-proved).
+    incremental_mirror = config.deploy.ftp_incremental_mirror and not plan.full
+    force_hybrid_publish = pending is not None or plan.full or not incremental_mirror
     if publish_needed:
         for item in hybrid.local.root_files:
             previous = hybrid.previous_outputs.get(item.name)
             if (
-                pending is not None
-                or plan.full
+                force_hybrid_publish
                 or previous != item.entry
                 or expected_types[item.name] is not RemotePathType.FILE
                 or item.name in adoptions
@@ -951,10 +959,9 @@ def _complete_ftp_remote_plan(
                 previous = hybrid.previous_outputs.get(path)
                 # Same trust model as Root Files: Local State hash is content
                 # proof; remote Size/Modify is not. Missing remote members and
-                # adoption/full/pending still force a republish.
+                # adoption/full/pending/strong-mirror still force a republish.
                 if (
-                    pending is not None
-                    or plan.full
+                    force_hybrid_publish
                     or previous != scanned.entry
                     or relative not in tree.files
                     or adopt_directory
@@ -1065,6 +1072,8 @@ def _complete_ftp_remote_plan(
         tuple(remote_trees[name] for name in sorted(remote_trees)),
         ownership_update,
         phase,
+        incremental_mirror=incremental_mirror,
+        verify_final=config.deploy.ftp_verify_final,
     )
     completed = replace(
         hybrid,
@@ -1327,6 +1336,9 @@ def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
             )
         if hybrid.backend is HybridBackend.FTP_IN_PLACE:
             lines.append("REMOTE  [ftp-hybrid] not read; use --remote-plan for exact orphan deletes")
+            lines.append(
+                "FTP MIRROR MODE: use --remote-plan for incremental vs strong contract"
+            )
             lines.append("GUARANTEE upload-first=yes, prune-last=yes, forward-resume=yes")
             lines.append(
                 "LIMITS directory-atomic-swap=no, rollback=no, after_deploy=no, "
@@ -1368,6 +1380,22 @@ def render_hybrid_plan(hybrid: HybridPlan) -> tuple[str, ...]:
         owned_count = len(hybrid.ownership.root_files) + len(hybrid.ownership.directories) if hybrid.ownership else 0
         if owned_count and not hybrid.local.names:
             lines.append("WARNING FTP Hybrid will delete all previously owned paths")
+        if ftp.incremental_mirror:
+            lines.append("FTP MIRROR MODE: LOCAL-STATE INCREMENTAL")
+            lines.append(
+                "REMOTE CONTENT HASH: NOT VERIFIED "
+                "(path presence only; use --full to force reconverge)"
+            )
+        else:
+            lines.append("FTP MIRROR MODE: STRONG (all current Hybrid files upload)")
+            lines.append("REMOTE CONTENT HASH: REPUBLISH ALL CURRENT FILES")
+        if ftp.verify_final:
+            lines.append("CONTENT PROOF: STAGE RETR SHA256 + FINAL RETR SHA256")
+        else:
+            lines.append(
+                "CONTENT PROOF: STAGE-VERIFIED RENAME-TRUSTED "
+                "(no final-path RETR; set deploy.ftp_verify_final=true for final proof)"
+            )
         lines.append("GUARANTEE upload-first=yes, prune-last=yes, forward-resume=yes")
         lines.append(
             "LIMITS directory-atomic-swap=no, rollback=no, after_deploy=no, "

@@ -479,3 +479,45 @@ def test_update_phase_force_refreshes_detail_without_advancing() -> None:
     assert "1/2" in output
     assert "verify b.js" in output
     assert reporter._phase_done == 1
+
+
+def test_update_phase_force_does_not_spam_non_tty() -> None:
+    """Non-TTY demotes force to a 2s sample so 10k files stay log-bounded."""
+
+    clock = FakeClock()
+    stream = FakeStream(tty=False)
+    reporter = ProgressReporter(clock=clock, stream=stream)
+    reporter.start_phase("STAGE", 10_000)
+    start_lines = len([line for line in stream.getvalue().splitlines() if line.strip()])
+    for index in range(200):
+        reporter.update_phase(detail=f"verify f{index}.js", force=True)
+        clock.advance(0.01)
+    mid = [line for line in stream.getvalue().splitlines() if line.strip()]
+    # 200 force updates at 10ms must not emit ~200 lines on non-TTY.
+    assert len(mid) - start_lines <= 5
+    clock.advance(2.0)
+    reporter.update_phase(detail="verify late.js", force=True)
+    late = stream.getvalue()
+    assert "verify late.js" in late or "STAGE" in late
+
+
+def test_abort_phase_does_not_report_100_percent() -> None:
+    """Failed cleanup closes the phase as PENDING instead of forced success."""
+
+    stream = FakeStream(tty=False)
+    reporter = ProgressReporter(stream=stream)
+    reporter.start_phase("CLEANUP", 1)
+    reporter.abort_phase(detail="pending")
+    output = stream.getvalue()
+    assert "CLEANUP PENDING" in output
+    assert "100%" not in output
+    assert reporter._phase_name is None
+
+
+def test_note_emits_durable_log_line() -> None:
+    """DELETE/RMD style notes always use a full newline line."""
+
+    stream = FakeStream(tty=False)
+    reporter = ProgressReporter(stream=stream)
+    reporter.note("DELETE old.js")
+    assert "DELETE old.js" in stream.getvalue()

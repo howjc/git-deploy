@@ -25,7 +25,6 @@ from git_deploy.bootstrap import (
     enumerate_project_bootstrap_candidates,
     enumerate_workspace_bootstrap_candidates,
     execute_bootstrap,
-    execute_bootstrap_item,
     mutation_count,
     plan_bootstrap_items,
     preflight_bootstrap_item,

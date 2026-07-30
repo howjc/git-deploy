@@ -27,11 +27,20 @@ Incremental 的本地 State 只描述上次在当前 Git Common Dir 成功部署
 
 ## Mirror 文件增量（Local State）
 
-FTP In-place 对 Mirror Directory 内每个文件单独 Stage/Publish，因此 Local State 必须持久化 `<directory>/<relative>` 的 SHA256/Size（与 Root File 同一内容契约）。普通部署仅在以下情况上传 Mirror 文件：Local State 缺失或 hash 变化、远端树中缺失该文件、目录 Adoption、`--full`、或存在需重新发布的 Pending。远端 Size/Modify 仍不可作为内容证明。孤儿清理继续依赖 MLSD Typed Scan，与上传增量无关。升级后若旧 State 没有嵌套路径，下一次部署会按「previous 缺失」重传 Mirror 文件一次并写入完整 State。
+FTP In-place 对 Mirror Directory 内每个文件单独 Stage/Publish，因此 Local State 必须持久化 `<directory>/<relative>` 的 SHA256/Size（与 Root File 同一内容契约）。
 
-## 业务文件校验边界（Stage RETR，无 Final RETR）
+### Mirror 模式（`deploy.ftp_incremental_mirror`，默认 `true`）
 
-每个业务上传文件的内容证明发生在 **Stage STOR 之后的整文件 RETR SHA256**（含 Publish 重试时的 restage）。Publish 仅执行已 Probe 的 Rename Replace，并检查 Stage 源路径已被消费、最终路径类型为 File；**不再对最终路径做整文件 RETR**，以去掉约三分之一的数据连接。该取舍依赖：Capability Probe 证明 Rename Replace、单发布器契约、以及 Stage 校验已绑定冻结字节。Pending Marker 与 Ownership 等小元数据仍使用 `publish_verified_bytes`（Stage RETR + Final RETR）。
+| 模式 | 配置 | 行为 |
+|------|------|------|
+| **LOCAL-STATE INCREMENTAL** | `ftp_incremental_mirror = true`（默认） | Local State hash 未变且远端路径仍存在时可跳过上传；**不校验远端文件内容**是否等于 State |
+| **STRONG** | `ftp_incremental_mirror = false` 或 CLI `--full` | 当前全部 Hybrid Root/Mirror 文件进入上传队列（强制收敛） |
+
+远端 Size/Modify 仍不可作为内容证明。面板改写、备份回滚、外部覆盖等漂移需 `--full` 或关闭增量。孤儿清理继续依赖 MLSD Typed Scan，与上传增量无关。升级后若旧 State 没有嵌套路径，下一次部署会按「previous 缺失」重传 Mirror 文件一次并写入完整 State。Remote Plan 会明示 `FTP MIRROR MODE` 与 `REMOTE CONTENT HASH` 契约行。
+
+## 业务文件校验边界（Stage RETR；可选 Final RETR）
+
+每个业务上传文件的内容证明默认发生在 **Stage STOR 之后的整文件 RETR SHA256**（含 Publish 重试时的 restage）。Publish 执行已 Probe 的 Rename Replace，检查 Stage 源路径已被消费、最终路径类型为 File；默认 **不再对最终路径做整文件 RETR**（`CONTENT PROOF: STAGE-VERIFIED RENAME-TRUSTED`）。设置 `deploy.ftp_verify_final = true` 时在 Rename 后再做一次 Final RETR SHA256。Pending Marker 与 Ownership 等小元数据仍使用 `publish_verified_bytes`（Stage RETR + Final RETR）。
 
 ## 并行 FTP 会话
 

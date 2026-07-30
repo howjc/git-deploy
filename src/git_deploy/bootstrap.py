@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, cast
 
 from git_deploy.config import Config, TargetConfig, load_config, resolve_target_for_plan
 from git_deploy.errors import ConfigError, DeployError, GitDeployError, PlanError
@@ -876,7 +876,8 @@ def _resolve_bootstrap_output(
     if output is not None:
         return output
     if print_fn is not None:
-        return _PrintFnAdapter(print_fn)
+        # Adapter is TextIO-compatible for plan/summary writes in unit tests.
+        return cast(TextIO, _PrintFnAdapter(print_fn))
     return sys.stdout
 
 
@@ -1050,7 +1051,7 @@ def _action_label(item: BootstrapItem) -> str:
     if item.action is BootstrapAction.FAIL_PRECHECK:
         return f"FAIL ({item.reason})"
     if item.action is BootstrapAction.SKIP:
-        return f"SKIP"
+        return "SKIP"
     return item.action.value.upper()
 
 

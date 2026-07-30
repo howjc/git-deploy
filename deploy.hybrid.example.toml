@@ -39,4 +39,8 @@ command_timeout = 120
 retries = 3
 # Parallel FTP sessions for Hybrid Stage/Publish (1–16; default 1 = serial).
 ftp_connections = 1
+# Incremental Mirror skips unchanged Local State hashes when the remote path exists.
+ftp_incremental_mirror = true
+# Final-path RETR after Rename (strongest content proof; slower).
+ftp_verify_final = false
 retry_delay = 2

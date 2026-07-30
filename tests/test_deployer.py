@@ -1008,6 +1008,95 @@ def test_ftp_hybrid_publish_skips_final_retr_after_stage_verified(tmp_path: Path
     assert transport.retr_paths == []
 
 
+def test_ftp_hybrid_publish_final_retr_when_verify_final_enabled(tmp_path: Path) -> None:
+    """ftp_verify_final=true RETR-SHA256s the final path after rename."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    payload = b"final-verified-payload"
+    local_path = tmp_path / "asset.js"
+    local_path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    operation = FTPHybridFileUpload(
+        "assets/app.js",
+        local_path,
+        digest,
+        len(payload),
+    )
+    stage_root = ".git-deploy/ftp-hybrid/stage/deployment-1"
+    staged_path = f"{stage_root}/files/{operation.path}"
+
+    class PublishFTP(FTPTransport):
+        """Rename-replace and allow final-path RETR."""
+
+        def __init__(self) -> None:
+            super().__init__(target)
+            self.files: dict[str, bytes] = {staged_path: payload}
+            self.retr_paths: list[str] = []
+            self.ftp = self  # type: ignore[assignment]
+
+        def lstat(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> RemotePathType:
+            del allow_case_collisions
+            if remote_path in self.files:
+                return RemotePathType.FILE
+            return RemotePathType.MISSING
+
+        def read_file(
+            self,
+            remote_path: str,
+            *,
+            max_bytes: int,
+            allow_case_collisions: bool = False,
+        ) -> bytes:
+            del allow_case_collisions
+            self.retr_paths.append(remote_path)
+            data = self.files[remote_path]
+            if len(data) > max_bytes:
+                raise DeployError(f"exceeds {max_bytes}")
+            return data
+
+        def rename_replace(self, source: str, destination: str) -> None:
+            self.files[destination] = self.files.pop(source)
+
+        def upload(
+            self,
+            local_path: Path,
+            remote_path: str,
+            callback: ProgressCallback,
+            *,
+            executable: bool = False,
+        ) -> None:
+            del local_path, remote_path, callback, executable
+            raise AssertionError("publish happy path must not restage")
+
+    transport = PublishFTP()
+    progress = ProgressReporter(verbose=False)
+    deployer_module._publish_ftp_hybrid_file(
+        operation,
+        local_path,
+        stage_root,
+        transport,
+        progress,
+        attempts=1,
+        delay=0,
+        verify_final=True,
+    )
+    assert transport.files[operation.path] == payload
+    assert transport.retr_paths == [operation.path]
+
+
 def test_ftp_hybrid_publish_restage_still_retr_verifies_stage(tmp_path: Path) -> None:
     """When Stage is missing, publish restages and RETR-verifies Stage only."""
 

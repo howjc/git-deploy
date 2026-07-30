@@ -57,3 +57,7 @@ retry_delay = 2
 # Parallel FTP control sessions for Hybrid Stage/Publish (1–16; default 1 = serial).
 # Raise only after the FTP server proves concurrent control sessions.
 ftp_connections = 1
+# Local-State incremental Mirror (default true). Set false for strong republish-all.
+# ftp_incremental_mirror = true
+# Optional final-path RETR SHA256 after Rename (default false = stage-verified rename-trusted).
+# ftp_verify_final = false

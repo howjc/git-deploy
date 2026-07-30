@@ -728,7 +728,228 @@ def test_ftp_hybrid_mirror_plan_skips_unchanged_uploads_and_republishes_gaps(
     )
     full_remote = complete_remote_plan(full, config, transport)
     assert full_remote.hybrid is not None and full_remote.hybrid.ftp is not None
+    assert full_remote.hybrid.ftp.incremental_mirror is False
     assert sorted(item.path for item in full_remote.hybrid.ftp.uploads) == [
+        "assets/app.js",
+        "assets/nested/chunk.js",
+        "index.html",
+    ]
+    from git_deploy.planner import render_hybrid_plan
+
+    full_lines = "\n".join(render_hybrid_plan(full_remote.hybrid))
+    assert "FTP MIRROR MODE: STRONG" in full_lines
+    assert "STAGE-VERIFIED RENAME-TRUSTED" in full_lines
+    assert noop_remote.hybrid is not None and noop_remote.hybrid.ftp is not None
+    assert noop_remote.hybrid.ftp.incremental_mirror is True
+    noop_lines = "\n".join(render_hybrid_plan(noop_remote.hybrid))
+    assert "LOCAL-STATE INCREMENTAL" in noop_lines
+    assert "REMOTE CONTENT HASH: NOT VERIFIED" in noop_lines
+
+
+def test_ftp_strong_mirror_republishes_all_current_files(
+    git_project: Path,
+    tmp_path: Path,
+) -> None:
+    """deploy.ftp_incremental_mirror=false uploads every Hybrid file like strong Mirror."""
+
+    from git_deploy.config import resolve_target_for_plan
+    from git_deploy.ftp_hybrid import (
+        FTP_CAPABILITY_SCHEMA,
+        FTPHybridCapabilities,
+        save_capability_profile,
+    )
+    from git_deploy.hybrid import make_ownership, serialize_ownership
+    from git_deploy.manifest import new_state
+    from git_deploy.planner import complete_remote_plan
+    from git_deploy.transports.base import RemotePathType
+    from git_deploy.transports.ftp import FTPRemoteEntry, FTPTransport
+
+    root = git_project / ".deploy" / "frontend-root"
+    (root / "assets" / "nested").mkdir(parents=True)
+    (root / "index.html").write_text("home", encoding="utf-8")
+    (root / "assets" / "app.js").write_text("app-v1", encoding="utf-8")
+    (root / "assets" / "nested" / "chunk.js").write_text("chunk-v1", encoding="utf-8")
+    config = load_config(
+        write_config(
+            git_project,
+            """
+project_id = "github.com/acme/project"
+
+[source]
+include = ["app.py"]
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+
+[deploy]
+ftp_incremental_mirror = false
+""",
+            create_outputs=False,
+        )
+    )
+    repository = GitRepository(git_project)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    target = resolve_target_for_plan(config.target(None), runtime_dir=runtime)
+    banner = "b" * 64
+    save_capability_profile(
+        runtime,
+        FTPHybridCapabilities(
+            FTP_CAPABILITY_SCHEMA,
+            target.fingerprint,
+            banner,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            100,
+            True,
+            True,
+            True,
+        ),
+    )
+    first = create_plan(config, target, repository, None, full=False, resolved_target=target)
+    assert first.hybrid is not None
+    ownership = make_ownership(
+        first.hybrid.local,
+        config.project_id or "",
+        first.head,
+        now=10,
+    )
+    state = new_state(
+        first.target.name,
+        first.target_fingerprint,
+        first.head,
+        dict(first.output_manifest),
+    )
+
+    class StrongPlanFTP(FTPTransport):
+        """Remote tree already matches Local State content identity."""
+
+        def __init__(self) -> None:
+            super().__init__(target)
+            self._file_bytes = {
+                ".git-deploy/hybrid/frontend-root.json": serialize_ownership(ownership),
+                "index.html": b"home",
+                "assets/app.js": b"app-v1",
+                "assets/nested/chunk.js": b"chunk-v1",
+                "app.py": b"print('v1')\n",
+            }
+            self._directories = {
+                "",
+                ".git-deploy",
+                ".git-deploy/hybrid",
+                "assets",
+                "assets/nested",
+            }
+
+        def connect(self) -> None:
+            self.ftp = self  # type: ignore[assignment]
+
+        def close(self) -> None:
+            self.ftp = None
+
+        def enable_utf8(self) -> None:
+            self._require_utf8 = True
+
+        def server_banner_hash(self) -> str:
+            return banner
+
+        def features(self) -> frozenset[str]:
+            return frozenset({"MLSD", "UTF8"})
+
+        def list_root_names(self) -> tuple[str, ...]:
+            names = sorted(
+                {
+                    path.split("/", 1)[0]
+                    for path in (*self._file_bytes, *self._directories)
+                    if path and "/" not in path
+                }
+            )
+            return tuple(names)
+
+        def list_directory_typed(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> tuple[FTPRemoteEntry, ...]:
+            del allow_case_collisions
+            prefix = "" if remote_path in {"", "."} else remote_path.rstrip("/") + "/"
+            children: dict[str, RemotePathType] = {}
+            for directory in self._directories:
+                if not directory.startswith(prefix):
+                    continue
+                rest = directory[len(prefix) :]
+                if rest and "/" not in rest:
+                    children[rest] = RemotePathType.DIRECTORY
+            for file_path in self._file_bytes:
+                if not file_path.startswith(prefix):
+                    continue
+                rest = file_path[len(prefix) :]
+                if rest and "/" not in rest:
+                    children[rest] = RemotePathType.FILE
+            return tuple(
+                FTPRemoteEntry(name, kind, None, None)
+                for name, kind in sorted(children.items())
+            )
+
+        def read_file(
+            self,
+            remote_path: str,
+            *,
+            max_bytes: int,
+            allow_case_collisions: bool = False,
+        ) -> bytes:
+            del allow_case_collisions
+            data = self._file_bytes[remote_path]
+            if len(data) > max_bytes:
+                raise AssertionError(f"test fixture exceeds max_bytes for {remote_path}")
+            return data
+
+        def lstat(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> RemotePathType:
+            del allow_case_collisions
+            path = remote_path.strip("/")
+            if path in {"", "."}:
+                return RemotePathType.DIRECTORY
+            if path in self._directories:
+                return RemotePathType.DIRECTORY
+            if path in self._file_bytes:
+                return RemotePathType.FILE
+            return RemotePathType.MISSING
+
+    transport = StrongPlanFTP()
+    transport.connect()
+    plan = create_plan(
+        config,
+        target,
+        repository,
+        state,
+        full=False,
+        resolved_target=target,
+    )
+    remote = complete_remote_plan(plan, config, transport)
+    assert remote.hybrid is not None and remote.hybrid.ftp is not None
+    assert remote.hybrid.ftp.incremental_mirror is False
+    assert sorted(item.path for item in remote.hybrid.ftp.uploads) == [
         "assets/app.js",
         "assets/nested/chunk.js",
         "index.html",

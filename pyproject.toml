@@ -1,6 +1,6 @@
 [project]
 name = "git-deploy"
-version = "1.7.3"
+version = "1.8.0"
 description = "Git-aware local build and FTP/SFTP file synchronization"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,7 +28,7 @@ dependencies = [
 Homepage = "https://github.com/howjc/git-deploy"
 Repository = "https://github.com/howjc/git-deploy"
 Issues = "https://github.com/howjc/git-deploy/issues"
-Changelog = "https://github.com/howjc/git-deploy/blob/main/docs/releases/v1.7.3.md"
+Changelog = "https://github.com/howjc/git-deploy/blob/main/docs/releases/v1.8.0.md"
 
 [project.scripts]
 git-deploy = "git_deploy.cli:main"

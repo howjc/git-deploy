@@ -58,6 +58,8 @@ def test_deploy_ftp_connections_defaults_and_bounds(git_project: Path) -> None:
 
     defaulted = load_config(write_config(git_project))
     assert defaulted.deploy.ftp_connections == 1
+    assert defaulted.deploy.ftp_incremental_mirror is True
+    assert defaulted.deploy.ftp_verify_final is False
 
     configured = load_config(
         write_config(
@@ -71,11 +73,15 @@ remote_root = "/srv/app"
 
 [deploy]
 ftp_connections = 8
+ftp_incremental_mirror = false
+ftp_verify_final = true
 """,
             create_outputs=False,
         )
     )
     assert configured.deploy.ftp_connections == 8
+    assert configured.deploy.ftp_incremental_mirror is False
+    assert configured.deploy.ftp_verify_final is True
 
     with pytest.raises(ConfigError, match="ftp_connections"):
         load_config(
@@ -90,6 +96,24 @@ remote_root = "/srv/app"
 
 [deploy]
 ftp_connections = 0
+""",
+                create_outputs=False,
+            )
+        )
+
+    with pytest.raises(ConfigError, match="ftp_incremental_mirror"):
+        load_config(
+            write_config(
+                git_project,
+                """
+[targets.dev]
+protocol = "sftp"
+host = "example.invalid"
+username = "deploy"
+remote_root = "/srv/app"
+
+[deploy]
+ftp_incremental_mirror = "yes"
 """,
                 create_outputs=False,
             )

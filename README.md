@@ -16,7 +16,7 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 ```bash
 uv tool install \
-  https://github.com/howjc/git-deploy/releases/download/v1.7.3/git_deploy-1.7.3-py3-none-any.whl
+  https://github.com/howjc/git-deploy/releases/download/v1.8.0/git_deploy-1.8.0-py3-none-any.whl
 git-deploy --version
 ```
 
@@ -29,8 +29,7 @@ uv tool install --editable .
 
 ## Shell Tab 补全
 
-安装后会在**首次运行** `git-deploy` 时按 `$SHELL` 自动写入用户级补全（pip / `uv tool`
-没有可靠的 post-install hook，因此用首次启动补上）。也可显式安装或重装：
+安装后请**显式**启用 Tab 补全（普通 CLI 不会改写 `.bashrc` / `.zshrc`；最多在用户数据目录放置脚本并提示运行 install）：
 
 ```bash
 git-deploy completion install          # 检测 $SHELL，写入脚本 + RC
@@ -174,7 +173,7 @@ remote_root = "/www/wwwroot/project"
 
 聚合根的直接文件是 Root File；直接目录是完整 Mirror Directory，并保留嵌套空目录，确保目录内没有远端孤儿。删除只来自 `.git-deploy/hybrid/frontend-root.json` 声明的历史所有权，本地 State 丢失也不影响删除；未声明的 `index.php`、`.env`、后端、运行时和未知路径永远不处理。SFTP Root File 按 Hash 增量；FTP Hybrid 的 Root File 与 Mirror 内文件均按 Local State Hash、远端是否仍存在与 Pending/`--full` 决定是否上传，不把远端 Size/Modify 当作内容证明。SFTP Mirror Directory 仍整目录 Stage/Swap。
 
-SFTP 使用现有 SFTP Staged Hybrid：目录 Stage/Backup/Swap，中断后先审阅并显式 `--recover`。FTP 使用 FTP In-place Hybrid：所有当前文件先上传到 `.git-deploy/ftp-hybrid/stage/`、RETR SHA256 校验，再逐文件 Rename Replace（发布后不再整文件回读；依赖 Stage 校验、已 Probe 的 Rename 与 Stage 消费检查）。Stage/Publish 可用 `deploy.ftp_connections`（默认 1 串行，1–16 显式并行）并行多条 FTP 控制会话以降低小文件 RTT；元数据与 Prune 仍串行。全部发布成功后才删除 Mirror 孤儿和历史受管路径；Pending/Ownership 等元数据仍 Stage+Final 双校验。最后提交 Ownership 与 Local State。FTP 通过 `.git-deploy/ftp-hybrid/pending/` 提供 Forward Resume，不提供目录原子 Swap、旧树回滚或 `after_deploy`。
+SFTP 使用现有 SFTP Staged Hybrid：目录 Stage/Backup/Swap，中断后先审阅并显式 `--recover`。FTP 使用 FTP In-place Hybrid：待发布文件先上传到 `.git-deploy/ftp-hybrid/stage/`、RETR SHA256 校验，再逐文件 Rename Replace。默认 `deploy.ftp_incremental_mirror = true`：Local State hash 未变且远端路径仍存在时可跳过（**不证明远端内容**）；`--full` 或 `ftp_incremental_mirror = false` 强制上传全部当前 Hybrid 文件。默认不做最终路径 RETR（Stage-verified + rename-trusted）；需要最强证明时设 `deploy.ftp_verify_final = true`。Stage/Publish 可用 `deploy.ftp_connections`（默认 1 串行，1–16 显式并行）并行多条 FTP 控制会话；元数据与 Prune 仍串行。全部发布成功后才删除 Mirror 孤儿和历史受管路径；Pending/Ownership 等元数据仍 Stage+Final 双校验。最后提交 Ownership 与 Local State。FTP 通过 `.git-deploy/ftp-hybrid/pending/` 提供 Forward Resume，不提供目录原子 Swap、旧树回滚或 `after_deploy`。Shell Tab 补全：`git-deploy completion install`（普通 CLI 不再自动改写 `.bashrc`/`.zshrc`）。
 
 FTP Hybrid 首次使用前必须初始化 Capability Profile。推荐对 Project / Workspace 一次性完成：
 

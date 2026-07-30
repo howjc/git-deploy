@@ -36,11 +36,11 @@ _VOLATILE_LOCAL_TIME = re.compile(r"(?i)(local time is now\s+)[^.]*")
 _OPTS_UTF8_UNSUPPORTED_CODES = frozenset({"500", "501", "502", "504"})
 
 
-def _is_opts_utf8_unsupported(exc: BaseException) -> bool:
+def _is_opts_utf8_unsupported(exc: BaseException | str) -> bool:
     """Return whether an OPTS permanent error means the command is unsupported.
 
     Args:
-        exc: Raised ``ftplib.error_perm`` (or reply text beginning with a code).
+        exc: Raised ``ftplib.error_perm`` or reply text beginning with a code.
 
     Returns:
         ``True`` only for 500/501/502/504; other permanent codes fail closed.

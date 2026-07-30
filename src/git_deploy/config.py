@@ -126,12 +126,17 @@ class ResolvedSSHConfig:
 
 @dataclass(frozen=True, slots=True)
 class DeployConfig:
-    """Configure per-file retry and FTP Hybrid parallelism."""
+    """Configure per-file retry and FTP Hybrid transfer policy."""
 
     retries: int = 3
     retry_delay: float = 2.0
     # Parallel FTP control sessions for Hybrid Stage/Publish (1 = serial default).
     ftp_connections: int = 1
+    # When True, skip Mirror/Root files whose Local State hash still matches and
+    # whose remote path still exists. When False, upload every current Hybrid file.
+    ftp_incremental_mirror: bool = True
+    # When True, RETR SHA256 the final path after Rename Replace (strongest proof).
+    ftp_verify_final: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -826,13 +831,25 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
 
 
 def _parse_deploy(raw: Any) -> DeployConfig:
-    """Validate retry count, delay, and FTP Hybrid connection parallelism."""
+    """Validate retry count, delay, and FTP Hybrid transfer settings."""
 
     table = _table(raw, "deploy")
-    _reject_unknown(table, {"retries", "retry_delay", "ftp_connections"}, "deploy")
+    _reject_unknown(
+        table,
+        {
+            "retries",
+            "retry_delay",
+            "ftp_connections",
+            "ftp_incremental_mirror",
+            "ftp_verify_final",
+        },
+        "deploy",
+    )
     retries = table.get("retries", 3)
     delay = table.get("retry_delay", 2)
     ftp_connections = table.get("ftp_connections", 1)
+    ftp_incremental_mirror = table.get("ftp_incremental_mirror", True)
+    ftp_verify_final = table.get("ftp_verify_final", False)
     if not isinstance(retries, int) or isinstance(retries, bool) or retries < 1:
         raise ConfigError("deploy.retries must be a positive integer")
     if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
@@ -844,7 +861,17 @@ def _parse_deploy(raw: Any) -> DeployConfig:
         or ftp_connections > 16
     ):
         raise ConfigError("deploy.ftp_connections must be an integer from 1 to 16")
-    return DeployConfig(retries, float(delay), ftp_connections)
+    if not isinstance(ftp_incremental_mirror, bool):
+        raise ConfigError("deploy.ftp_incremental_mirror must be a boolean")
+    if not isinstance(ftp_verify_final, bool):
+        raise ConfigError("deploy.ftp_verify_final must be a boolean")
+    return DeployConfig(
+        retries,
+        float(delay),
+        ftp_connections,
+        ftp_incremental_mirror,
+        ftp_verify_final,
+    )
 
 
 def _table(value: Any, name: str) -> dict[str, Any]:

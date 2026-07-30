@@ -627,6 +627,7 @@ def _execute_ftp_hybrid_plan(
                     progress,
                     attempts=config.deploy.retries,
                     delay=config.deploy.retry_delay,
+                    verify_final=config.deploy.ftp_verify_final,
                 )
                 progress.advance_phase(detail=upload.path)
 
@@ -656,7 +657,7 @@ def _execute_ftp_hybrid_plan(
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
-            print(f"DELETE {path}")
+            progress.note(f"DELETE {path}")
             if prune_total:
                 progress.advance_phase(detail=path)
         for path in ftp_plan.remove_directories:
@@ -667,7 +668,7 @@ def _execute_ftp_hybrid_plan(
                 attempts=config.deploy.retries,
                 delay=config.deploy.retry_delay,
             )
-            print(f"RMD {path}/")
+            progress.note(f"RMD {path}/")
             if prune_total:
                 progress.advance_phase(detail=f"{path}/")
         if prune_total:
@@ -719,15 +720,16 @@ def _execute_ftp_hybrid_plan(
         try:
             _cleanup_ftp_hybrid_pending(transport, pending)
             progress.advance_phase(detail="stage")
+            progress.finish_phase()
         except Exception as exc:
-            progress.advance_phase(detail="pending")
+            # Do not force 100% on a failed cleanup — Marker may still exist.
+            progress.abort_phase(detail="pending")
             print(
                 "WARNING: FTP Hybrid cleanup is pending; run Doctor and rerun the "
                 f"deployment: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
-        progress.finish_phase()
     progress.render_summary()
 
 
@@ -1012,13 +1014,15 @@ def _publish_ftp_hybrid_file(
     *,
     attempts: int,
     delay: float,
+    verify_final: bool = False,
 ) -> None:
     """Rename-replace one stage-verified file; restage with RETR if Stage is gone.
 
-    Content identity is proven only on Stage (or restage) via full RETR SHA256.
-    Publish trusts the probed Rename Replace contract plus Stage consumption and
-    a final-path type check, avoiding a second full-file RETR per payload file.
-    Pending/Ownership metadata still uses ``publish_verified_bytes`` (stage + final).
+    Content identity is proven on Stage (or restage) via full RETR SHA256.
+    By default Publish trusts the probed Rename Replace contract plus Stage
+    consumption and a final-path type check. When ``verify_final`` is true, also
+    RETR SHA256 the final path. Pending/Ownership metadata still uses
+    ``publish_verified_bytes`` (stage + final).
     """
 
     staged_path = f"{stage_root}/files/{operation.path}"
@@ -1052,6 +1056,16 @@ def _publish_ftp_hybrid_file(
             raise DeployError(
                 f"FTP publish did not leave a regular file at {operation.path}"
             )
+        if verify_final:
+            progress.update_phase(detail=f"final-verify {operation.path}", force=True)
+            final = transport.read_file(operation.path, max_bytes=operation.size)
+            if (
+                len(final) != operation.size
+                or hashlib.sha256(final).hexdigest() != operation.sha256
+            ):
+                raise DeployError(
+                    f"FTP final-path verification mismatch for {operation.path}"
+                )
 
     def record_upload_retry() -> None:
         """Close transfer timing only when this publish attempt restaged bytes."""
