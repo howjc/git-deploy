@@ -2,17 +2,24 @@
 
 Target listing stays read-only and never opens remotes or loads secrets.
 ``install_shell_completion`` may write user-local completion files and RC
-snippets; it still never contacts remotes.
+snippets; it still never contacts remotes. Ordinary CLI entry never rewrites
+shell RC files — users opt in with ``git-deploy completion install``.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
+import shlex
+import stat
+import sys
+import tempfile
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from git_deploy import __version__
 
@@ -221,8 +228,9 @@ def install_shell_completion(
     *,
     force: bool = False,
     home: Path | None = None,
+    update_rc: bool = True,
 ) -> list[CompletionInstallResult]:
-    """Detect the user shell and write completion scripts plus RC snippets.
+    """Detect the user shell and write completion scripts plus optional RC snippets.
 
     Args:
         shell: Optional shell name/path (``bash``, ``zsh``, or a full ``$SHELL``
@@ -230,6 +238,9 @@ def install_shell_completion(
             every supported RC file that already exists under ``home``.
         force: Rewrite script and RC markers even when content is current.
         home: Home directory override for tests.
+        update_rc: When ``True`` (explicit ``completion install``), upsert the
+            marked RC source block. When ``False``, only write user-local
+            scripts and never touch ``.bashrc`` / ``.zshrc``.
 
     Returns:
         One result per shell that was installed or already current.
@@ -247,9 +258,18 @@ def install_shell_completion(
             "(supported: bash, zsh)"
         )
     results: list[CompletionInstallResult] = []
-    for item in targets:
-        results.append(_install_one_shell(item, force=force, home=home_path))
-    _write_install_state(home_path, __version__)
+    with _install_lock(home_path):
+        for item in targets:
+            results.append(
+                _install_one_shell(
+                    item,
+                    force=force,
+                    home=home_path,
+                    update_rc=update_rc,
+                )
+            )
+        if update_rc:
+            _write_install_state(home_path, __version__)
     return results
 
 
@@ -258,19 +278,18 @@ def ensure_shell_completion_installed(
     home: Path | None = None,
     environ: dict[str, str] | None = None,
 ) -> list[CompletionInstallResult] | None:
-    """Best-effort once-per-version install for tool installs without post-hooks.
+    """Best-effort script-only install; never rewrites shell RC files.
 
-    Python package installs (pip / ``uv tool install``) cannot reliably run shell
-    RC edits as a post-install step. This hook runs on normal CLI entry, writes
-    user-local completion files when the package version changes, and never
-    raises into the caller.
+    Ordinary CLI entry may place packaged completion scripts under the user
+    data directory when they are missing, then print a one-line note to run
+    ``git-deploy completion install``. RC edits require that explicit command.
 
     Args:
         home: Home directory override for tests.
         environ: Environment override for tests; defaults to ``os.environ``.
 
     Returns:
-        Install results when work ran, or ``None`` when skipped.
+        Install results when scripts were written, or ``None`` when skipped.
     """
 
     env = environ if environ is not None else os.environ
@@ -279,14 +298,26 @@ def ensure_shell_completion_installed(
     if env.get("_ARGCOMPLETE"):
         return None
     home_path = (home or Path.home()).expanduser().resolve()
-    state_path = home_path / _STATE_RELATIVE
     try:
-        if state_path.is_file() and state_path.read_text(encoding="utf-8").strip() == __version__:
-            # Still refresh scripts when files are missing (manual delete).
-            shell = detect_login_shell(env.get("SHELL"))
-            if shell is not None and completion_script_path(shell, home=home_path).is_file():
-                return None
-        return install_shell_completion(env.get("SHELL"), force=False, home=home_path)
+        shell = detect_login_shell(env.get("SHELL"))
+        if shell is None:
+            return None
+        script = completion_script_path(shell, home=home_path)
+        if script.is_file():
+            return None
+        results = install_shell_completion(
+            shell,
+            force=False,
+            home=home_path,
+            update_rc=False,
+        )
+        print(
+            "note: shell completion scripts installed under the user data "
+            "directory; enable Tab completion with: "
+            "git-deploy completion install",
+            file=sys.stderr,
+        )
+        return results
     except Exception:
         return None
 
@@ -349,13 +380,34 @@ def _install_one_shell(
     *,
     force: bool,
     home: Path,
+    update_rc: bool = True,
 ) -> CompletionInstallResult:
-    """Write one shell's completion script and idempotent RC source block."""
+    """Write one shell's completion script and optionally the RC source block.
+
+    Args:
+        shell: Target shell.
+        force: Rewrite even when content matches.
+        home: Resolved home directory.
+        update_rc: When ``False``, leave RC files untouched.
+
+    Returns:
+        Install outcome for this shell.
+    """
 
     script_path = completion_script_path(shell, home=home)
     rc_path = completion_rc_path(shell, home=home)
     script_body = load_completion_script(shell)
     script_written = _write_text_if_changed(script_path, script_body, force=force)
+    if not update_rc:
+        already = not script_written and script_path.is_file()
+        return CompletionInstallResult(
+            shell,
+            script_path,
+            rc_path,
+            script_written,
+            False,
+            already,
+        )
     rc_block = _rc_snippet(shell, script_path)
     rc_updated = _upsert_rc_block(rc_path, rc_block, force=force)
     already_current = not script_written and not rc_updated
@@ -370,25 +422,38 @@ def _install_one_shell(
 
 
 def _rc_snippet(shell: SupportedShell, script_path: Path) -> str:
-    """Build the marked RC fragment that sources the installed script."""
+    """Build the marked RC fragment that sources the installed script.
 
-    path_text = str(script_path)
+    Paths are shell-quoted so home directories containing spaces, quotes, or
+    ``$`` do not expand when the RC is sourced.
+    """
+
+    path_text = shlex.quote(str(script_path))
     if shell == "bash":
-        body = f'[[ -r "{path_text}" ]] && source "{path_text}"'
+        body = f"[[ -r {path_text} ]] && source {path_text}"
     else:
         # Keep zsh completion on fpath and source the install script once.
-        site = str(script_path.parent)
+        site = shlex.quote(str(script_path.parent))
         body = "\n".join(
             (
-                f'fpath=("{site}" $fpath)',
-                f'[[ -r "{path_text}" ]] && source "{path_text}"',
+                f"fpath=({site} $fpath)",
+                f"[[ -r {path_text} ]] && source {path_text}",
             )
         )
     return f"{_RC_BEGIN}\n{body}\n{_RC_END}\n"
 
 
 def _write_text_if_changed(path: Path, content: str, *, force: bool) -> bool:
-    """Write ``content`` when missing, forced, or different; return whether written."""
+    """Atomically write ``content`` when missing, forced, or different.
+
+    Args:
+        path: Destination file.
+        content: Full UTF-8 text to persist.
+        force: Rewrite even when the on-disk bytes already match.
+
+    Returns:
+        ``True`` when the file was written.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if not force and path.is_file():
@@ -397,12 +462,15 @@ def _write_text_if_changed(path: Path, content: str, *, force: bool) -> bool:
                 return False
         except OSError:
             pass
-    path.write_text(content, encoding="utf-8")
+    _atomic_write_text(path, content)
     return True
 
 
 def _upsert_rc_block(rc_path: Path, block: str, *, force: bool) -> bool:
     """Insert or replace the marked completion block in a shell RC file.
+
+    Uses an atomic replace so a crash mid-write cannot truncate the RC. The
+    previous file mode is preserved when the RC already exists.
 
     Args:
         rc_path: User RC path (created when missing).
@@ -428,7 +496,7 @@ def _upsert_rc_block(rc_path: Path, block: str, *, force: bool) -> bool:
             if current == block and not force:
                 return False
             updated = existing[:start] + block + existing[end:]
-            rc_path.write_text(updated, encoding="utf-8")
+            _atomic_write_text(rc_path, updated)
             return True
     prefix = existing
     if prefix and not prefix.endswith("\n"):
@@ -436,16 +504,76 @@ def _upsert_rc_block(rc_path: Path, block: str, *, force: bool) -> bool:
     if prefix and not prefix.endswith("\n\n"):
         prefix += "\n"
     rc_path.parent.mkdir(parents=True, exist_ok=True)
-    rc_path.write_text(prefix + block, encoding="utf-8")
+    _atomic_write_text(rc_path, prefix + block)
     return True
 
 
 def _write_install_state(home: Path, version: str) -> None:
-    """Persist the package version that last installed completion files."""
+    """Persist the package version that last ran an explicit RC install."""
 
     path = home / _STATE_RELATIVE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{version}\n", encoding="utf-8")
+    _atomic_write_text(path, f"{version}\n")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write UTF-8 text via temp file, fsync, and ``os.replace``.
+
+    Args:
+        path: Final destination path.
+        content: Full file body.
+
+    Raises:
+        OSError: When the temporary write or replace fails.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous_mode: int | None = None
+    if path.is_file():
+        previous_mode = stat.S_IMODE(path.stat().st_mode)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if previous_mode is not None:
+            os.chmod(tmp_path, previous_mode)
+        else:
+            os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _install_lock(home: Path) -> Iterator[None]:
+    """Serialize concurrent completion installs for one home directory.
+
+    Args:
+        home: Resolved user home used as the lock namespace.
+
+    Yields:
+        ``None`` while the exclusive lock is held.
+    """
+
+    lock_path = home / ".config/git-deploy/completion-install.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _list_target_names_impl(

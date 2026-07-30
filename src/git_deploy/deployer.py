@@ -20,7 +20,7 @@ from git_deploy.ftp_hybrid import (
     FTP_PENDING_SCHEMA,
     FTPHybridPending,
     FTPPendingPhase,
-    local_manifest_hash,
+    pending_local_manifest_hash,
     pending_path,
     publish_verified_bytes,
     serialize_pending,
@@ -530,7 +530,7 @@ def _execute_ftp_hybrid_plan(
             FTPPendingPhase.PREPARED,
             hybrid.expected_ownership_hash or ownership_hash(hybrid.ownership),
             ownership_hash(ftp_plan.next_ownership),
-            local_manifest_hash(hybrid.local, plan.output_manifest),
+            pending_local_manifest_hash(hybrid.local, plan.output_manifest),
             plan.head,
             next_state,
             ftp_plan.next_ownership.updated_at,
@@ -792,8 +792,13 @@ def _run_ftp_hybrid_file_jobs(
     *,
     connections: int,
     job: Callable[[FTPHybridFileUpload, FTPTransport], None],
-) -> None:
+) -> int:
     """Run Stage or Publish jobs over one or more FTP control sessions.
+
+    Establishes the full worker session pool **before** any job runs. When a
+    sibling connect fails, the pool degrades to the sessions already open
+    (always at least the primary) and emits a WARNING — never starts remote
+    work with a half-open parallel pool.
 
     Args:
         uploads: Frozen Hybrid file operations in plan order.
@@ -802,19 +807,55 @@ def _run_ftp_hybrid_file_jobs(
         job: Per-file action bound to one worker-owned transport.
 
     Returns:
-        ``None`` after every job succeeds.
+        Effective control-session count used for this batch.
 
     Raises:
         DeployError: When any worker fails; remaining queued jobs are skipped.
     """
 
     if not uploads:
-        return
-    workers = max(1, min(connections, len(uploads), 16))
-    if workers == 1:
+        return 1
+    desired = max(1, min(connections, len(uploads), 16))
+    if desired == 1:
         for upload in uploads:
             job(upload, primary)
-        return
+        return 1
+
+    # Build the full session pool before enqueueing work or starting workers.
+    pool: list[tuple[FTPTransport, bool]] = [(primary, False)]
+    extras: list[FTPTransport] = []
+    for index in range(1, desired):
+        try:
+            sibling = _open_ftp_hybrid_worker(primary)
+        except BaseException as exc:
+            print(
+                "WARNING: FTP Hybrid could not open parallel session "
+                f"{index + 1}/{desired} ({exc}); continuing with {len(pool)} "
+                "connection(s)",
+                file=sys.stderr,
+            )
+            break
+        extras.append(sibling)
+        pool.append((sibling, True))
+
+    workers = len(pool)
+    if workers > 1:
+        print(
+            f"FTP Hybrid effective connections: {workers}"
+            + (f" (requested {desired})" if workers != desired else ""),
+            file=sys.stderr,
+        )
+    if workers == 1:
+        # Degraded to serial after sibling failures — still no remote work yet.
+        for transport, owns in pool:
+            if owns:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+        for upload in uploads:
+            job(upload, primary)
+        return 1
 
     work: queue.Queue[FTPHybridFileUpload | None] = queue.Queue()
     for upload in uploads:
@@ -825,7 +866,6 @@ def _run_ftp_hybrid_file_jobs(
     errors: list[BaseException] = []
     error_lock = threading.Lock()
     stop = threading.Event()
-    extras: list[FTPTransport] = []
 
     def run_worker(transport: FTPTransport, *, owns_transport: bool) -> None:
         """Drain the shared job queue on one dedicated FTP session."""
@@ -855,38 +895,38 @@ def _run_ftp_hybrid_file_jobs(
                     pass
 
     threads: list[threading.Thread] = []
-    try:
-        try:
-            for index in range(workers):
-                if index == 0:
-                    worker_transport = primary
-                    owns = False
-                else:
-                    worker_transport = _open_ftp_hybrid_worker(primary)
-                    extras.append(worker_transport)
-                    owns = True
-                thread = threading.Thread(
-                    target=run_worker,
-                    args=(worker_transport,),
-                    kwargs={"owns_transport": owns},
-                    name=f"ftp-hybrid-{index}",
-                    daemon=True,
-                )
-                threads.append(thread)
-                thread.start()
-        except BaseException:
-            # Startup failed after some workers began; stop them before re-raising.
-            stop.set()
-            for _ in threads:
-                try:
-                    work.put_nowait(None)
-                except Exception:
-                    pass
-            for thread in threads:
-                thread.join(timeout=primary.target.timeout + 5)
-            raise
+
+    def _stop_workers(*, join_timeout: float) -> None:
+        """Signal workers to exit and wait up to ``join_timeout`` each."""
+
+        stop.set()
+        for _ in threads:
+            try:
+                work.put_nowait(None)
+            except Exception:
+                pass
         for thread in threads:
-            thread.join()
+            thread.join(timeout=join_timeout)
+
+    try:
+        for index, (worker_transport, owns) in enumerate(pool):
+            thread = threading.Thread(
+                target=run_worker,
+                args=(worker_transport,),
+                kwargs={"owns_transport": owns},
+                name=f"ftp-hybrid-{index}",
+                daemon=True,
+            )
+            threads.append(thread)
+        # Start only after every pool transport is ready.
+        for thread in threads:
+            thread.start()
+        try:
+            for thread in threads:
+                thread.join()
+        except BaseException:
+            _stop_workers(join_timeout=primary.target.timeout + 5)
+            raise
     finally:
         for transport in extras:
             try:
@@ -898,6 +938,7 @@ def _run_ftp_hybrid_file_jobs(
         raise DeployError(
             f"FTP Hybrid parallel transfer failed: {errors[0]}"
         ) from errors[0]
+    return workers
 
 
 def _open_ftp_hybrid_worker(primary: FTPTransport) -> FTPTransport:

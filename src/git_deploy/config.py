@@ -130,8 +130,8 @@ class DeployConfig:
 
     retries: int = 3
     retry_delay: float = 2.0
-    # Parallel FTP control sessions for Hybrid Stage/Publish (1 = serial).
-    ftp_connections: int = 4
+    # Parallel FTP control sessions for Hybrid Stage/Publish (1 = serial default).
+    ftp_connections: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -832,7 +832,7 @@ def _parse_deploy(raw: Any) -> DeployConfig:
     _reject_unknown(table, {"retries", "retry_delay", "ftp_connections"}, "deploy")
     retries = table.get("retries", 3)
     delay = table.get("retry_delay", 2)
-    ftp_connections = table.get("ftp_connections", 4)
+    ftp_connections = table.get("ftp_connections", 1)
     if not isinstance(retries, int) or isinstance(retries, bool) or retries < 1:
         raise ConfigError("deploy.retries must be a positive integer")
     if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:

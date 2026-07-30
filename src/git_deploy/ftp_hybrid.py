@@ -607,11 +607,48 @@ def validate_remote_root_aliases(
             )
 
 
+def pending_manifest_outputs(
+    local: HybridLocalManifest,
+    outputs: dict[str, ManifestEntry],
+) -> dict[str, ManifestEntry]:
+    """Return the ``outputs`` subset used for Schema 2 Pending ``local_manifest_hash``.
+
+    Pending Hash already serializes Mirror nested files via ``local.directories``.
+    Local State may also store those paths under ``plan.output_manifest`` so FTP
+    In-place can skip unchanged Mirror uploads, but those nested keys must not
+    enter the Pending Hash ``outputs`` side — matching v1.7.3 semantics where
+    ``output_manifest`` only carried Incremental paths plus Hybrid Root Files.
+
+    Args:
+        local: Current Hybrid Aggregation Root scan.
+        outputs: Full Local State / plan output map (may include Mirror nested keys).
+
+    Returns:
+        Filtered mapping without Mirror nested ``<dir>/<relative>`` paths.
+    """
+
+    mirror_paths = {
+        f"{directory.name}/{relative}"
+        for directory in local.directories
+        for relative in directory.files
+    }
+    if not mirror_paths:
+        return dict(outputs)
+    return {
+        path: entry for path, entry in outputs.items() if path not in mirror_paths
+    }
+
+
 def local_manifest_hash(
     manifest: HybridLocalManifest,
     outputs: dict[str, ManifestEntry] | None = None,
 ) -> str:
-    """Return a canonical hash for Hybrid plus all incremental output content."""
+    """Return a canonical hash for Hybrid plus selected incremental output content.
+
+    Callers that bind Pending resume must pass outputs through
+    :func:`pending_manifest_outputs` so Mirror nested State keys do not change
+    Schema 2 hash semantics relative to v1.7.3.
+    """
 
     payload = {
         "mapping": manifest.mapping,
@@ -633,6 +670,26 @@ def local_manifest_hash(
         },
     }
     return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+
+def pending_local_manifest_hash(
+    manifest: HybridLocalManifest,
+    outputs: dict[str, ManifestEntry] | None = None,
+) -> str:
+    """Hash Hybrid local facts for Pending write/resume with Schema 2 output shape.
+
+    Args:
+        manifest: Current Hybrid Aggregation Root scan.
+        outputs: Full plan/Local State outputs; Mirror nested keys are stripped.
+
+    Returns:
+        SHA256 hex digest compatible with v1.7.3 Pending markers.
+    """
+
+    return local_manifest_hash(
+        manifest,
+        pending_manifest_outputs(manifest, outputs or {}),
+    )
 
 
 def pending_path(mapping: str) -> str:
@@ -1108,6 +1165,8 @@ __all__ = [
     "local_manifest_hash",
     "parse_capabilities",
     "parse_pending",
+    "pending_local_manifest_hash",
+    "pending_manifest_outputs",
     "pending_path",
     "publish_verified_bytes",
     "probe_and_save_ftp_hybrid_capabilities",

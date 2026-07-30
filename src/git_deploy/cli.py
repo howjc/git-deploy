@@ -261,7 +261,7 @@ def _completion_command(args: argparse.Namespace) -> int:
     if kind == "install":
         try:
             results = install_shell_completion(force=args.force)
-        except ValueError as exc:
+        except (ValueError, OSError, UnicodeError) as exc:
             raise ConfigError(str(exc)) from exc
         print(format_install_report(results))
         return 0

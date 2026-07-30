@@ -54,10 +54,10 @@ remote_root = "/public_html"
 
 
 def test_deploy_ftp_connections_defaults_and_bounds(git_project: Path) -> None:
-    """FTP Hybrid parallelism defaults to 4 and rejects out-of-range values."""
+    """FTP Hybrid parallelism defaults to serial (1) and rejects out-of-range values."""
 
     defaulted = load_config(write_config(git_project))
-    assert defaulted.deploy.ftp_connections == 4
+    assert defaulted.deploy.ftp_connections == 1
 
     configured = load_config(
         write_config(

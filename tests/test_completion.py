@@ -180,22 +180,54 @@ def test_install_shell_completion_zsh(tmp_path: Path) -> None:
     assert results[0].shell == "zsh"
     script = completion_script_path("zsh", home=tmp_path)
     assert script.name == "_git-deploy"
+    body = script.read_text(encoding="utf-8")
+    assert body.startswith("#compdef git-deploy\n")
     rc = (tmp_path / ".zshrc").read_text(encoding="utf-8")
     assert "fpath=" in rc
     assert str(script) in rc
+
+
+def test_install_rc_quotes_special_home_paths(tmp_path: Path) -> None:
+    """RC snippets shell-quote script paths that contain spaces."""
+
+    home = tmp_path / "user home"
+    home.mkdir()
+    install_shell_completion("bash", home=home)
+    rc = (home / ".bashrc").read_text(encoding="utf-8")
+    script = completion_script_path("bash", home=home)
+    # shlex.quote produces single-quoted paths for spaces.
+    assert "source " in rc
+    assert str(script) in rc or f"'{script}'" in rc
 
 
 def test_ensure_shell_completion_skips_when_current(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Once-per-version ensure is a no-op when scripts already match this version."""
+    """Ensure writes scripts once, never touches RC, then becomes a no-op."""
 
     monkeypatch.setenv("SHELL", "/bin/bash")
     assert ensure_shell_completion_installed(home=tmp_path) is not None
+    assert completion_script_path("bash", home=tmp_path).is_file()
+    # Ordinary CLI entry must not rewrite shell RC files.
+    assert not (tmp_path / ".bashrc").exists()
     assert ensure_shell_completion_installed(home=tmp_path) is None
     monkeypatch.setenv("GIT_DEPLOY_SKIP_COMPLETION_INSTALL", "1")
     assert ensure_shell_completion_installed(home=tmp_path) is None
+
+
+def test_ensure_shell_completion_never_updates_existing_rc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When scripts are missing, ensure still leaves a pre-existing RC alone."""
+
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    rc = tmp_path / ".bashrc"
+    rc.write_text("# user rc\n", encoding="utf-8")
+    assert ensure_shell_completion_installed(home=tmp_path) is not None
+    assert rc.read_text(encoding="utf-8") == "# user rc\n"
+    assert "# >>> git-deploy shell completion >>>" not in rc.read_text(encoding="utf-8")
 
 
 def test_load_completion_scripts_are_packaged() -> None:
@@ -204,6 +236,7 @@ def test_load_completion_scripts_are_packaged() -> None:
     bash = load_completion_script("bash")
     zsh = load_completion_script("zsh")
     assert "complete -F _git_deploy git-deploy" in bash
+    assert zsh.startswith("#compdef git-deploy\n")
     assert "compdef _git_deploy git-deploy" in zsh
     for flag in ("--dry-run", "--config", "--workspace", "--probe-ftp-hybrid"):
         assert flag in bash

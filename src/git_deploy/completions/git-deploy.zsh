@@ -1,6 +1,7 @@
+#compdef git-deploy
 # zsh completion for git-deploy
 # Enable: eval "$(git-deploy completion zsh)"
-# Or place as _git-deploy on fpath and run: compdef _git_deploy git-deploy
+# Or place as _git-deploy on fpath (compinit maps via #compdef).
 
 _git_deploy() {
   local -a opts actions completion_kinds

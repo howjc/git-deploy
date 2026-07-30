@@ -54,5 +54,6 @@ timeout = 15
 [deploy]
 retries = 3
 retry_delay = 2
-# Parallel FTP control sessions for Hybrid Stage/Publish (1–16; 1 = serial).
-ftp_connections = 4
+# Parallel FTP control sessions for Hybrid Stage/Publish (1–16; default 1 = serial).
+# Raise only after the FTP server proves concurrent control sessions.
+ftp_connections = 1

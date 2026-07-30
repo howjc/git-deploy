@@ -35,7 +35,7 @@ FTP In-place 对 Mirror Directory 内每个文件单独 Stage/Publish，因此 L
 
 ## 并行 FTP 会话
 
-`deploy.ftp_connections`（默认 4，范围 1–16）控制 Hybrid **Stage** 与 **Publish** 阶段各自使用的并行控制会话数。每个 worker 持有独立 `FTPTransport`（独立控制连接与 PASV 数据连接），继承主会话的 UTF-8/Banner 契约；主连接不关闭。仍是单发布器进程内并行，不允许多机器并发发布。`1` 退化为串行。普通 Source/Incremental 队列、目录 MKD、Prune、Ownership/Pending 元数据仍走主连接串行路径。
+`deploy.ftp_connections`（**默认 1**，范围 1–16）控制 Hybrid **Stage** 与 **Publish** 阶段各自使用的并行控制会话数。默认串行以兼容共享主机与单连接限额；并行为显式 opt-in。实现先建立全部 sibling 会话再启动 Worker；sibling 建连失败时安全降级到已成功的会话数（至少 primary），并输出 WARNING 与 effective connections。每个 worker 持有独立 `FTPTransport`（独立控制连接与 PASV 数据连接），继承主会话的 UTF-8/Banner 契约；主连接不关闭。仍是单发布器进程内并行，不允许多机器并发发布。普通 Source/Incremental 队列、目录 MKD、Prune、Ownership/Pending 元数据仍走主连接串行路径。
 
 ## 为什么不做 FTP Directory Swap
 

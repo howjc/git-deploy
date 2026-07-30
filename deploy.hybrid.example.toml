@@ -37,6 +37,6 @@ command_timeout = 120
 
 [deploy]
 retries = 3
-# Parallel FTP sessions for Hybrid Stage/Publish (1–16).
-ftp_connections = 4
+# Parallel FTP sessions for Hybrid Stage/Publish (1–16; default 1 = serial).
+ftp_connections = 1
 retry_delay = 2

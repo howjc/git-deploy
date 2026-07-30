@@ -25,7 +25,7 @@ from git_deploy.ftp_hybrid import (
     FTPPendingPhase,
     FTPRemoteTree,
     load_capability_profile,
-    local_manifest_hash,
+    pending_local_manifest_hash,
     read_pending,
     scan_ftp_tree,
     validate_pending_resume,
@@ -788,7 +788,8 @@ def _complete_ftp_remote_plan(
         remote=hybrid.local.remote,
         target=plan.target,
     )
-    manifest_snapshot = local_manifest_hash(hybrid.local, plan.output_manifest)
+    # Schema 2 Pending Hash must ignore Mirror nested State keys (v1.7.3 shape).
+    manifest_snapshot = pending_local_manifest_hash(hybrid.local, plan.output_manifest)
     if pending is not None:
         validate_pending_resume(
             pending,

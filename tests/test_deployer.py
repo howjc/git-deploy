@@ -788,13 +788,124 @@ def test_run_ftp_hybrid_file_jobs_serial_when_connections_is_one() -> None:
         del upload
         transports.append(id(transport))
 
-    deployer_module._run_ftp_hybrid_file_jobs(
+    effective = deployer_module._run_ftp_hybrid_file_jobs(
         uploads,
         primary,
         connections=1,
         job=job,
     )
+    assert effective == 1
     assert transports == [id(primary), id(primary)]
+
+
+def test_run_ftp_hybrid_file_jobs_establishes_pool_before_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No job runs until every requested sibling session is open."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    events: list[str] = []
+    opened = 0
+
+    def fake_open(source: FTPTransport) -> FTPTransport:
+        """Record sibling open order relative to job execution."""
+
+        del source
+        nonlocal opened
+        opened += 1
+        events.append(f"open-{opened}")
+        sibling = FTPTransport(target)
+        sibling.ftp = object()  # type: ignore[assignment]
+        return sibling
+
+    monkeypatch.setattr(deployer_module, "_open_ftp_hybrid_worker", fake_open)
+    uploads = tuple(
+        FTPHybridFileUpload(f"f{i}.js", Path(f"/tmp/f{i}.js"), "a" * 64, 1)
+        for i in range(4)
+    )
+
+    def job(upload: FTPHybridFileUpload, transport: FTPTransport) -> None:
+        """Mark that work started only after pool setup."""
+
+        del upload, transport
+        events.append("job")
+
+    effective = deployer_module._run_ftp_hybrid_file_jobs(
+        uploads,
+        primary,
+        connections=3,
+        job=job,
+    )
+    assert effective == 3
+    assert events[:2] == ["open-1", "open-2"]
+    assert events.count("job") == 4
+    assert all(item.startswith("open-") for item in events[:2])
+
+
+def test_run_ftp_hybrid_file_jobs_degrades_when_sibling_connect_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Sibling connect failure degrades before any Stage/Publish job runs."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    jobs = 0
+    attempts = 0
+
+    def fail_open(source: FTPTransport) -> FTPTransport:
+        """Fail the first sibling so the pool stays on primary only."""
+
+        del source
+        nonlocal attempts
+        attempts += 1
+        raise DeployError("max sessions reached")
+
+    monkeypatch.setattr(deployer_module, "_open_ftp_hybrid_worker", fail_open)
+    uploads = (
+        FTPHybridFileUpload("a.js", Path("/tmp/a.js"), "a" * 64, 1),
+        FTPHybridFileUpload("b.js", Path("/tmp/b.js"), "b" * 64, 1),
+    )
+
+    def job(upload: FTPHybridFileUpload, transport: FTPTransport) -> None:
+        """Count serial fallback jobs on the primary transport."""
+
+        del upload
+        nonlocal jobs
+        jobs += 1
+        assert transport is primary
+
+    effective = deployer_module._run_ftp_hybrid_file_jobs(
+        uploads,
+        primary,
+        connections=4,
+        job=job,
+    )
+    assert attempts == 1
+    assert effective == 1
+    assert jobs == 2
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "continuing with 1" in err
 
 
 def test_ftp_hybrid_publish_skips_final_retr_after_stage_verified(tmp_path: Path) -> None:

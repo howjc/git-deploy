@@ -23,6 +23,8 @@ from git_deploy.ftp_hybrid import (
     local_manifest_hash,
     parse_capabilities,
     parse_pending,
+    pending_local_manifest_hash,
+    pending_manifest_outputs,
     probe_ftp_hybrid_capabilities,
     save_capability_profile,
     scan_ftp_tree,
@@ -31,7 +33,7 @@ from git_deploy.ftp_hybrid import (
     validate_pending_resume,
     validate_remote_root_aliases,
 )
-from git_deploy.hybrid import scan_hybrid_output
+from git_deploy.hybrid import hybrid_content_manifest, scan_hybrid_output
 from git_deploy.manifest import ManifestEntry, TargetState
 from git_deploy.transports.base import RemotePathType
 from git_deploy.transports.ftp import FTPRemoteEntry, FTPTransport
@@ -437,6 +439,85 @@ def test_schema_one_pending_only_allows_post_commit_frozen_recovery(
         parsed.with_phase(FTPPendingPhase.STATE_COMPLETE),
         current_ownership_hash=legacy.next_ownership_hash,
     )
+
+
+def test_pending_manifest_hash_ignores_mirror_nested_state_keys(
+    tmp_path: Path,
+) -> None:
+    """Schema 2 Pending Hash matches v1.7.3 even when State stores Mirror files.
+
+    v1.7.3 put only Hybrid Root Files into ``plan.output_manifest``. Current
+    Local State also records Mirror nested paths for incremental skip; those
+    keys must not change Pending resume identity for the same aggregation tree.
+    """
+
+    local = _manifest(tmp_path)
+    # v1.7.3 shape: incremental empty + hybrid root files only.
+    v173_outputs = {item.name: item.entry for item in local.root_files}
+    # Current Local State shape: root files + every Mirror nested file.
+    full_state_outputs = hybrid_content_manifest(local)
+
+    assert "assets/app.js" in full_state_outputs
+    assert "assets/app.js" not in pending_manifest_outputs(local, full_state_outputs)
+    assert pending_manifest_outputs(local, full_state_outputs) == v173_outputs
+
+    expected = local_manifest_hash(local, v173_outputs)
+    assert pending_local_manifest_hash(local, full_state_outputs) == expected
+    assert pending_local_manifest_hash(local, v173_outputs) == expected
+    # Unfiltered full State outputs would change the hash (the P1-01 regression).
+    assert local_manifest_hash(local, full_state_outputs) != expected
+
+
+def test_v173_style_pending_phases_resume_with_full_mirror_state(
+    tmp_path: Path,
+) -> None:
+    """PREPARED / FILES_PUBLISHED / PRUNED markers keep matching after Mirror State."""
+
+    target = _target()
+    local = _manifest(tmp_path)
+    full_state = hybrid_content_manifest(local)
+    # Marker written with Schema 2 hash input shape (v1.7.3 / pending_local_*).
+    manifest_hash = pending_local_manifest_hash(local, full_state)
+    state = TargetState(
+        1,
+        target.name,
+        target.fingerprint,
+        "head-1",
+        10,
+        full_state,
+    )
+    base = FTPHybridPending(
+        FTP_PENDING_SCHEMA,
+        "github.com/acme/project",
+        "frontend-root",
+        ".",
+        target.fingerprint,
+        "deployment-1",
+        FTPPendingPhase.PREPARED,
+        "1" * 64,
+        "2" * 64,
+        manifest_hash,
+        "head-1",
+        state,
+        11,
+        "3" * 64,
+        "4" * 64,
+    )
+    # Current planner re-hashes with full State outputs filtered the same way.
+    current_hash = pending_local_manifest_hash(local, full_state)
+    for phase, ownership in (
+        (FTPPendingPhase.PREPARED, "1" * 64),
+        (FTPPendingPhase.FILES_PUBLISHED, "1" * 64),
+        (FTPPendingPhase.PRUNED, "2" * 64),
+    ):
+        validate_pending_resume(
+            base.with_phase(phase),
+            manifest_hash=current_hash,
+            head="head-1",
+            non_hybrid_plan_hash="3" * 64,
+            previous_state_hash="4" * 64,
+            current_ownership_hash=ownership,
+        )
 
 
 def test_schema_two_pending_requires_both_contract_hashes(tmp_path: Path) -> None:
