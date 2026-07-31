@@ -334,7 +334,10 @@ remote_root = "/srv/app"
         load_config(path)
 
 
-@pytest.mark.parametrize("name", ["build", "doctor", "init"])
+@pytest.mark.parametrize(
+    "name",
+    ["build", "doctor", "init", "bootstrap", "completion"],
+)
 def test_rejects_flat_cli_reserved_target_names(git_project: Path, name: str) -> None:
     """Target names cannot be shadowed by the CLI's action words."""
 
@@ -351,6 +354,21 @@ remote_root = "/srv/app"
 
     with pytest.raises(ConfigError, match="reserved by the flat CLI"):
         load_config(path)
+
+
+def test_reserved_target_names_match_cli_fixed_actions() -> None:
+    """Config reserved set and completion FIXED_ACTIONS stay one shared list."""
+
+    from git_deploy.completion import FIXED_ACTIONS
+    from git_deploy.config import CLI_FIXED_ACTIONS, RESERVED_TARGET_NAMES
+
+    assert FIXED_ACTIONS == CLI_FIXED_ACTIONS
+    assert RESERVED_TARGET_NAMES == frozenset(CLI_FIXED_ACTIONS)
+    assert "bootstrap" in RESERVED_TARGET_NAMES
+    assert "completion" in RESERVED_TARGET_NAMES
+    assert is_valid_target_name("dev")
+    assert not is_valid_target_name("bootstrap")
+    assert not is_valid_target_name("completion")
 
 
 @pytest.mark.parametrize(

@@ -235,6 +235,37 @@ def test_ensure_shell_completion_never_updates_existing_rc(
     assert "# >>> git-deploy shell completion >>>" not in rc.read_text(encoding="utf-8")
 
 
+def test_ensure_shell_completion_refreshes_stale_script_without_rc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Stale installed script body is rewritten; matching content is a no-op; no RC."""
+
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    script = completion_script_path("bash", home=tmp_path)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# stale v1.8.0 completion body\n", encoding="utf-8")
+    rc = tmp_path / ".bashrc"
+    rc.write_text("# user rc untouched\n", encoding="utf-8")
+
+    results = ensure_shell_completion_installed(home=tmp_path)
+    assert results is not None
+    assert any(item.script_written for item in results)
+    packaged = load_completion_script("bash")
+    assert script.read_text(encoding="utf-8") == packaged
+    assert rc.read_text(encoding="utf-8") == "# user rc untouched\n"
+    err = capsys.readouterr().err
+    assert "refreshed" in err
+    assert "completion install" in err
+
+    # Identical packaged content skips further writes and notes.
+    assert ensure_shell_completion_installed(home=tmp_path) is None
+    assert script.read_text(encoding="utf-8") == packaged
+    assert rc.read_text(encoding="utf-8") == "# user rc untouched\n"
+    assert capsys.readouterr().err == ""
+
+
 def test_load_completion_scripts_are_packaged() -> None:
     """Static bash/zsh scripts ship with the package and mention key flags."""
 

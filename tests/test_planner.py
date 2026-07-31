@@ -986,6 +986,325 @@ def test_files_published_plan_skips_uploads_and_fail_closed_on_missing(
         complete_remote_plan(first, config, missing)
 
 
+def test_files_published_resume_fail_closed_on_missing_empty_directories(
+    git_project: Path,
+    tmp_path: Path,
+) -> None:
+    """Published resume phases require top-level and nested empty directories."""
+
+    from git_deploy.config import resolve_target_for_plan
+    from git_deploy.ftp_hybrid import (
+        FTP_CAPABILITY_SCHEMA,
+        FTP_PENDING_SCHEMA,
+        FTPHybridCapabilities,
+        FTPHybridPending,
+        FTPPendingPhase,
+        pending_local_manifest_hash,
+        pending_path,
+        save_capability_profile,
+        serialize_pending,
+    )
+    from git_deploy.hybrid import make_ownership, ownership_hash, serialize_ownership
+    from git_deploy.manifest import new_state
+    from git_deploy.planner import complete_remote_plan
+    from git_deploy.transports.base import RemotePathType
+    from git_deploy.transports.ftp import FTPRemoteEntry, FTPTransport
+
+    root = git_project / ".deploy" / "frontend-root"
+    (root / "assets" / "nested").mkdir(parents=True)
+    (root / "assets" / "empty-nested").mkdir(parents=True)
+    (root / "keep-empty").mkdir(parents=True)
+    (root / "index.html").write_text("home", encoding="utf-8")
+    (root / "assets" / "app.js").write_text("app-v1", encoding="utf-8")
+    (root / "assets" / "nested" / "chunk.js").write_text("chunk-v1", encoding="utf-8")
+    config = load_config(
+        write_config(
+            git_project,
+            """
+project_id = "github.com/acme/project"
+
+[source]
+include = ["app.py"]
+
+[[outputs]]
+name = "frontend-root"
+local = ".deploy/frontend-root"
+remote = "."
+mode = "hybrid"
+
+[targets.dev]
+protocol = "ftp"
+host = "ftp.example.invalid"
+username = "deploy"
+password_env = "FTP_PASSWORD"
+remote_root = "/public_html"
+""",
+            create_outputs=False,
+        )
+    )
+    repository = GitRepository(git_project)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    target = resolve_target_for_plan(config.target(None), runtime_dir=runtime)
+    banner = "c" * 64
+    save_capability_profile(
+        runtime,
+        FTPHybridCapabilities(
+            FTP_CAPABILITY_SCHEMA,
+            target.fingerprint,
+            banner,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            100,
+            True,
+            True,
+            True,
+        ),
+    )
+    first = create_plan(config, target, repository, None, full=False, resolved_target=target)
+    assert first.hybrid is not None
+    assert "keep-empty" in first.hybrid.local.directory_names
+    assets = next(item for item in first.hybrid.local.directories if item.name == "assets")
+    assert "empty-nested" in assets.directories
+
+    ownership = make_ownership(
+        first.hybrid.local,
+        config.project_id or "",
+        first.head,
+        now=10,
+    )
+    next_ownership = make_ownership(
+        first.hybrid.local,
+        config.project_id or "",
+        first.head,
+        now=11,
+    )
+    ownership_bytes = serialize_ownership(ownership)
+    state = new_state(
+        first.target.name,
+        first.target_fingerprint,
+        first.head,
+        dict(first.output_manifest),
+    )
+
+    def make_pending(phase: FTPPendingPhase) -> FTPHybridPending:
+        """Build a schema-2 pending marker for one published-phase resume."""
+
+        return FTPHybridPending(
+            FTP_PENDING_SCHEMA,
+            config.project_id or "",
+            "frontend-root",
+            ".",
+            target.fingerprint,
+            f"deployment-{phase.value.lower()}",
+            phase,
+            ownership_hash(ownership),
+            ownership_hash(next_ownership),
+            pending_local_manifest_hash(first.hybrid.local, first.output_manifest),
+            first.head,
+            state,
+            11,
+            first.non_hybrid_plan_hash,
+            first.previous_state_hash,
+        )
+
+    class EmptyDirResumeTransport(FTPTransport):
+        """In-memory tree with optional dropped/mis-typed empty directories."""
+
+        def __init__(
+            self,
+            *,
+            drop_top: bool = False,
+            drop_nested: bool = False,
+            top_as_file: bool = False,
+            phase: FTPPendingPhase = FTPPendingPhase.FILES_PUBLISHED,
+        ) -> None:
+            """Seed a published tree; optionally omit or mistype empty dirs."""
+
+            super().__init__(target)
+            pending_bytes = serialize_pending(make_pending(phase))
+            self._file_bytes = {
+                ".git-deploy/hybrid/frontend-root.json": ownership_bytes,
+                pending_path("frontend-root"): pending_bytes,
+                "index.html": b"home",
+                "assets/app.js": b"app-v1",
+                "assets/nested/chunk.js": b"chunk-v1",
+                "app.py": b"print('v1')\n",
+            }
+            self._directories = {
+                "",
+                ".git-deploy",
+                ".git-deploy/hybrid",
+                ".git-deploy/ftp-hybrid",
+                ".git-deploy/ftp-hybrid/pending",
+                "assets",
+                "assets/nested",
+                "assets/empty-nested",
+                "keep-empty",
+            }
+            if drop_top:
+                self._directories.discard("keep-empty")
+            if drop_nested:
+                self._directories.discard("assets/empty-nested")
+            if top_as_file:
+                self._directories.discard("keep-empty")
+                self._file_bytes["keep-empty"] = b"not-a-directory"
+
+        def connect(self) -> None:
+            """Mark the adapter connected without a real socket."""
+
+            self.ftp = self  # type: ignore[assignment]
+
+        def close(self) -> None:
+            """Drop the synthetic session handle."""
+
+            self.ftp = None
+
+        def enable_utf8(self) -> None:
+            """Accept UTF-8 as required for Hybrid planning."""
+
+            self._require_utf8 = True
+
+        def server_banner_hash(self) -> str:
+            """Return the capability-profile banner identity."""
+
+            return banner
+
+        def features(self) -> frozenset[str]:
+            """Advertise MLSD and UTF8 for the capability gate."""
+
+            return frozenset({"MLSD", "UTF8"})
+
+        def list_root_names(self) -> tuple[str, ...]:
+            """Expose only direct children of the synthetic root."""
+
+            names = sorted(
+                {
+                    path.split("/", 1)[0]
+                    for path in (*self._file_bytes, *self._directories)
+                    if path and "/" not in path
+                }
+            )
+            self._root_names = tuple(names)
+            self._root_types = {
+                name: (
+                    RemotePathType.DIRECTORY
+                    if name in self._directories
+                    else RemotePathType.FILE
+                )
+                for name in names
+            }
+            return self._root_names
+
+        def list_directory_typed(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> tuple[FTPRemoteEntry, ...]:
+            """Return one level of typed children under ``remote_path``."""
+
+            del allow_case_collisions
+            prefix = "" if remote_path in {"", "."} else remote_path.rstrip("/") + "/"
+            children: dict[str, RemotePathType] = {}
+            for directory in self._directories:
+                if not directory.startswith(prefix):
+                    continue
+                rest = directory[len(prefix) :]
+                if rest and "/" not in rest:
+                    children[rest] = RemotePathType.DIRECTORY
+            for file_path in self._file_bytes:
+                if not file_path.startswith(prefix):
+                    continue
+                rest = file_path[len(prefix) :]
+                if rest and "/" not in rest:
+                    children[rest] = RemotePathType.FILE
+            return tuple(
+                FTPRemoteEntry(name, kind, None, None)
+                for name, kind in sorted(children.items())
+            )
+
+        def read_file(
+            self,
+            remote_path: str,
+            *,
+            max_bytes: int,
+            allow_case_collisions: bool = False,
+        ) -> bytes:
+            """Return configured file bytes with the hard bound enforced."""
+
+            del allow_case_collisions
+            data = self._file_bytes[remote_path]
+            if len(data) > max_bytes:
+                raise AssertionError(f"test fixture exceeds max_bytes for {remote_path}")
+            return data
+
+        def lstat(
+            self,
+            remote_path: str,
+            *,
+            allow_case_collisions: bool = False,
+        ) -> RemotePathType:
+            """Classify synthetic paths without consulting a real FTP server."""
+
+            del allow_case_collisions
+            path = remote_path.strip("/")
+            if path in {"", "."}:
+                return RemotePathType.DIRECTORY
+            if path in self._directories:
+                return RemotePathType.DIRECTORY
+            if path in self._file_bytes:
+                return RemotePathType.FILE
+            return RemotePathType.MISSING
+
+    ok = EmptyDirResumeTransport()
+    ok.connect()
+    remote = complete_remote_plan(first, config, ok)
+    assert remote.hybrid is not None and remote.hybrid.ftp is not None
+    assert remote.hybrid.ftp.resume_phase is FTPPendingPhase.FILES_PUBLISHED
+    assert remote.hybrid.ftp.uploads == ()
+
+    missing_top = EmptyDirResumeTransport(drop_top=True)
+    missing_top.connect()
+    with pytest.raises(PlanError, match="cannot verify published directory: keep-empty"):
+        complete_remote_plan(first, config, missing_top)
+
+    missing_nested = EmptyDirResumeTransport(drop_nested=True)
+    missing_nested.connect()
+    with pytest.raises(
+        PlanError,
+        match="cannot verify published mirror directories: assets/empty-nested",
+    ):
+        complete_remote_plan(first, config, missing_nested)
+
+    type_drift = EmptyDirResumeTransport(top_as_file=True)
+    type_drift.connect()
+    with pytest.raises(PlanError, match="type mismatch for directory 'keep-empty'|cannot verify published directory"):
+        complete_remote_plan(first, config, type_drift)
+
+    pruned_ok = EmptyDirResumeTransport(phase=FTPPendingPhase.PRUNED)
+    pruned_ok.connect()
+    pruned_remote = complete_remote_plan(first, config, pruned_ok)
+    assert pruned_remote.hybrid is not None and pruned_remote.hybrid.ftp is not None
+    assert pruned_remote.hybrid.ftp.resume_phase is FTPPendingPhase.PRUNED
+
+    pruned_missing_nested = EmptyDirResumeTransport(
+        drop_nested=True,
+        phase=FTPPendingPhase.PRUNED,
+    )
+    pruned_missing_nested.connect()
+    with pytest.raises(
+        PlanError,
+        match="cannot verify published mirror directories: assets/empty-nested",
+    ):
+        complete_remote_plan(first, config, pruned_missing_nested)
+
+
 def test_ftp_strong_mirror_republishes_all_current_files(
     git_project: Path,
     tmp_path: Path,

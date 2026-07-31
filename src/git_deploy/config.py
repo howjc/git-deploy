@@ -14,7 +14,16 @@ from git_deploy.errors import ConfigError
 
 Protocol = Literal["sftp", "ftp"]
 OutputMode = Literal["incremental", "hybrid"]
-RESERVED_TARGET_NAMES = frozenset({"build", "doctor", "init"})
+# Flat CLI fixed first-position words (not deploy targets). Shared by config
+# validation, shell completion, and CLI dispatch so reserved names cannot drift.
+CLI_FIXED_ACTIONS: tuple[str, ...] = (
+    "build",
+    "doctor",
+    "init",
+    "bootstrap",
+    "completion",
+)
+RESERVED_TARGET_NAMES = frozenset(CLI_FIXED_ACTIONS)
 # Safe target names for config, CLI, and shell completion (no shell metacharacters).
 TARGET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_AFTER_DEPLOY_COMMANDS = 16

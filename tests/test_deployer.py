@@ -1020,6 +1020,87 @@ def test_run_ftp_hybrid_file_jobs_closes_siblings_on_later_keyboard_interrupt(
     assert len(closed) == 1
 
 
+def test_open_ftp_hybrid_worker_closes_sibling_on_connect_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-connect KeyboardInterrupt closes the in-progress sibling transport."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    primary._require_utf8 = True
+    primary._required_server_banner_hash = "b" * 64
+    closed: list[object] = []
+
+    def boom_connect(self: FTPTransport) -> None:
+        """Mark a partial session then interrupt before the worker returns."""
+
+        self.ftp = object()  # type: ignore[assignment]
+        raise KeyboardInterrupt
+
+    def track_close(self: FTPTransport) -> None:
+        """Record close of the partially constructed sibling."""
+
+        closed.append(self)
+        self.ftp = None
+
+    monkeypatch.setattr(FTPTransport, "connect", boom_connect)
+    monkeypatch.setattr(FTPTransport, "close", track_close)
+
+    with pytest.raises(KeyboardInterrupt):
+        deployer_module._open_ftp_hybrid_worker(primary)
+    assert len(closed) == 1
+
+
+def test_open_ftp_hybrid_worker_closes_sibling_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any BaseException during connect path closes the in-progress sibling."""
+
+    target = TargetConfig(
+        "dev",
+        "ftp",
+        "ftp.example.invalid",
+        "deploy",
+        PurePosixPath("/public_html"),
+        21,
+        password_env="FTP_PASSWORD",
+    )
+    primary = FTPTransport(target)
+    primary.ftp = object()  # type: ignore[assignment]
+    primary._require_utf8 = False
+    closed = 0
+
+    def boom_connect(self: FTPTransport) -> None:
+        """Raise a non-Exception BaseException after partial construction."""
+
+        del self
+        raise SystemExit(99)
+
+    def track_close(self: FTPTransport) -> None:
+        """Count closes for the in-progress sibling."""
+
+        nonlocal closed
+        closed += 1
+        self.ftp = None
+
+    monkeypatch.setattr(FTPTransport, "connect", boom_connect)
+    monkeypatch.setattr(FTPTransport, "close", track_close)
+
+    with pytest.raises(SystemExit) as exc_info:
+        deployer_module._open_ftp_hybrid_worker(primary)
+    assert exc_info.value.code == 99
+    assert closed == 1
+
+
 def test_ftp_hybrid_publish_skips_final_retr_after_stage_verified(tmp_path: Path) -> None:
     """Business publish trusts Stage SHA256 + rename; no final-path RETR."""
 

@@ -1011,18 +1011,29 @@ def _complete_ftp_remote_plan(
         FTPPendingPhase.OWNERSHIP_COMMITTED,
         FTPPendingPhase.STATE_COMPLETE,
     }:
-        # Fail-closed: marker claims publish complete; missing current files abort
-        # rather than prune without re-upload (Plan no longer advertises uploads).
+        # Fail-closed: marker claims publish complete; missing current files or
+        # empty directories abort rather than prune/commit without re-upload
+        # (Plan no longer advertises uploads or MKDIRs for these phases).
         for item in hybrid.local.root_files:
             if transport.lstat(item.name) is not RemotePathType.FILE:
                 raise PlanError(f"FTP Hybrid resume cannot verify published file: {item.name}")
         for directory in hybrid.local.directories:
+            if transport.lstat(directory.name) is not RemotePathType.DIRECTORY:
+                raise PlanError(
+                    f"FTP Hybrid resume cannot verify published directory: {directory.name}"
+                )
             tree = remote_trees[directory.name]
             missing = sorted(set(directory.files) - set(tree.files))
             if missing:
                 raise PlanError(
                     "FTP Hybrid resume cannot verify published mirror files: "
                     + ", ".join(f"{directory.name}/{path}" for path in missing[:10])
+                )
+            missing_dirs = sorted(set(directory.directories) - set(tree.directories))
+            if missing_dirs:
+                raise PlanError(
+                    "FTP Hybrid resume cannot verify published mirror directories: "
+                    + ", ".join(f"{directory.name}/{path}" for path in missing_dirs[:10])
                 )
     if phase in {
         FTPPendingPhase.PRUNED,

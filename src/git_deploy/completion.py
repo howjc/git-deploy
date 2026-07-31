@@ -22,17 +22,11 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from git_deploy import __version__
-from git_deploy.config import is_valid_target_name
+from git_deploy.config import CLI_FIXED_ACTIONS, is_valid_target_name
 from git_deploy.errors import ConfigError
 
-# Fixed first-position words (not deploy targets).
-FIXED_ACTIONS: tuple[str, ...] = (
-    "build",
-    "doctor",
-    "init",
-    "bootstrap",
-    "completion",
-)
+# Fixed first-position words (not deploy targets); same set as config reserved names.
+FIXED_ACTIONS: tuple[str, ...] = CLI_FIXED_ACTIONS
 
 # Second position after ``completion``.
 COMPLETION_SHELLS: tuple[str, ...] = ("bash", "zsh", "targets", "install")
@@ -280,11 +274,13 @@ def ensure_shell_completion_installed(
     home: Path | None = None,
     environ: dict[str, str] | None = None,
 ) -> list[CompletionInstallResult] | None:
-    """Best-effort script-only install; never rewrites shell RC files.
+    """Best-effort script-only install/refresh; never rewrites shell RC files.
 
     Ordinary CLI entry may place packaged completion scripts under the user
-    data directory when they are missing, then print a one-line note to run
-    ``git-deploy completion install``. RC edits require that explicit command.
+    data directory when they are missing, or atomically refresh them when the
+    installed body differs from the packaged script. Prints a one-line note
+    only when a write happens. RC edits require explicit
+    ``git-deploy completion install``.
 
     Args:
         home: Home directory override for tests.
@@ -306,6 +302,27 @@ def ensure_shell_completion_installed(
             return None
         script = completion_script_path(shell, home=home_path)
         if script.is_file():
+            packaged = load_completion_script(shell)
+            try:
+                if script.read_text(encoding="utf-8") == packaged:
+                    return None
+            except OSError:
+                pass
+            # Stale or unreadable install: refresh script only (no RC rewrite).
+            results = install_shell_completion(
+                shell,
+                force=False,
+                home=home_path,
+                update_rc=False,
+            )
+            if any(item.script_written for item in results):
+                print(
+                    "note: shell completion script refreshed under the user data "
+                    "directory (RC unchanged); enable Tab completion with: "
+                    "git-deploy completion install",
+                    file=sys.stderr,
+                )
+                return results
             return None
         results = install_shell_completion(
             shell,

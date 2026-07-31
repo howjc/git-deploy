@@ -956,6 +956,10 @@ def _run_ftp_hybrid_file_jobs(
 def _open_ftp_hybrid_worker(primary: FTPTransport) -> FTPTransport:
     """Open one additional UTF-8 FTP session matching the primary Hybrid contract.
 
+    On ``BaseException`` during connect/setup (including ``KeyboardInterrupt``),
+    the partially constructed sibling is closed before re-raising so mid-connect
+    interrupts do not leave an unclosed transport.
+
     Args:
         primary: Connected Hybrid transport whose target and UTF-8 policy to mirror.
 
@@ -964,6 +968,7 @@ def _open_ftp_hybrid_worker(primary: FTPTransport) -> FTPTransport:
 
     Raises:
         DeployError: When connect or UTF-8 activation fails.
+        BaseException: Propagated after closing the in-progress sibling.
     """
 
     sibling = FTPTransport(primary.target)
@@ -971,10 +976,17 @@ def _open_ftp_hybrid_worker(primary: FTPTransport) -> FTPTransport:
     # paths re-apply OPTS/encoding the same way as the primary transport.
     sibling._require_utf8 = primary._require_utf8
     sibling._required_server_banner_hash = primary._required_server_banner_hash
-    sibling.connect()
-    if primary._require_utf8 and not sibling._require_utf8:
-        sibling.enable_utf8()
-    return sibling
+    try:
+        sibling.connect()
+        if primary._require_utf8 and not sibling._require_utf8:
+            sibling.enable_utf8()
+        return sibling
+    except BaseException:
+        try:
+            sibling.close()
+        except Exception:
+            pass
+        raise
 
 
 def _stage_ftp_hybrid_file(
