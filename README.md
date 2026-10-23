@@ -14,6 +14,8 @@ v1-lite 不再提供 v0.3 的 Expected State、Generation、CAS、Transaction、
 
 需要 Python 3.11+ 和 Git。稳定版通过 GitHub Release 分发 wheel：
 
+Windows 10/11 原生客户端的安装、构建 Shell、PowerShell 补全和 SSH 差异见 [Windows 使用指南](docs/windows.md)。Windows 兼容改动需使用当前源码或由其构建的 wheel，以下旧 v1.8.1 Release wheel 尚不包含此改动。
+
 ```bash
 uv tool install \
   https://github.com/howjc/git-deploy/releases/download/v1.8.1/git_deploy-1.8.1-py3-none-any.whl
@@ -123,7 +125,7 @@ retry_delay = 2
 
 以下保护规则始终生效，不能被配置移除：`.env`、`.env.*`、`.git-deploy/**`、`uploads/**`、`runtime/**`、`storage/cert/**`、`**/*.key`、`**/*.pem`。默认也排除 `.git/**`、`.deploy/**`、`.git-deploy/**`、`node_modules/**` 和 `storage/logs/**`。
 
-配置 `ssh_host_alias` 时自动使用当前环境的 Native OpenSSH：
+配置 `ssh_host_alias` 时自动使用当前环境的 Native OpenSSH。以下连接复用行为适用于 POSIX / WSL；Windows 使用原生 `ssh.exe`/`sftp.exe` 和非交互密钥/Agent 认证，每次调用独立连接，详见 [Windows 指南](docs/windows.md)：
 
 - 完整读取 OpenSSH Config、Include、ProxyJump 和 ProxyCommand；
 - 继承当前 `SSH_AUTH_SOCK`，兼容 WSL 中的 1Password SSH Agent；
@@ -132,7 +134,7 @@ retry_delay = 2
 - `timeout` 只生成 OpenSSH `ConnectTimeout`，不会中断 1Password 授权或完整文件传输；
 - 文件同步和 `after_deploy` 复用同一条 ControlMaster，不会再次触发生物认证；
 - 不读取私钥、不管理 Agent Socket、不启用 Agent Forwarding；
-- 只调用当前环境的 POSIX `ssh`/`sftp`，不会回退 Windows `ssh.exe`。
+- POSIX / WSL 只调用当前环境的 POSIX `ssh`/`sftp`，不会回退 Windows `ssh.exe`。
 
 Alias Target 只配置 `ssh_host_alias`、可选 `ssh_config_file` 和 `remote_root`；不要混入 `host`、`username`、`port`、`key_file` 或 `password_env`。只配置 `host`/`username` 的 SFTP Target 继续使用 Paramiko，支持 `key_file`、`password_env`、`known_hosts_file` 和 SSH Agent。
 

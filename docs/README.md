@@ -11,6 +11,7 @@
 | [Migrate to Hybrid Output](migrate-to-hybrid-output.md) | 启用 Hybrid 聚合产物发布 |
 | [Migrate to FTP Hybrid](migrate-to-ftp-hybrid.md) | FTP In-place Hybrid 专用步骤 |
 | [Native OpenSSH / WSL](native-openssh-wsl.md) | WSL、OpenSSH Config、1Password、Windows Hello |
+| [Windows 本机客户端](windows.md) | 原生安装、PowerShell、构建、路径与 SSH 差异 |
 
 ## Architecture decisions (ADR)
 

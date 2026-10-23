@@ -7,7 +7,7 @@ import re
 import subprocess
 import tomllib
 from dataclasses import dataclass, field, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, cast
 
 from git_deploy.errors import ConfigError
@@ -45,7 +45,10 @@ def is_valid_target_name(name: str) -> bool:
         return False
     if name in RESERVED_TARGET_NAMES:
         return False
-    return TARGET_NAME_PATTERN.fullmatch(name) is not None
+    return (
+        TARGET_NAME_PATTERN.fullmatch(name) is not None
+        and not (os.name == "nt" and PureWindowsPath(name).is_reserved())
+    )
 
 
 def validate_target_name(name: str) -> str:
@@ -73,6 +76,8 @@ def validate_target_name(name: str) -> str:
             f"invalid target name: {name!r}; "
             "use 1–64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*"
         )
+    if os.name == "nt" and PureWindowsPath(name).is_reserved():
+        raise ConfigError(f"target name {name!r} is reserved by Windows")
     return name
 
 DEFAULT_EXCLUDE = (
@@ -287,7 +292,7 @@ def resolve_current_ssh_alias(
 
     Args:
         target: Prepared target retaining its alias and frozen endpoint fields.
-        ssh_executable: Previously validated POSIX OpenSSH executable.
+        ssh_executable: Previously validated native OpenSSH executable.
 
     Returns:
         The alias endpoint as it resolves immediately before connection.
@@ -332,6 +337,8 @@ def _resolve_ssh_query(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
     except OSError as exc:
@@ -743,6 +750,8 @@ def _parse_targets(raw: Any, root: Path) -> dict[str, TargetConfig]:
     for name, value in table.items():
         # Shared safe-name rule used by completion raw readers as well.
         validate_target_name(name if isinstance(name, str) else "")
+        if os.name == "nt" and any(existing.casefold() == name.casefold() for existing in targets):
+            raise ConfigError(f"target names must be distinct ignoring case on Windows: {name!r}")
         item = _table(value, f"targets.{name}")
         _reject_unknown(
             item,

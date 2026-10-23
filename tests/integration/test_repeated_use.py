@@ -61,7 +61,7 @@ def test_repeated_daily_workflow_converges_and_preserves_unknown_remote(
     assert _deploy_once(git_project, transport) == 2
     assert _deploy_once(git_project, transport) == 0
 
-    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8", newline="\n")
     asset.write_text("asset-v2", encoding="utf-8")
     commit_all(git_project, "daily update")
     assert _deploy_once(git_project, transport) == 2

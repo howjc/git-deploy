@@ -426,7 +426,7 @@ def test_zsh_script_uses_line_array_for_targets() -> None:
     assert "first+=(${=targets})" not in zsh
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason="bash not available")
 def test_bash_completion_does_not_execute_malicious_target_markers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -535,3 +535,69 @@ def test_install_rejects_dangling_rc_symlink(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="dangling|unresolvable symlink"):
         install_shell_completion("bash", home=tmp_path)
     assert link.is_symlink()
+
+
+@pytest.mark.parametrize("shell", ["powershell", "pwsh"])
+def test_powershell_install_preserves_profile_and_quotes_unicode_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: str,
+) -> None:
+    """Profile discovery honors redirected Documents and UTF-16/BOM profiles."""
+
+    home = tmp_path / "用户's home"
+    profile = home / "OneDrive/Documents/profile.ps1"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("# existing profile\r\n", encoding="utf-16")
+    monkeypatch.setattr("git_deploy.completion.shutil.which", lambda name: name)
+    monkeypatch.setattr("git_deploy.completion.subprocess.run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(args, 0, str(profile) + "\n", ""))
+    result = install_shell_completion(shell, home=home)
+    assert result[0].rc_path == profile
+    body = profile.read_text(encoding="utf-8-sig")
+    assert "# existing profile" in body
+    assert "用户''s home" in body and "Test-Path -LiteralPath" in body
+    assert profile.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert install_shell_completion(shell, home=home)[0].already_current
+    script = load_completion_script(shell)
+    for flag in CLI_OPTION_FLAGS:
+        assert flag in script
+
+
+@pytest.mark.parametrize("shell", ["powershell", "pwsh"])
+def test_real_powershell_completion_is_literal_and_honors_config_paths(
+    tmp_path: Path, shell: str,
+) -> None:
+    """The real shell completes targets/flags without evaluating prompt expressions."""
+
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+    config = tmp_path / "config with spaces.toml"
+    config.write_text('[targets.production]\n[targets.preview]\n', encoding="utf-8")
+    script = tmp_path / "completion.ps1"
+    script.write_text(load_completion_script(shell), encoding="utf-8-sig")
+    marker = tmp_path / "executed"
+    inputs = [
+        f"git-deploy --config '{config}' pr",
+        "git-deploy completion install pw",
+        "git-deploy --dry",
+        f"git-deploy --config $(New-Item '{marker}') pr",
+    ]
+    import json
+    expressions = []
+    for value in inputs:
+        quoted = "'" + value.replace("'", "''") + "'"
+        expressions.append(
+            f"$line = {quoted}; ConvertTo-Json -Compress -InputObject @([System.Management.Automation.CommandCompletion]::"
+            "CompleteInput($line, $line.Length, $null).CompletionMatches.CompletionText)"
+            ""
+        )
+    command = ". '" + str(script).replace("'", "''") + "'; " + "; ".join(expressions)
+    result = subprocess.run(
+        [executable, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    results = [json.loads(line) for line in result.stdout.splitlines()]
+    assert sorted(results[0]) == ["preview", "production"]
+    assert results[1] == ["pwsh"]
+    assert results[2] == ["--dry-run"]
+    assert not marker.exists()

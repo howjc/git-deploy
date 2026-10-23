@@ -36,7 +36,8 @@ def run_build(config: BuildConfig, project_root: Path) -> None:
                 step,
                 cwd=project_root,
                 shell=True,
-                start_new_session=True,
+                start_new_session=os.name != "nt",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
             returncode = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
@@ -55,6 +56,29 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
     """Terminate a build's whole process group so shell children cannot leak."""
 
     if process.poll() is not None:
+        return
+    if os.name == "nt":
+        # Terminating cmd.exe alone leaves npm/python/compiler children running.
+        # A separate process group keeps Ctrl-C from killing cmd before taskkill
+        # can discover and terminate its descendants.
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            process.kill()
+            process.wait()
+            raise BuildError(f"cannot terminate the Windows build process tree: {exc}") from exc
+        if result.returncode != 0 and process.poll() is None:
+            process.kill()
+            process.wait()
+            detail = result.stderr.decode(errors="replace").strip()
+            raise BuildError(f"cannot terminate the Windows build process tree: {detail}")
+        process.wait()
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)

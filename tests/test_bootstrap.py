@@ -1851,6 +1851,7 @@ def test_emit_bootstrap_output_flush_contract() -> None:
     assert any("PLAN" in chunk for chunk in stream.chunks)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pipefail/SIGPIPE contract")
 def test_subprocess_plan_pipe_head_c0_zero_mutation(tmp_path: Path) -> None:
     """Real stdout pipe with zero-byte consumer must not perform remote mutation.
 

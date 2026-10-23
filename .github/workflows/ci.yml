@@ -8,11 +8,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12"]
+    env:
+      PYTHONUTF8: "1"
+      GIT_DEPLOY_SKIP_COMPLETION_INSTALL: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -21,12 +25,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-          cache-suffix: py-${{ matrix.python-version }}
+          cache-suffix: ${{ matrix.os }}-py-${{ matrix.python-version }}
 
       - name: Verify Python matrix interpreter
         run: |
-          uv run python -c \
-            "import sys; expected='${{ matrix.python-version }}'; actual=f'{sys.version_info.major}.{sys.version_info.minor}'; print(sys.version); assert actual == expected, (actual, expected)"
+          uv run python -c "import sys; expected='${{ matrix.python-version }}'; actual=f'{sys.version_info.major}.{sys.version_info.minor}'; print(sys.version); assert actual == expected, (actual, expected)"
 
       - name: Check lockfile is up to date
         run: uv lock --check
@@ -47,8 +50,4 @@ jobs:
         run: uv build --clear
 
       - name: Install built wheel in isolation and smoke test
-        run: |
-          uv venv --clear /tmp/git-deploy-smoke
-          uv pip install --python /tmp/git-deploy-smoke/bin/python dist/*.whl
-          /tmp/git-deploy-smoke/bin/git-deploy --version
-          /tmp/git-deploy-smoke/bin/git-deploy --help
+        run: uv run python tests/smoke_wheel.py

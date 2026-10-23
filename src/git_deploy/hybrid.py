@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from git_deploy.filesystem import is_link
 from git_deploy.config import OutputConfig, TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.manifest import ManifestEntry, ScannedOutput, hash_file
@@ -206,7 +207,7 @@ def scan_hybrid_output(output: OutputConfig) -> HybridLocalManifest:
     root = output.local
     if not root.exists():
         raise PlanError(f"configured hybrid output does not exist after build: {root}")
-    if root.is_symlink() or not root.is_dir():
+    if is_link(root) or not root.is_dir():
         raise PlanError(f"hybrid output must be a regular directory without symlinks: {root}")
     root_files: list[HybridRootFile] = []
     directories: list[HybridDirectoryManifest] = []
@@ -218,7 +219,7 @@ def scan_hybrid_output(output: OutputConfig) -> HybridLocalManifest:
     for child in children:
         _validate_direct_name(child.name, root)
         kind = child.lstat().st_mode
-        if stat.S_ISLNK(kind):
+        if is_link(child):
             raise PlanError(f"hybrid output does not support symlinks: {child}")
         if stat.S_ISREG(kind):
             root_files.append(HybridRootFile(child.name, child, hash_file(child)))
@@ -890,7 +891,7 @@ def _scan_hybrid_directory(root: Path) -> HybridDirectoryManifest:
         _reject_portable_name_collisions(children, directory)
         for child in children:
             mode = child.lstat().st_mode
-            if stat.S_ISLNK(mode):
+            if is_link(child):
                 raise PlanError(f"hybrid output does not support symlinks: {child}")
             if stat.S_ISDIR(mode):
                 relative = child.relative_to(root).as_posix()

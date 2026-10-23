@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+import shlex
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,7 +22,8 @@ def git_project(tmp_path: Path) -> Path:
     _git(root, "config", "user.name", "Tests")
     info_exclude = root / ".git/info/exclude"
     info_exclude.write_text("deploy.toml\ndist/\n", encoding="utf-8")
-    (root / "app.py").write_text("print('v1')\n", encoding="utf-8")
+    _git(root, "config", "core.autocrlf", "false")
+    (root / "app.py").write_bytes(b"print('v1')\n")
     _git(root, "add", "app.py")
     _git(root, "commit", "-qm", "initial")
     return root
@@ -83,3 +87,10 @@ def _git(root: Path, *arguments: str) -> str:
         text=True,
         stdout=subprocess.PIPE,
     ).stdout
+
+
+def python_command(code: str) -> str:
+    """Quote a Python build step for the platform's native shell."""
+
+    args = [sys.executable, "-c", code]
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)

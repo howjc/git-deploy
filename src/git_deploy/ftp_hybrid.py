@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from git_deploy.filesystem import sync_directory
 from git_deploy.config import TargetConfig
 from git_deploy.errors import DeployError, PlanError
 from git_deploy.hybrid import HybridLocalManifest
@@ -1104,11 +1105,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        sync_directory(path.parent)
     except OSError as exc:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

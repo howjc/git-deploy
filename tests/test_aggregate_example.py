@@ -130,7 +130,7 @@ def test_reference_aggregator_rejects_core_protected_and_unstable_names(
 
     (tmp_path / "frontend/dist/.git/config").unlink()
     (tmp_path / "frontend/dist/.git").rmdir()
-    (tmp_path / "frontend/dist/trailing ").mkdir()
+    (tmp_path / "frontend/dist/trailing\u2009").mkdir()
     unstable = subprocess.run(
         [sys.executable, str(SCRIPT)],
         cwd=tmp_path,

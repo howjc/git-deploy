@@ -58,8 +58,8 @@ def aggregate(sources: tuple[Path, ...], destination: Path) -> None:
     try:
         for source in resolved_sources:
             _merge_source(source, stage, seen)
-        had_target = target.exists() or target.is_symlink()
-        if target.is_symlink():
+        had_target = target.exists() or _is_link(target)
+        if _is_link(target):
             raise AggregationError("destination must not be a symlink")
         if had_target:
             os.replace(target, backup)
@@ -80,7 +80,7 @@ def aggregate(sources: tuple[Path, ...], destination: Path) -> None:
 def _merge_source(source: Path, stage: Path, seen: dict[str, str]) -> None:
     """Copy one verified tree while rejecting duplicate and type conflicts."""
 
-    if source.is_symlink() or not source.is_dir():
+    if _is_link(source) or not source.is_dir():
         raise AggregationError(f"source must be a regular directory: {source}")
 
     def visit(directory: Path) -> None:
@@ -90,7 +90,7 @@ def _merge_source(source: Path, stage: Path, seen: dict[str, str]) -> None:
             mode = child.lstat().st_mode
             relative = child.relative_to(source).as_posix()
             _validate_relative(relative)
-            if stat.S_ISLNK(mode):
+            if _is_link(child):
                 raise AggregationError(f"symbolic links are not supported: {child}")
             if stat.S_ISDIR(mode):
                 _claim(relative, "directory", seen)
@@ -126,6 +126,18 @@ def _claim(path: str, kind: str, seen: dict[str, str]) -> None:
     seen[path] = kind
 
 
+def _is_link(path: Path) -> bool:
+    """Reject symbolic links and Windows reparse points without following them."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
 def _inside_project(path: Path, project: Path, label: str) -> Path:
     """Normalize one path and reject escape or symbolic-link components."""
 
@@ -136,7 +148,7 @@ def _inside_project(path: Path, project: Path, label: str) -> Path:
     current = project
     for component in candidate.relative_to(project).parts:
         current /= component
-        if current.is_symlink():
+        if _is_link(current):
             raise AggregationError(f"{label} contains a symbolic link: {current}")
     return candidate
 

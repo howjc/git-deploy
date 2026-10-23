@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import socket
@@ -11,6 +10,7 @@ from pathlib import Path
 from types import TracebackType
 
 from git_deploy.errors import PlanError
+from git_deploy.file_lock import lock_file, unlock_file
 
 
 class TargetLock:
@@ -36,11 +36,15 @@ class TargetLock:
         an orphaned advisory lock waiting on GC.
         """
 
+        if self._handle is not None:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+", encoding="utf-8")
+        acquired = False
         try:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file(handle)
+                acquired = True
             except BlockingIOError as exc:
                 handle.seek(0)
                 owner = handle.read().strip() or "owner information unavailable"
@@ -62,7 +66,8 @@ class TargetLock:
         except BaseException:
             # Deterministic cleanup for busy-lock, metadata, fsync, and interrupt.
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if acquired:
+                    unlock_file(handle)
             except Exception:
                 pass
             try:
@@ -83,7 +88,7 @@ class TargetLock:
             handle.seek(0)
             handle.truncate()
             handle.flush()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
         finally:
             handle.close()
 

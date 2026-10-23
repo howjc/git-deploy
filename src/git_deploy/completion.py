@@ -8,10 +8,11 @@ shell RC files — users opt in with ``git-deploy completion install``.
 
 from __future__ import annotations
 
-import fcntl
 import os
 import shlex
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -24,14 +25,15 @@ from typing import Any, Iterator, Literal
 from git_deploy import __version__
 from git_deploy.config import CLI_FIXED_ACTIONS, is_valid_target_name
 from git_deploy.errors import ConfigError
+from git_deploy.file_lock import lock_file, unlock_file
 
 # Fixed first-position words (not deploy targets); same set as config reserved names.
 FIXED_ACTIONS: tuple[str, ...] = CLI_FIXED_ACTIONS
 
 # Second position after ``completion``.
-COMPLETION_SHELLS: tuple[str, ...] = ("bash", "zsh", "targets", "install")
+COMPLETION_SHELLS: tuple[str, ...] = ("bash", "zsh", "powershell", "pwsh", "targets", "install")
 
-SupportedShell = Literal["bash", "zsh"]
+SupportedShell = Literal["bash", "zsh", "powershell", "pwsh"]
 
 # Public CLI option strings for static scripts and tests (long form only).
 CLI_OPTION_FLAGS: tuple[str, ...] = (
@@ -137,7 +139,7 @@ def load_completion_script(shell: str) -> str:
     """Load a packaged static completion script.
 
     Args:
-        shell: ``bash`` or ``zsh``.
+        shell: ``bash``, ``zsh``, ``powershell`` or ``pwsh``.
 
     Returns:
         Script text ending with a newline.
@@ -147,9 +149,10 @@ def load_completion_script(shell: str) -> str:
         FileNotFoundError: When the packaged resource is missing.
     """
 
-    if shell not in ("bash", "zsh"):
+    if shell not in ("bash", "zsh", "powershell", "pwsh"):
         raise ValueError(f"unsupported completion shell: {shell!r}")
-    resource = files("git_deploy.completions").joinpath(f"git-deploy.{shell}")
+    extension = "ps1" if shell in {"powershell", "pwsh"} else shell
+    resource = files("git_deploy.completions").joinpath(f"git-deploy.{extension}")
     text = resource.read_text(encoding="utf-8")
     return text if text.endswith("\n") else f"{text}\n"
 
@@ -173,13 +176,17 @@ def detect_login_shell(shell: str | None = None) -> SupportedShell | None:
         shell: Explicit shell path or name; defaults to ``os.environ['SHELL']``.
 
     Returns:
-        ``bash`` / ``zsh``, or ``None`` when the shell is unsupported.
+        A supported shell name, or ``None`` when it is unsupported.
     """
 
     raw = (shell if shell is not None else os.environ.get("SHELL", "")).strip()
     if not raw:
         return None
     name = Path(raw).name.lower()
+    if name in {"powershell", "powershell.exe"}:
+        return "powershell"
+    if name in {"pwsh", "pwsh.exe"}:
+        return "pwsh"
     if name in {"bash", "bash.exe"}:
         return "bash"
     if name in {"zsh", "zsh.exe"}:
@@ -201,6 +208,8 @@ def completion_script_path(shell: SupportedShell, *, home: Path | None = None) -
     base = (home or Path.home()).expanduser().resolve()
     if shell == "bash":
         return base / ".local/share/bash-completion/completions/git-deploy"
+    if shell in {"powershell", "pwsh"}:
+        return base / ".local/share/git-deploy/completion.ps1"
     return base / ".local/share/zsh/site-functions/_git-deploy"
 
 
@@ -212,10 +221,26 @@ def completion_rc_path(shell: SupportedShell, *, home: Path | None = None) -> Pa
         home: Home directory override (tests); defaults to ``Path.home()``.
 
     Returns:
-        ``~/.bashrc`` or ``~/.zshrc``.
+        Bash/Zsh RC or the selected PowerShell's current-user all-hosts profile.
     """
 
     base = (home or Path.home()).expanduser().resolve()
+    if shell in {"powershell", "pwsh"}:
+        # Ask the selected shell: Documents may be redirected to OneDrive, and
+        # Windows PowerShell 5.1 and PowerShell 7 have different profile roots.
+        executable = shutil.which(shell)
+        if executable is None:
+            raise ValueError(f"cannot find {shell}; load 'git-deploy completion {shell}' manually")
+        result = subprocess.run(
+            [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); "
+             "$PROFILE.CurrentUserAllHosts"],
+            capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+        value = result.stdout.strip().lstrip("\ufeff")
+        if result.returncode != 0 or not value or not Path(value).is_absolute():
+            raise ValueError(f"cannot determine the {shell} profile path")
+        return Path(value)
     return base / (".bashrc" if shell == "bash" else ".zshrc")
 
 
@@ -250,8 +275,7 @@ def install_shell_completion(
     targets = _resolve_install_shells(shell, home=home_path)
     if not targets:
         raise ValueError(
-            "cannot detect a supported shell; pass bash or zsh explicitly "
-            "(supported: bash, zsh)"
+            "cannot detect a supported shell; pass bash, zsh, powershell or pwsh explicitly"
         )
     results: list[CompletionInstallResult] = []
     with _install_lock(home_path):
@@ -304,7 +328,7 @@ def ensure_shell_completion_installed(
         if script.is_file():
             packaged = load_completion_script(shell)
             try:
-                if script.read_text(encoding="utf-8") == packaged:
+                if _read_completion_text(script) == packaged:
                     return None
             except OSError:
                 pass
@@ -368,7 +392,7 @@ def format_install_report(results: list[CompletionInstallResult]) -> str:
         if not parts:
             parts.append(f"verified {item.script_path}")
         lines.append(f"{item.shell}: wrote " + ", ".join(parts))
-    lines.append("Reload the shell or run: source <rc-file>  (then try: git-deploy <Tab>)")
+    lines.append("Reload the shell, then try: git-deploy <Tab>")
     return "\n".join(lines)
 
 
@@ -386,6 +410,8 @@ def _resolve_install_shells(shell: str | None, *, home: Path) -> list[SupportedS
     detected = detect_login_shell()
     if detected is not None:
         return [detected]
+    if os.name == "nt":
+        return ["powershell"]
     found: list[SupportedShell] = []
     if (home / ".bashrc").is_file() or (home / ".bash_profile").is_file():
         found.append("bash")
@@ -414,7 +440,7 @@ def _install_one_shell(
     """
 
     script_path = completion_script_path(shell, home=home)
-    rc_path = completion_rc_path(shell, home=home)
+    rc_path = completion_rc_path(shell, home=home) if update_rc else script_path
     script_body = load_completion_script(shell)
     script_written = _write_text_if_changed(script_path, script_body, force=force)
     if not update_rc:
@@ -447,12 +473,16 @@ def _rc_snippet(shell: SupportedShell, script_path: Path) -> str:
     ``$`` do not expand when the RC is sourced.
     """
 
-    path_text = shlex.quote(str(script_path))
+    if shell in {"powershell", "pwsh"}:
+        path_text = "'" + str(script_path).replace("'", "''") + "'"
+        body = f"if (Test-Path -LiteralPath {path_text}) {{ . {path_text} }}"
+        return f"{_RC_BEGIN}\n{body}\n{_RC_END}\n"
+    path_text = shlex.quote(script_path.as_posix())
     if shell == "bash":
         body = f"[[ -r {path_text} ]] && source {path_text}"
     else:
         # Keep zsh completion on fpath and source the install script once.
-        site = shlex.quote(str(script_path.parent))
+        site = shlex.quote(script_path.parent.as_posix())
         body = "\n".join(
             (
                 f"fpath=({site} $fpath)",
@@ -477,7 +507,7 @@ def _write_text_if_changed(path: Path, content: str, *, force: bool) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not force and path.is_file():
         try:
-            if path.read_text(encoding="utf-8") == content:
+            if _read_completion_text(path) == content:
                 return False
         except OSError:
             pass
@@ -502,7 +532,7 @@ def _upsert_rc_block(rc_path: Path, block: str, *, force: bool) -> bool:
 
     existing = ""
     if rc_path.is_file():
-        existing = rc_path.read_text(encoding="utf-8")
+        existing = _read_completion_text(rc_path)
     if _RC_BEGIN in existing and _RC_END in existing:
         start = existing.find(_RC_BEGIN)
         end = existing.find(_RC_END, start)
@@ -533,6 +563,14 @@ def _write_install_state(home: Path, version: str) -> None:
     path = home / _STATE_RELATIVE
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(path, f"{version}\n")
+
+
+def _read_completion_text(path: Path) -> str:
+    """Read shell files, including PowerShell's UTF-8/UTF-16 BOM encodings."""
+
+    data = path.read_bytes()
+    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    return data.decode(encoding).replace("\r\n", "\n")
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -571,7 +609,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
     )
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        encoding = "utf-8-sig" if destination.suffix == ".ps1" else "utf-8"
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -602,11 +641,11 @@ def _install_lock(home: Path) -> Iterator[None]:
     lock_path = home / ".config/git-deploy/completion-install.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_file(handle, blocking=True)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
 
 
 def _list_target_names_impl(

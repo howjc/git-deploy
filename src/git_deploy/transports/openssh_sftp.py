@@ -1,4 +1,4 @@
-"""Native OpenSSH SFTP backend with private ControlMaster connection reuse."""
+"""Native OpenSSH SFTP, with ControlMaster reuse on POSIX clients."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from git_deploy.transports.base import (
     TransferMeasurementMode,
     is_stable_remote_component,
 )
+
+IS_WINDOWS = os.name == "nt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +61,13 @@ class OpenSSHMaster:
         if not target.ssh_host_alias:
             raise DeployError("Native OpenSSH backend requires ssh_host_alias")
         self.target = target
-        self.ssh = _find_posix_executable("ssh")
-        self.sftp = _find_posix_executable("sftp")
+        self.ssh = _find_openssh_executable("ssh")
+        self.sftp = _find_openssh_executable("sftp")
         self.alias = target.ssh_host_alias
         self.directory: Path | None = None
         self.control_path: Path | None = None
         self.connected = False
+        self.multiplex = not IS_WINDOWS
 
     @property
     def key(self) -> OpenSSHEndpointKey:
@@ -93,6 +96,31 @@ class OpenSSHMaster:
         if self.connected:
             return
         self._assert_alias_current()
+        if not self.multiplex:
+            # Windows OpenSSH has no ControlMaster. Use key/agent authentication
+            # on each invocation; BatchMode avoids unexpected prompts mid-plan.
+            try:
+                result = subprocess.run(
+                    [self.ssh, *self._config_arguments(), *self._connection_arguments(),
+                     *self._pinned_endpoint_arguments(), "-T", self.alias, "exit 0"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except OSError as exc:
+                raise DeployError(f"OpenSSH authentication failed: {exc}") from exc
+            if result.returncode != 0:
+                raise DeployError(
+                    f"OpenSSH authentication failed for target {self.target.name}: "
+                    f"{result.stderr.strip()} (Windows requires a key or SSH Agent; "
+                    "use a direct host/password_env target for password authentication)"
+                )
+            self.connected = True
+            return
         root = self.target.runtime_dir or Path(tempfile.gettempdir()) / "git-deploy"
         socket_root = _control_socket_root(root, self.target.name)
         socket_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -122,6 +150,8 @@ class OpenSSHMaster:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         except OSError as exc:
@@ -168,6 +198,8 @@ class OpenSSHMaster:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
 
@@ -180,6 +212,8 @@ class OpenSSHMaster:
 
         if not self.connected:
             return False
+        if not self.multiplex:
+            return True
         try:
             return self.control_command("check").returncode == 0
         except OSError:
@@ -194,18 +228,21 @@ class OpenSSHMaster:
     ) -> subprocess.CompletedProcess[str]:
         """Run SFTP batch commands through the existing master connection."""
 
-        if not self.connected or self.control_path is None:
+        if not self.connected:
             raise DeployError("OpenSSH master is not connected")
+        if not self.multiplex:
+            self._assert_alias_current()
         payload = "\n".join(commands) + "\n"
         result = subprocess.run(
             [
                 self.sftp,
                 *self._config_arguments(),
                 "-q",
+                "-S",
+                self.ssh,
                 "-b",
                 "-",
-                "-o",
-                f"ControlPath={self.control_path}",
+                *self._connection_arguments(),
                 *self._pinned_endpoint_arguments(),
                 self.alias,
             ],
@@ -213,6 +250,8 @@ class OpenSSHMaster:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env={**os.environ, "LC_ALL": "C"},
             check=False,
         )
@@ -240,14 +279,15 @@ class OpenSSHMaster:
             ``None`` after a zero remote exit status.
         """
 
-        if not self.connected or self.control_path is None:
+        if not self.connected:
             raise DeployError("OpenSSH master is not connected")
+        if not self.multiplex:
+            self._assert_alias_current()
         wrapped = f"cd -- {shlex.quote(cwd.as_posix())} && {command}"
         invocation = [
             self.ssh,
             *self._config_arguments(),
-            "-o",
-            f"ControlPath={self.control_path}",
+            *self._connection_arguments(),
             *self._pinned_endpoint_arguments(),
             "-T",
             self.alias,
@@ -283,13 +323,14 @@ class OpenSSHMaster:
             Exact stdout after a zero remote exit status.
         """
 
-        if not self.connected or self.control_path is None:
+        if not self.connected:
             raise DeployError("OpenSSH master is not connected")
+        if not self.multiplex:
+            self._assert_alias_current()
         invocation = [
             self.ssh,
             *self._config_arguments(),
-            "-o",
-            f"ControlPath={self.control_path}",
+            *self._connection_arguments(),
             *self._pinned_endpoint_arguments(),
             "-T",
             self.alias,
@@ -302,6 +343,8 @@ class OpenSSHMaster:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.target.timeout,
                 check=False,
             )
@@ -316,7 +359,7 @@ class OpenSSHMaster:
     def close(self) -> None:
         """Close the master and delete its private directory idempotently."""
 
-        if self.connected:
+        if self.connected and self.multiplex:
             try:
                 self.control_command("exit")
             except OSError:
@@ -326,6 +369,15 @@ class OpenSSHMaster:
             shutil.rmtree(self.directory, ignore_errors=True)
         self.directory = None
         self.control_path = None
+
+    def _connection_arguments(self) -> list[str]:
+        """Select a POSIX master or unattended Windows authentication."""
+
+        if not self.multiplex:
+            return ["-o", "BatchMode=yes"]
+        if self.control_path is None:
+            raise DeployError("OpenSSH master is not connected")
+        return ["-o", f"ControlPath={self.control_path}"]
 
     def _config_arguments(self) -> list[str]:
         """Return the explicit OpenSSH config selector when configured."""
@@ -493,7 +545,7 @@ class OpenSSHSFTPTransport(Transport):
             callback(0, local_path.stat().st_size)
             master.run_batch(
                 (
-                    f"put {_quote_sftp(str(local_path))} {_quote_sftp(temporary)}",
+                    f"put {_quote_sftp(local_path.absolute().as_posix())} {_quote_sftp(temporary)}",
                     f"chmod {'0755' if executable else '0644'} {_quote_sftp(temporary)}",
                 ),
                 operation=f"upload {remote_path}",
@@ -573,7 +625,7 @@ class OpenSSHSFTPTransport(Transport):
             with tempfile.NamedTemporaryFile(prefix="git-deploy-read-", delete=False) as handle:
                 local = Path(handle.name)
             self._require_master().run_batch(
-                (f"get {_quote_sftp(self._absolute(remote_path))} {_quote_sftp(str(local))}",),
+                (f"get {_quote_sftp(self._absolute(remote_path))} {_quote_sftp(local.as_posix())}",),
                 operation=f"read metadata {remote_path}",
             )
             if local.stat().st_size > max_bytes:
@@ -808,16 +860,17 @@ class OpenSSHSFTPTransport(Transport):
         return self.master
 
 
-def _find_posix_executable(name: str) -> str:
-    """Find a system OpenSSH executable while refusing Windows ``.exe`` paths."""
+def _find_openssh_executable(name: str) -> str:
+    """Find native OpenSSH; WSL must never fall through to Windows executables."""
 
     value = shutil.which(name)
     if value is None:
         raise DeployError(f"Native OpenSSH backend requires the system '{name}' executable")
     path = Path(value)
-    if path.suffix.lower() == ".exe" or not path.is_absolute():
+    if (not IS_WINDOWS and path.suffix.lower() == ".exe") or not path.is_absolute():
         raise DeployError(
-            f"Native OpenSSH backend requires a POSIX {name} executable, found: {value}"
+            f"Native OpenSSH backend requires a {'Windows' if IS_WINDOWS else 'POSIX'} "
+            f"{name} executable, found: {value}"
         )
     return str(path)
 

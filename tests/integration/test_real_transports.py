@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import os
 import shutil
 import socket
 import subprocess
@@ -56,6 +57,8 @@ def _docker(*arguments: str) -> str:
 def sftp_server(tmp_path_factory: pytest.TempPathFactory):  # noqa: ANN201
     """Start isolated OpenSSH and return its container, port, and known-hosts file."""
 
+    if os.name == "nt":
+        pytest.skip("Linux-container SSH server fixture; Windows client covered by native contracts")
     root = Path(__file__).parent / "fixtures/sftp"
     tag = f"git-deploy-v1-sftp:{secrets.token_hex(6)}"
     _docker("build", "-q", "-t", tag, str(root))
@@ -204,6 +207,7 @@ def test_real_ftp_upload_replace_and_idempotent_delete(
         transport.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="local NTFS FTP fixture cannot provide required case-sensitive server semantics")
 def test_real_ftp_hybrid_capability_probe_supports_active_mode(
     tmp_path: Path,
     ftp_server,
@@ -239,6 +243,7 @@ def test_real_ftp_hybrid_capability_probe_supports_active_mode(
     assert len(tuple(sibling.parent.iterdir())) == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="local NTFS FTP fixture cannot provide required case-sensitive server semantics")
 def test_real_ftp_hybrid_probe_adoption_mirror_state_loss_and_cleanup(
     git_project: Path,
     ftp_server,
@@ -396,6 +401,7 @@ remote_root = "/public_html/ftp-hybrid"
     assert (remote_root / "index.php").read_text(encoding="utf-8") == "backend"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="local NTFS FTP fixture cannot provide required case-sensitive server semantics")
 def test_real_ftp_hybrid_forward_resume_at_publish_prune_state_and_cleanup(
     git_project: Path,
     ftp_server,

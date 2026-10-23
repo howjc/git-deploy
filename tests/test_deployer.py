@@ -157,7 +157,7 @@ def test_success_uploads_exact_head_and_commits_state(git_project: Path) -> None
     repository = GitRepository(git_project)
     store = StateStore(repository.git_dir())
     plan = create_plan(config, config.target(None), repository, None, full=False)
-    (git_project / "app.py").write_text("print('dirty')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('dirty')\n", encoding="utf-8", newline="\n")
     transport = FakeTransport()
 
     execute_plan(plan, config, repository, store, transport_factory=lambda target: transport)
@@ -311,7 +311,7 @@ def test_source_freeze_stays_bound_to_planned_commit_after_head_moves(
     store = StateStore(repository.git_dir())
     plan = create_plan(config, config.target(None), repository, None, full=False)
     planned_head = plan.head
-    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "move HEAD after planning")
     transport = FakeTransport()
 
@@ -391,7 +391,7 @@ retry_delay = 0
     target = config.target(None)
     old = TargetState(1, "dev", target.fingerprint, repository.head(), 1, {})
     store.save(old)
-    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "command deployment change")
     plan = create_plan(config, target, repository, old, full=False)
     failed = FakeTransport(command_failure=2)

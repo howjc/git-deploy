@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from dataclasses import replace
 import json
@@ -641,9 +643,12 @@ def test_hybrid_rejects_unstable_whitespace_components(
     """Local and remote ownership names share one stable SFTP boundary."""
 
     config = load_config(_hybrid_project(git_project))
-    (config.outputs[0].local / name).write_text("unsafe", encoding="utf-8")
-    with pytest.raises(PlanError, match="unsafe direct child"):
-        scan_hybrid_output(config.outputs[0])
+    # Win32 cannot materialize tabs or trailing ASCII spaces; the remote parser
+    # below must still reject those names returned by a POSIX server.
+    if os.name != "nt" or ("\t" not in name and not name.endswith(" ")):
+        (config.outputs[0].local / name).write_text("unsafe", encoding="utf-8")
+        with pytest.raises(PlanError, match="unsafe direct child"):
+            scan_hybrid_output(config.outputs[0])
 
     record = HybridOwnership(
         1,

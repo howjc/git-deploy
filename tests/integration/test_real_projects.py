@@ -96,7 +96,7 @@ def test_real_php_composer_build_sync_and_protection(tmp_path: Path) -> None:
     root.mkdir()
     _initialize(root)
     (root / "composer.json").write_text('{"name":"fixture/php","require":{}}\n', encoding="utf-8")
-    (root / "index.php").write_text("<?php echo 'ok';\n", encoding="utf-8")
+    (root / "index.php").write_bytes(b"<?php echo 'ok';\n")
     (root / ".env").write_text("SECRET=no\n", encoding="utf-8")
     (root / "runtime").mkdir()
     (root / "runtime/session").write_text("private", encoding="utf-8")

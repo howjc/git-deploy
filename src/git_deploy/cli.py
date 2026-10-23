@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any, Literal
@@ -68,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help=(
             "doctor/workspace-build target, bootstrap target filter names, "
-            "or completion {bash,zsh,targets,install}"
+            "or completion {bash,zsh,powershell,pwsh,targets,install [shell]}"
         ),
     )
     setattr(extra, "completer", _complete_extra)
@@ -168,6 +169,12 @@ def main(argv: list[str] | None = None) -> int:
         Zero on success or the categorized v1-lite failure code.
     """
 
+    if os.name == "nt":
+        # Redirected Windows streams otherwise use the legacy ANSI code page,
+        # which cannot represent arbitrary Git paths or SSH diagnostics.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = build_parser()
     # Only auto-complete when using real process argv (argcomplete reads env + sys.argv).
     if argv is None:
@@ -260,12 +267,14 @@ def _completion_command(args: argparse.Namespace) -> int:
     kind = args.extra[0]
     if kind == "install":
         try:
-            results = install_shell_completion(force=args.force)
+            results = install_shell_completion(
+                args.extra[1] if len(args.extra) == 2 else None, force=args.force
+            )
         except (ValueError, OSError, UnicodeError) as exc:
             raise ConfigError(str(exc)) from exc
         print(format_install_report(results))
         return 0
-    if kind in {"bash", "zsh"}:
+    if kind in {"bash", "zsh", "powershell", "pwsh"}:
         sys.stdout.write(load_completion_script(kind))
         return 0
     # targets: one name per line for static shell scripts
@@ -854,11 +863,17 @@ def _validate_bootstrap_args(args: argparse.Namespace) -> None:
 def _validate_completion_args(args: argparse.Namespace) -> None:
     """Reject deploy-only flags and require exactly one completion kind."""
 
-    if len(args.extra) != 1 or args.extra[0] not in {"bash", "zsh", "targets", "install"}:
-        raise ConfigError("usage: git-deploy completion {bash,zsh,targets,install}")
+    shells = {"bash", "zsh", "powershell", "pwsh"}
+    valid = (
+        len(args.extra) == 1 and args.extra[0] in shells | {"targets", "install"}
+    ) or (
+        len(args.extra) == 2 and args.extra[0] == "install" and args.extra[1] in shells
+    )
+    if not valid:
+        raise ConfigError("usage: git-deploy completion {bash,zsh,powershell,pwsh,targets,install [shell]}")
     if args.config is not None and args.workspace is not None:
         raise ConfigError("--config and --workspace are mutually exclusive")
-    if args.extra[0] in {"bash", "zsh", "install"} and (
+    if args.extra[0] in shells | {"install"} and (
         args.config is not None or args.workspace is not None
     ):
         raise ConfigError(

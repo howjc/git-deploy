@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -104,3 +105,31 @@ def test_partial_acquire_metadata_write_failure_closes_handle(
     retry = TargetLock(state_root, "staging")
     retry.acquire()
     retry.release()
+
+
+def test_lock_excludes_other_process_and_is_released_on_exit(tmp_path: Path) -> None:
+    """A live process owns the lock; even an abrupt exit releases the OS lock."""
+
+    script = (
+        "import sys; from pathlib import Path; from git_deploy.lock import TargetLock; "
+        "lock = TargetLock(Path(sys.argv[1]), 'prod'); lock.acquire(); "
+        "print('locked', flush=True); sys.stdin.read()"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "locked"
+        before = (tmp_path / "prod.lock").read_bytes()
+        for _ in range(2):
+            with pytest.raises(PlanError, match='"pid"'):
+                TargetLock(tmp_path, "prod").acquire()
+        assert (tmp_path / "prod.lock").read_bytes() == before
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+    with TargetLock(tmp_path, "prod"):
+        assert (tmp_path / "prod.lock").stat().st_size < 1024

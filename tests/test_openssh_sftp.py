@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+
 from git_deploy.config import TargetConfig
 from git_deploy.deployer import _execute_with_retry
 from git_deploy.errors import DeployError
@@ -24,11 +25,14 @@ from git_deploy.transports.openssh_sftp import (
     PathProbeResult,
     SSHConnectionPool,
     _classify_path_probe,
-    _find_posix_executable,
+    _find_openssh_executable,
     _control_socket_root,
     _quote_sftp,
 )
 from git_deploy.transports.sftp import SFTPTransport
+
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX ControlMaster contract; Windows sessions covered in test_windows.py")
 
 
 def _success(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -81,13 +85,13 @@ def test_missing_or_windows_executables_fail_structurally(
 
     monkeypatch.setattr("git_deploy.transports.openssh_sftp.shutil.which", lambda name: None)
     with pytest.raises(DeployError, match="system 'ssh'"):
-        _find_posix_executable("ssh")
+        _find_openssh_executable("ssh")
     monkeypatch.setattr(
         "git_deploy.transports.openssh_sftp.shutil.which",
         lambda name: "/mnt/c/Windows/System32/OpenSSH/ssh.exe",
     )
     with pytest.raises(DeployError, match="POSIX"):
-        _find_posix_executable("ssh")
+        _find_openssh_executable("ssh")
 
 
 def test_batch_path_quoting_rejects_command_delimiters() -> None:

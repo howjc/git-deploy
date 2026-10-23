@@ -9,8 +9,9 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
+from git_deploy.filesystem import is_link, sync_directory
 from git_deploy.config import OutputConfig
 from git_deploy.errors import PlanError, StateError
 
@@ -124,11 +125,7 @@ class StateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            sync_directory(path.parent)
         except OSError as exc:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -173,26 +170,37 @@ def scan_outputs(outputs: tuple[OutputConfig, ...]) -> dict[str, ScannedOutput]:
             # A missing configured root usually means a broken build or typo. It
             # must not be interpreted as deliberate removal of every old output.
             raise PlanError(f"configured output does not exist after build: {output.local}")
-        if output.local.is_symlink():
+        if is_link(output.local):
             raise PlanError(f"output path must not be a symlink: {output.local}")
         if output.local.is_file():
             candidates = ((output.local, PurePosixPath(output.local.name)),)
         elif output.local.is_dir():
             candidates = tuple(
                 (path, PurePosixPath(path.relative_to(output.local).as_posix()))
-                for path in sorted(output.local.rglob("*"))
-                if path.is_file()
+                for path in _output_files(output.local)
             )
         else:
             raise PlanError(f"output path is not a regular file or directory: {output.local}")
         for local_path, relative in candidates:
-            if local_path.is_symlink() or not local_path.resolve().is_relative_to(output.local.resolve()):
+            if is_link(local_path) or not local_path.resolve().is_relative_to(output.local.resolve()):
                 raise PlanError(f"output file must not escape through a symlink: {local_path}")
             remote = (output.remote / relative).as_posix()
             if remote in scanned:
                 raise PlanError(f"multiple outputs map to the same remote path: {remote}")
             scanned[remote] = ScannedOutput(local_path, hash_file(local_path))
     return dict(sorted(scanned.items()))
+
+
+def _output_files(root: Path) -> Iterator[Path]:
+    """Yield regular output files without traversing symlinks or junctions."""
+
+    for child in sorted(root.iterdir()):
+        if is_link(child):
+            raise PlanError(f"output path must not be a symlink or junction: {child}")
+        if child.is_dir():
+            yield from _output_files(child)
+        elif child.is_file():
+            yield child
 
 
 def hash_file(path: Path) -> ManifestEntry:

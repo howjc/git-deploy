@@ -1487,7 +1487,7 @@ def freeze_uploads(
     for operation in plan.operations:
         if not isinstance(operation, UploadOperation):
             continue
-        destination = staging / operation.remote_path
+        destination = _staging_path(staging, operation.remote_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if operation.origin == "source":
             if not operation.git_path:
@@ -1529,7 +1529,7 @@ def freeze_uploads(
             _freeze_hybrid_file(item.name, item.local_path, item.entry, staging, frozen)
         for directory in plan.hybrid.local.directories:
             for relative, scanned in directory.files.items():
-                remote = (Path(directory.name) / Path(relative)).as_posix()
+                remote = (PurePosixPath(directory.name) / relative).as_posix()
                 _freeze_hybrid_file(
                     remote,
                     scanned.local_path,
@@ -1573,6 +1573,16 @@ def estimate_frozen_bytes(plan: DeploymentPlan, repository: GitRepository) -> in
     return total
 
 
+def _staging_path(staging: Path, remote_path: str) -> Path:
+    """Map a remote POSIX name to an opaque, portable local staging filename.
+
+    Remote paths may contain Windows device names, colons, or case-distinct
+    siblings. Never interpret them as local paths or collapse frozen content.
+    """
+
+    return staging / (hashlib.sha256(remote_path.encode("utf-8")).hexdigest() + ".blob")
+
+
 def _freeze_hybrid_file(
     remote_path: str,
     local_path: Path,
@@ -1593,7 +1603,7 @@ def _freeze_hybrid_file(
         ``None`` after verified bytes are bound to ``remote_path``.
     """
 
-    destination = staging / remote_path
+    destination = _staging_path(staging, remote_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copyfile(local_path, destination)

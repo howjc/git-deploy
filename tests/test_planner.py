@@ -129,7 +129,7 @@ def test_modified_source_is_uploaded(git_project: Path) -> None:
     config = load_config(write_config(git_project))
     repository = GitRepository(git_project)
     old = repository.head()
-    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('v2')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "modify source")
     state = TargetState(1, "dev", config.target(None).fingerprint, old, 1, {})
 
@@ -321,8 +321,9 @@ def test_executable_source_is_preserved_for_sftp_and_rejected_for_ftp(
 
     script = git_project / "deploy.sh"
     script.write_text("#!/bin/sh\n", encoding="utf-8")
-    script.chmod(0o755)
-    commit_all(git_project, "add executable")
+    subprocess.run(["git", "add", "deploy.sh"], cwd=git_project, check=True)
+    subprocess.run(["git", "update-index", "--chmod=+x", "deploy.sh"], cwd=git_project, check=True)
+    subprocess.run(["git", "commit", "-qm", "add executable"], cwd=git_project, check=True)
     repository = GitRepository(git_project)
     sftp_config = load_config(write_config(git_project))
 

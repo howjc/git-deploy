@@ -1,5 +1,7 @@
 # Native OpenSSH、WSL 与 1Password SSH Agent
 
+本页的 ControlMaster/Agent Bridge 流程适用于 POSIX 和 WSL。Windows 原生客户端见 [Windows 指南](windows.md)。
+
 配置 `ssh_host_alias` 后，git-deploy 完整委托当前环境中的系统 `ssh` 和 `sftp`。工具不调用 1Password API、不读取私钥、不修改 `SSH_AUTH_SOCK`，也不启用 Agent Forwarding。
 
 ## WSL 前置检查

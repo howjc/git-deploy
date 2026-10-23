@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 import git_deploy.cli as cli
 from git_deploy.doctor import DoctorResult
 from git_deploy.errors import BuildError
-from tests.conftest import write_config
+from tests.conftest import write_config, python_command
 
 
 def test_help_exposes_only_lite_workflow(capsys: pytest.CaptureFixture[str]) -> None:
@@ -213,14 +214,16 @@ def test_build_only_does_not_read_git_or_state(tmp_path: Path) -> None:
         tmp_path,
         """
 [build]
-steps = ["printf built > artifact"]
+steps = [{build_artifact}]
 
 [targets.dev]
 protocol = "sftp"
 host = "host"
 username = "deploy"
 remote_root = "/srv/app"
-""",
+""".format(build_artifact=json.dumps(python_command(
+            "from pathlib import Path; Path('artifact').write_text('built')"
+        ))),
     )
 
     assert cli.main(["--config", str(path), "build"]) == 0
@@ -365,14 +368,16 @@ def test_build_created_dirty_worktree_is_reported_and_can_be_required_clean(
         git_project,
         """
 [build]
-steps = ["touch generated.txt"]
+steps = [{build_generated}]
 
 [targets.dev]
 protocol = "sftp"
 host = "host"
 username = "deploy"
 remote_root = "/srv/app"
-""",
+""".format(build_generated=json.dumps(python_command(
+            "from pathlib import Path; Path('generated.txt').touch()"
+        ))),
     )
     assert cli.main(["--config", str(warning_config), "--dry-run"]) == 0
     assert "build changed the worktree" in capsys.readouterr().out
@@ -385,14 +390,16 @@ remote_root = "/srv/app"
 require_clean_worktree = true
 
 [build]
-steps = ["touch generated.txt"]
+steps = [{build_generated}]
 
 [targets.dev]
 protocol = "sftp"
 host = "host"
 username = "deploy"
 remote_root = "/srv/app"
-""",
+""".format(build_generated=json.dumps(python_command(
+            "from pathlib import Path; Path('generated.txt').touch()"
+        ))),
     )
     assert cli.main(["--config", str(strict_config), "--dry-run"]) == 4
 

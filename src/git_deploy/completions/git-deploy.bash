@@ -13,7 +13,7 @@ _git_deploy() {
 
   local opts="--dry-run --remote-plan --recover --skip-build --full --yes --config --workspace --verbose --create-root --no-create-root --force --probe-ftp-hybrid --version --help"
   local actions="build doctor init bootstrap completion"
-  local completion_kinds="bash zsh targets install"
+  local completion_kinds="bash zsh powershell pwsh targets install"
 
   case "$prev" in
     --config|--workspace)

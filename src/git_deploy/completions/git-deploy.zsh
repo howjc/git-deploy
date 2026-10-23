@@ -29,7 +29,7 @@ _git_deploy() {
     --help
   )
   actions=(build doctor init bootstrap completion)
-  completion_kinds=(bash zsh targets install)
+  completion_kinds=(bash zsh powershell pwsh targets install)
 
   for ((i = 2; i < CURRENT; i++)); do
     case "${words[i]}" in

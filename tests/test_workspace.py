@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import json
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from git_deploy.workspace import (
     run_workspace_doctor,
 )
 
+from tests.conftest import python_command
 
 class WorkspaceTransport(Transport):
     """Persist fake remote files and optionally fail one repository."""
@@ -206,7 +208,7 @@ def test_all_targets_are_validated_before_first_workspace_build(tmp_path: Path) 
         tmp_path,
         "api",
         target="prod",
-        build_steps=('printf built > build-marker',),
+        build_steps=(python_command("from pathlib import Path; Path('build-marker').write_text('built')"),),
     )
     second = _create_repository(tmp_path, "web", target="dev")
     workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
@@ -228,14 +230,14 @@ def test_workspace_build_is_local_without_target_ssh_tools_or_remote_ownership(
         "api",
         remote_root="/srv/app",
         alias="invalid-api",
-        build_steps=('printf built > build-marker',),
+        build_steps=(python_command("from pathlib import Path; Path('build-marker').write_text('built')"),),
     )
     second = _create_repository(
         tmp_path,
         "web",
         remote_root="/srv/app/public",
         alias="invalid-web",
-        build_steps=('printf built > build-marker',),
+        build_steps=(python_command("from pathlib import Path; Path('build-marker').write_text('built')"),),
     )
     workspace_path = _write_workspace(tmp_path, (("api", first), ("web", second)))
     workspace_path.write_text(
@@ -282,7 +284,7 @@ def test_all_workspace_locks_are_available_before_first_build(tmp_path: Path) ->
     first = _create_repository(
         tmp_path,
         "api",
-        build_steps=('printf built > build-marker',),
+        build_steps=(python_command("from pathlib import Path; Path('build-marker').write_text('built')"),),
     )
     second = _create_repository(tmp_path, "web")
     workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
@@ -503,7 +505,7 @@ def test_workspace_rejects_equal_or_nested_remote_roots_before_build_or_lock(
         tmp_path,
         "api",
         remote_root=first_root,
-        build_steps=('printf built > build-marker',),
+        build_steps=(python_command("from pathlib import Path; Path('build-marker').write_text('built')"),),
     )
     second = _create_repository(tmp_path, "web", remote_root=second_root)
     workspace = load_workspace(_write_workspace(tmp_path, (("api", first), ("web", second))))
@@ -566,7 +568,7 @@ def test_aliases_resolving_to_same_endpoint_are_grouped_before_build(
         "api",
         alias="prod-api",
         remote_root="/srv/app",
-        build_steps=('printf built > build-marker',),
+        build_steps=(python_command("from pathlib import Path; Path('build-marker').write_text('built')"),),
     )
     second = _create_repository(
         tmp_path,
@@ -591,7 +593,7 @@ def test_aliases_resolving_to_same_endpoint_are_grouped_before_build(
 
     monkeypatch.setattr("git_deploy.config.subprocess.run", resolve)
     monkeypatch.setattr(
-        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: str(tmp_path / name)
     )
 
     with pytest.raises(ConfigError, match="overlapping remote roots"):
@@ -616,7 +618,7 @@ def test_alias_drift_after_workspace_prepare_keeps_state_and_remote_untouched(
 
         command = list(command)
         commands.append(command)
-        if (command[0] == "ssh" or command[0].endswith("/ssh")) and "-G" in command:
+        if (Path(command[0]).name == "ssh") and "-G" in command:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -630,7 +632,7 @@ def test_alias_drift_after_workspace_prepare_keeps_state_and_remote_untouched(
     monkeypatch.setattr("git_deploy.config.subprocess.run", run)
     monkeypatch.setattr("git_deploy.transports.openssh_sftp.subprocess.run", run)
     monkeypatch.setattr(
-        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: f"/usr/bin/{name}"
+        "git_deploy.transports.openssh_sftp.shutil.which", lambda name: str(tmp_path / name)
     )
     _, prepared = prepare_workspace(workspace, None, full=False, skip_build=True)
     current_host = "192.0.2.99"
@@ -757,7 +759,7 @@ def _create_repository(
     (root / "app.py").write_text(f"print('{name}')\n", encoding="utf-8")
     _git(root, "add", "app.py")
     _git(root, "commit", "-qm", "initial")
-    steps = ", ".join(f'"{step}"' for step in build_steps)
+    steps = ", ".join(json.dumps(step) for step in build_steps)
     remote_commands = ", ".join(f'"{command}"' for command in after_deploy)
     command_config = f"after_deploy = [{remote_commands}]\n" if after_deploy else ""
     output = ""
