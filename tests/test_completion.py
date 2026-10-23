@@ -164,7 +164,7 @@ def test_install_shell_completion_writes_script_and_rc(tmp_path: Path) -> None:
     assert "complete -F _git_deploy git-deploy" in script.read_text(encoding="utf-8")
     rc = (tmp_path / ".bashrc").read_text(encoding="utf-8")
     assert "# >>> git-deploy shell completion >>>" in rc
-    assert str(script) in rc
+    assert script.as_posix() in rc
 
     second = install_shell_completion("bash", home=tmp_path)
     assert second[0].already_current is True
@@ -189,7 +189,7 @@ def test_install_shell_completion_zsh(tmp_path: Path) -> None:
     assert body.startswith("#compdef git-deploy\n")
     rc = (tmp_path / ".zshrc").read_text(encoding="utf-8")
     assert "fpath=" in rc
-    assert str(script) in rc
+    assert script.as_posix() in rc
 
 
 def test_install_rc_quotes_special_home_paths(tmp_path: Path) -> None:
@@ -202,7 +202,7 @@ def test_install_rc_quotes_special_home_paths(tmp_path: Path) -> None:
     script = completion_script_path("bash", home=home)
     # shlex.quote produces single-quoted paths for spaces.
     assert "source " in rc
-    assert str(script) in rc or f"'{script}'" in rc
+    assert f"'{script.as_posix()}'" in rc
 
 
 def test_ensure_shell_completion_skips_when_current(

@@ -248,22 +248,30 @@ def test_capability_probe_alias_gate_is_zero_mutation() -> None:
 
 def test_local_hybrid_rejects_root_and_nested_casefold_collisions(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Local sibling names must remain portable before any remote connection."""
+    """Reject ambiguous enumeration before stat, even on case-insensitive hosts."""
 
     root = tmp_path / "aggregation"
     root.mkdir()
-    (root / "Index.html").write_text("upper", encoding="utf-8")
-    (root / "index.html").write_text("lower", encoding="utf-8")
+    # NTFS cannot materialize both siblings. Supply their enumeration so the
+    # same safety check is exercised on Windows as on a case-sensitive host.
+    collisions = {root: [root / "Index.html", root / "index.html"]}
+    original_iterdir = Path.iterdir
+
+    def iterdir(path: Path):
+        """Return colliding names only for the directory under examination."""
+
+        return iter(collisions[path]) if path in collisions else original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
     output = OutputConfig(root, PurePosixPath("."), name="frontend-root", mode="hybrid")
     with pytest.raises(PlanError, match="collide.*Index.html.*index.html"):
         scan_hybrid_output(output)
 
-    (root / "Index.html").unlink()
-    (root / "index.html").unlink()
+    collisions.clear()
     (root / "assets").mkdir()
-    (root / "assets/App.js").write_text("upper", encoding="utf-8")
-    (root / "assets/app.js").write_text("lower", encoding="utf-8")
+    collisions[root / "assets"] = [root / "assets/App.js", root / "assets/app.js"]
     with pytest.raises(PlanError, match="collide.*App.js.*app.js"):
         scan_hybrid_output(output)
 

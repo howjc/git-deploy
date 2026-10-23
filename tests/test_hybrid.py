@@ -333,8 +333,8 @@ def _hybrid_project(root: Path, *, commands: tuple[str, ...] = ()) -> Path:
     )
     aggregation = root / ".deploy/frontend-root"
     (aggregation / "assets").mkdir(parents=True, exist_ok=True)
-    (aggregation / "index.html").write_text("current index\n", encoding="utf-8")
-    (aggregation / "assets/app.js").write_text("current app\n", encoding="utf-8")
+    (aggregation / "index.html").write_bytes(b"current index\n")
+    (aggregation / "assets/app.js").write_bytes(b"current app\n")
     command_text = ", ".join(f'"{item}"' for item in commands)
     command_config = f"after_deploy = [{command_text}]\n" if commands else ""
     return write_config(
@@ -1146,9 +1146,7 @@ def test_swap_failure_keeps_state_and_next_preflight_restores_then_converges(
     old_state = store.load("dev")
     old_bytes = remote.files["assets/app.js"]
 
-    (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "next app\n", encoding="utf-8"
-    )
+    (git_project / ".deploy/frontend-root/assets/app.js").write_bytes(b"next app\n")
     remote.fail_stage_publish_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(failed, transport_factory=lambda target: remote)
@@ -1225,9 +1223,7 @@ def test_ownership_write_failure_restores_backup_before_next_plan(
     store = StateStore(GitRepository(git_project).common_dir())
     old_state = store.load("dev")
     old_bytes = remote.files["assets/app.js"]
-    (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "ownership next\n", encoding="utf-8"
-    )
+    (git_project / ".deploy/frontend-root/assets/app.js").write_bytes(b"ownership next\n")
     remote.fail_ownership_write_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(failed, transport_factory=lambda target: remote)
@@ -1252,9 +1248,7 @@ def test_ctrl_c_leaves_recovery_and_next_run_restores_safely(git_project: Path) 
     prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     old = remote.files["assets/app.js"]
-    (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "interrupt next\n", encoding="utf-8"
-    )
+    (git_project / ".deploy/frontend-root/assets/app.js").write_bytes(b"interrupt next\n")
     remote.interrupt_stage_publish_once = True
     interrupted = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(

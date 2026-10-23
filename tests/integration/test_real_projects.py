@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from git_deploy.builder import run_build
-from git_deploy.config import load_config
+from git_deploy.config import BuildConfig, load_config
 from git_deploy.deployer import execute_plan
 from git_deploy.git import GitRepository
 from git_deploy.manifest import StateStore
@@ -64,7 +64,7 @@ def test_real_node_pnpm_build_and_dist_sync(tmp_path: Path) -> None:
         "require('fs').writeFileSync('dist/app.js','node-built');\n",
         encoding="utf-8",
     )
-    subprocess.run(["pnpm", "install", "--lockfile-only"], cwd=root, check=True, capture_output=True)
+    run_build(BuildConfig(("pnpm install --lockfile-only",)), root)
     commit_all(root, "node fixture")
 
     transport = _deploy(
@@ -100,12 +100,7 @@ def test_real_php_composer_build_sync_and_protection(tmp_path: Path) -> None:
     (root / ".env").write_text("SECRET=no\n", encoding="utf-8")
     (root / "runtime").mkdir()
     (root / "runtime/session").write_text("private", encoding="utf-8")
-    subprocess.run(
-        ["composer", "install", "--no-interaction", "--no-progress"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
+    run_build(BuildConfig(("composer install --no-interaction --no-progress",)), root)
     shutil.rmtree(root / "vendor")
     commit_all(root, "php fixture")
 
@@ -154,13 +149,8 @@ def test_real_mixed_project_builds_in_order_and_syncs_both_outputs(tmp_path: Pat
     )
     (root / "composer.json").write_text('{"name":"fixture/mixed","require":{}}\n', encoding="utf-8")
     (root / "index.php").write_text("<?php\n", encoding="utf-8")
-    subprocess.run(["pnpm", "install", "--lockfile-only"], cwd=root, check=True, capture_output=True)
-    subprocess.run(
-        ["composer", "install", "--no-interaction", "--no-progress"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
+    run_build(BuildConfig(("pnpm install --lockfile-only",)), root)
+    run_build(BuildConfig(("composer install --no-interaction --no-progress",)), root)
     shutil.rmtree(root / "vendor")
     commit_all(root, "mixed fixture")
 

@@ -16,7 +16,6 @@ jobs:
         python-version: ["3.11", "3.12"]
     env:
       PYTHONUTF8: "1"
-      GIT_DEPLOY_SKIP_COMPLETION_INSTALL: "1"
     steps:
       - uses: actions/checkout@v6
 
