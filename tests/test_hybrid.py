@@ -520,7 +520,7 @@ mode = "hybrid"
         prepare_project("project", config_path, None, full=False, skip_build=True)
     (aggregation / ".git-deploy").rmdir()
 
-    (aggregation / "app.py").write_text("collision\n", encoding="utf-8")
+    (aggregation / "app.py").write_text("collision\n", encoding="utf-8", newline="\n")
     with pytest.raises(PlanError, match="source/hybrid ownership conflict"):
         prepare_project("project", config_path, None, full=False, skip_build=True)
 
@@ -786,7 +786,7 @@ def test_freshness_gate_rejects_ownership_change_before_any_source_write(
     prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     old_source = remote.files["app.py"]
-    (git_project / "app.py").write_text("print('new source')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('new source')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "change source")
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(planned, transport_factory=lambda target: remote)
@@ -825,7 +825,7 @@ def test_secondary_freshness_rejects_path_created_during_stage(
     ownership_path = ".git-deploy/hybrid/frontend-root.json"
     old_ownership = remote.files[ownership_path]
     (git_project / ".deploy/frontend-root/race.txt").write_text(
-        "planned\n", encoding="utf-8"
+        "planned\n", encoding="utf-8", newline="\n"
     )
 
     remote.after_staged_record = lambda: remote.files.__setitem__(
@@ -854,7 +854,7 @@ def test_secondary_freshness_runs_after_stage_retry_and_reconnect(
     prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     (git_project / ".deploy/frontend-root/retry-race.txt").write_text(
-        "planned\n", encoding="utf-8"
+        "planned\n", encoding="utf-8", newline="\n"
     )
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(planned, transport_factory=lambda target: remote)
@@ -880,7 +880,7 @@ def test_secondary_stale_cleanup_failure_keeps_recovery_without_touching_online_
     config_path = _hybrid_project(git_project)
     remote = MemoryHybridTransport()
     (git_project / ".deploy/frontend-root/cleanup-race.txt").write_text(
-        "planned\n", encoding="utf-8"
+        "planned\n", encoding="utf-8", newline="\n"
     )
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(planned, transport_factory=lambda target: remote)
@@ -912,7 +912,7 @@ def test_missing_path_publish_is_no_overwrite_at_last_moment(
     prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     (git_project / ".deploy/frontend-root/late.txt").write_text(
-        "planned\n", encoding="utf-8"
+        "planned\n", encoding="utf-8", newline="\n"
     )
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(planned, transport_factory=lambda target: remote)
@@ -977,7 +977,7 @@ def test_expected_type_is_rechecked_immediately_before_backup(
     remote.after_swapping_record = replace_online_type
     if path == "index.html":
         (git_project / ".deploy/frontend-root/index.html").write_text(
-            "changed\n", encoding="utf-8"
+            "changed\n", encoding="utf-8", newline="\n"
         )
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(planned, transport_factory=lambda target: remote)
@@ -1012,7 +1012,7 @@ def test_ownership_is_rechecked_immediately_before_commit(git_project: Path) -> 
         ownership_path, external
     )
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "next\n", encoding="utf-8"
+        "next\n", encoding="utf-8", newline="\n"
     )
     planned = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(planned, transport_factory=lambda target: remote)
@@ -1033,7 +1033,7 @@ def test_hybrid_upload_bytes_remain_frozen_across_remote_preflight(
     remote = MemoryHybridTransport()
     prepared = prepare_project("project", config_path, None, full=False, skip_build=True)
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "changed after local plan\n", encoding="utf-8"
+        "changed after local plan\n", encoding="utf-8", newline="\n"
     )
     prepare_remote_plan(prepared, transport_factory=lambda target: remote)
     execute_prepared(prepared)
@@ -1108,7 +1108,7 @@ def test_hybrid_deploy_preserves_unknown_content_and_state_loss_still_deletes_ow
         git_project / ".deploy/frontend-root/new-assets"
     )
     (git_project / ".deploy/frontend-root/index10.css").write_text(
-        "new css\n", encoding="utf-8"
+        "new css\n", encoding="utf-8", newline="\n"
     )
     second = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(second, transport_factory=lambda target: remote)
@@ -1390,7 +1390,7 @@ def test_recovery_only_prepare_ignores_broken_local_deployment_inputs(
     )
     config_path.write_text(config_text, encoding="utf-8")
     shutil.rmtree(git_project / ".deploy")
-    (git_project / "app.py").write_text("dirty and not deployed\n", encoding="utf-8")
+    (git_project / "app.py").write_text("dirty and not deployed\n", encoding="utf-8", newline="\n")
     store = StateStore(GitRepository(git_project).common_dir())
     store.path_for("dev").write_text("not-json", encoding="utf-8")
 
@@ -1508,7 +1508,7 @@ def test_schema1_precommit_restore_remains_supported(git_project: Path) -> None:
     execute_prepared(first)
     old = remote.files["assets/app.js"]
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "next\n", encoding="utf-8"
+        "next\n", encoding="utf-8", newline="\n"
     )
     remote.fail_stage_publish_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
@@ -1533,7 +1533,7 @@ def test_pending_recovery_render_hides_current_deployment_operations(
     prepare_remote_plan(failed, transport_factory=lambda target: remote)
     with pytest.raises(DeployError, match="synthetic command failure"):
         execute_prepared(failed)
-    (git_project / "app.py").write_text("print('later')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('later')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "later source")
 
     current = prepare_project("project", config_path, None, full=False, skip_build=True)
@@ -1597,7 +1597,7 @@ def test_ownership_only_command_failure_remains_pending(git_project: Path) -> No
     first = prepare_project("project", config_path, None, full=False, skip_build=True)
     prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
-    (git_project / "app.py").write_text("print('ownership only')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('ownership only')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "ownership-only source")
     remote.fail_command = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
@@ -1605,7 +1605,7 @@ def test_ownership_only_command_failure_remains_pending(git_project: Path) -> No
     with pytest.raises(DeployError, match="synthetic command failure"):
         execute_prepared(failed)
     interrupted_commit = GitRepository(git_project).head()
-    (git_project / "app.py").write_text("print('later local head')\n", encoding="utf-8")
+    (git_project / "app.py").write_text("print('later local head')\n", encoding="utf-8", newline="\n")
     commit_all(git_project, "later local source")
     assert GitRepository(git_project).head() != interrupted_commit
 
@@ -1628,7 +1628,7 @@ def test_recovery_missing_required_backup_fails_closed_and_doctor_reports_manual
     prepare_remote_plan(first, transport_factory=lambda target: remote)
     execute_prepared(first)
     (git_project / ".deploy/frontend-root/assets/app.js").write_text(
-        "next\n", encoding="utf-8"
+        "next\n", encoding="utf-8", newline="\n"
     )
     remote.fail_stage_publish_once = True
     failed = prepare_project("project", config_path, None, full=False, skip_build=True)
