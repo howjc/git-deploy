@@ -944,6 +944,8 @@ def _safe_name(value: str) -> str:
 def _control_socket_root(runtime_dir: Path, target: str) -> Path:
     """Prefer common-dir storage, falling back to a short private temp root."""
 
+    if os.name == "nt":
+        raise DeployError("OpenSSH ControlMaster sockets require a POSIX client")
     preferred = runtime_dir / "ssh"
     # OpenSSH appends its own random suffix while binding. Leave enough room
     # below common sockaddr_un limits instead of failing deep worktree paths.

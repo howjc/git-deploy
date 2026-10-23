@@ -173,8 +173,9 @@ def main(argv: list[str] | None = None) -> int:
         # Redirected Windows streams otherwise use the legacy ANSI code page,
         # which cannot represent arbitrary Git paths or SSH diagnostics.
         for stream in (sys.stdout, sys.stderr):
-            if hasattr(stream, "reconfigure"):
-                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            reconfigure = getattr(stream, "reconfigure", None)
+            if callable(reconfigure):
+                reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = build_parser()
     # Only auto-complete when using real process argv (argcomplete reads env + sys.argv).
     if argv is None:
