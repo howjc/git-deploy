@@ -10,9 +10,11 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from typing import TypeVar
 
 from git_deploy.config import Config, TargetConfig
 from git_deploy.errors import DeployError, PlanError, StaleRemotePlanError
@@ -66,6 +68,8 @@ from git_deploy.transports.ftp import FTPTransport
 from git_deploy.transports.openssh_sftp import SSHConnectionPool
 
 TransportFactory = Callable[[TargetConfig], Transport]
+_T = TypeVar("_T")
+_FTP_PUBLISH_BATCH_SIZE = 32
 
 
 def execute_plan(
@@ -614,28 +618,22 @@ def _execute_ftp_hybrid_plan(
         if ftp_plan.uploads:
             progress.start_phase("PUBLISH", len(ftp_plan.uploads))
 
-            def publish_one(
-                upload: FTPHybridFileUpload, worker: FTPTransport
+            def publish_batch(
+                batch: tuple[FTPHybridFileUpload, ...], worker: FTPTransport
             ) -> None:
-                """Publish one staged file and advance the shared phase bar."""
-
-                _publish_ftp_hybrid_file(
-                    upload,
-                    frozen[upload.path],
-                    stage_root,
-                    worker,
-                    progress,
+                """Publish and verify this worker's same-directory batch."""
+                _publish_ftp_hybrid_batch(
+                    batch, frozen, stage_root, worker, progress,
                     attempts=config.deploy.retries,
                     delay=config.deploy.retry_delay,
                     verify_final=config.deploy.ftp_verify_final,
                 )
-                progress.advance_phase(detail=upload.path)
 
             _run_ftp_hybrid_file_jobs(
-                ftp_plan.uploads,
+                _ftp_publish_batches(ftp_plan.uploads, config.deploy.ftp_connections),
                 transport,
                 connections=config.deploy.ftp_connections,
-                job=publish_one,
+                job=publish_batch,
             )
             progress.finish_phase()
         progress.start_phase("PENDING", 1)
@@ -789,11 +787,11 @@ def _cleanup_ftp_hybrid_pending(
 
 
 def _run_ftp_hybrid_file_jobs(
-    uploads: Sequence[FTPHybridFileUpload],
+    uploads: Sequence[_T],
     primary: FTPTransport,
     *,
     connections: int,
-    job: Callable[[FTPHybridFileUpload, FTPTransport], None],
+    job: Callable[[_T, FTPTransport], None],
 ) -> int:
     """Run Stage or Publish jobs over one or more FTP control sessions.
 
@@ -803,10 +801,10 @@ def _run_ftp_hybrid_file_jobs(
     work with a half-open parallel pool.
 
     Args:
-        uploads: Frozen Hybrid file operations in plan order.
+        uploads: Frozen Stage operations or same-directory Publish batches.
         primary: Already connected primary Hybrid transport (not closed here).
         connections: Desired parallel FTP sessions (clamped to job count, max 16).
-        job: Per-file action bound to one worker-owned transport.
+        job: Action for one queue item on its worker-owned transport.
 
     Returns:
         Effective control-session count used for this batch.
@@ -869,7 +867,7 @@ def _run_ftp_hybrid_file_jobs(
             job(upload, primary)
         return 1
 
-    work: queue.Queue[FTPHybridFileUpload | None] = queue.Queue()
+    work: queue.Queue[_T | None] = queue.Queue()
     for upload in uploads:
         work.put(upload)
     for _ in range(workers):
@@ -1027,6 +1025,112 @@ def _stage_ftp_hybrid_file(
     )
 
 
+def _ftp_publish_batches(
+    uploads: Sequence[FTPHybridFileUpload], connections: int
+) -> list[tuple[FTPHybridFileUpload, ...]]:
+    """Group uploads by parent, leaving enough batches to use the requested sessions."""
+    groups: dict[str, list[FTPHybridFileUpload]] = defaultdict(list)
+    for upload in uploads:
+        groups[upload.path.rpartition("/")[0]].append(upload)
+    batch_size = max(1, min(_FTP_PUBLISH_BATCH_SIZE, len(uploads) // connections))
+    return [
+        tuple(group[start : start + batch_size])
+        for group in groups.values()
+        for start in range(0, len(group), batch_size)
+    ]
+
+
+def _publish_ftp_hybrid_batch(
+    uploads: tuple[FTPHybridFileUpload, ...],
+    frozen: dict[str, Path],
+    stage_root: str,
+    transport: FTPTransport,
+    progress: ProgressReporter,
+    *,
+    attempts: int,
+    delay: float,
+    verify_final: bool,
+) -> None:
+    """Publish a nonempty same-parent batch and count only verified files.
+
+    Each worker owns its connection and its filenames. Directory snapshots may
+    include other workers' changes; only this batch's exact names are checked.
+    Failed or ambiguous renames go through the per-file retry/restage contract.
+    """
+    def publish_one(upload: FTPHybridFileUpload, error: Exception | None = None) -> None:
+        """Finish one missing or uncertain file within its original retry budget."""
+        _publish_ftp_hybrid_file(
+            upload, frozen[upload.path], stage_root, transport, progress,
+            attempts=attempts, delay=delay, verify_final=verify_final, first_error=error,
+        )
+        progress.advance_phase(detail=upload.path)
+
+    if len(uploads) == 1:
+        publish_one(uploads[0])
+        return
+
+    parent = PurePosixPath(uploads[0].path).parent
+    staged_parent = (PurePosixPath(stage_root) / "files" / parent).as_posix()
+    names = {PurePosixPath(upload.path).name for upload in uploads}
+
+    def snapshot(directory: str) -> dict[str, RemotePathType]:
+        """Read sibling types together, reconnecting if the listing fails."""
+        return _retry_ftp_mutation(
+            f"inspect {directory}", lambda: transport.child_types(directory, names),
+            transport, attempts=attempts, delay=delay,
+        )
+
+    transport.refresh_remote_metadata()
+    staged = snapshot(staged_parent)
+    renamed: list[FTPHybridFileUpload] = []
+    for upload in uploads:
+        name = PurePosixPath(upload.path).name
+        kind = staged.get(name, RemotePathType.MISSING)
+        if kind is RemotePathType.MISSING:
+            publish_one(upload)
+            continue
+        if kind is not RemotePathType.FILE:
+            raise DeployError(f"FTP Stage is not a regular file for {upload.path}")
+        progress.update_phase(detail=f"rename {upload.path}")
+        try:
+            transport.rename_replace(f"{staged_parent}/{name}", upload.path)
+        except Exception as exc:
+            # A lost reply proves neither failure nor success, even if a regular
+            # file already exists at the destination. Reconcile on a fresh session.
+            publish_one(upload, exc)
+        else:
+            renamed.append(upload)
+
+    if not renamed:
+        return
+    transport.refresh_remote_metadata()
+    staged = snapshot(staged_parent)
+    published = snapshot(parent.as_posix())
+    for upload in renamed:
+        name = PurePosixPath(upload.path).name
+        try:
+            if name in staged:
+                raise DeployError(f"FTP Stage was not consumed for {upload.path}")
+            if published.get(name) is not RemotePathType.FILE:
+                raise DeployError(f"FTP publish did not leave a regular file at {upload.path}")
+            if verify_final:
+                _verify_ftp_final(upload, transport, progress)
+        except Exception as exc:
+            publish_one(upload, exc)
+        else:
+            progress.advance_phase(detail=upload.path)
+
+
+def _verify_ftp_final(
+    upload: FTPHybridFileUpload, transport: FTPTransport, progress: ProgressReporter,
+) -> None:
+    """Read back a published file and raise if it differs from the frozen manifest."""
+    progress.update_phase(detail=f"final-verify {upload.path}", force=True)
+    final = transport.read_file(upload.path, max_bytes=upload.size)
+    if len(final) != upload.size or hashlib.sha256(final).hexdigest() != upload.sha256:
+        raise DeployError(f"FTP final-path verification mismatch for {upload.path}")
+
+
 def _publish_ftp_hybrid_file(
     operation: FTPHybridFileUpload,
     local_path: Path,
@@ -1037,6 +1141,7 @@ def _publish_ftp_hybrid_file(
     attempts: int,
     delay: float,
     verify_final: bool = False,
+    first_error: Exception | None = None,
 ) -> None:
     """Rename-replace one stage-verified file; restage with RETR if Stage is gone.
 
@@ -1049,15 +1154,21 @@ def _publish_ftp_hybrid_file(
 
     staged_path = f"{stage_root}/files/{operation.path}"
     upload_attempted = False
+    restage_unverified = False
 
     def action() -> None:
         """Publish one stage-verified file and prove Stage consumption."""
 
-        nonlocal upload_attempted
+        nonlocal upload_attempted, restage_unverified
         upload_attempted = False
-        if transport.lstat(staged_path) is RemotePathType.MISSING:
+        kind = transport.lstat(staged_path)
+        if kind not in {RemotePathType.FILE, RemotePathType.MISSING}:
+            raise DeployError(f"FTP Stage is not a regular file for {operation.path}")
+        if restage_unverified or kind is RemotePathType.MISSING:
             # Retry/resume path: Stage bytes may be gone; restage and re-verify.
             upload_attempted = True
+            # A failed STOR/RETR can leave an unverified regular file in Stage.
+            restage_unverified = True
             transport.upload(
                 local_path,
                 staged_path,
@@ -1070,6 +1181,7 @@ def _publish_ftp_hybrid_file(
                 or hashlib.sha256(staged).hexdigest() != operation.sha256
             ):
                 raise DeployError(f"FTP restaged verification mismatch for {operation.path}")
+            restage_unverified = False
         progress.update_phase(detail=f"rename {operation.path}", force=True)
         transport.rename_replace(staged_path, operation.path)
         if transport.lstat(staged_path) is not RemotePathType.MISSING:
@@ -1079,15 +1191,7 @@ def _publish_ftp_hybrid_file(
                 f"FTP publish did not leave a regular file at {operation.path}"
             )
         if verify_final:
-            progress.update_phase(detail=f"final-verify {operation.path}", force=True)
-            final = transport.read_file(operation.path, max_bytes=operation.size)
-            if (
-                len(final) != operation.size
-                or hashlib.sha256(final).hexdigest() != operation.sha256
-            ):
-                raise DeployError(
-                    f"FTP final-path verification mismatch for {operation.path}"
-                )
+            _verify_ftp_final(operation, transport, progress)
 
     def record_upload_retry() -> None:
         """Close transfer timing only when this publish attempt restaged bytes."""
@@ -1100,6 +1204,7 @@ def _publish_ftp_hybrid_file(
         action,
         transport,
         on_retry=record_upload_retry,
+        first_error=first_error,
         attempts=attempts,
         delay=delay,
     )
@@ -1107,13 +1212,14 @@ def _publish_ftp_hybrid_file(
 
 def _retry_ftp_mutation(
     label: str,
-    action: Callable[[], None],
+    action: Callable[[], _T],
     transport: FTPTransport,
     *,
     on_retry: Callable[[], None] | None = None,
+    first_error: Exception | None = None,
     attempts: int,
     delay: float,
-) -> None:
+) -> _T:
     """Retry one idempotent FTP Hybrid action with a clean listing cache.
 
     Args:
@@ -1121,20 +1227,22 @@ def _retry_ftp_mutation(
         action: Idempotent mutation attempt.
         transport: Connected FTP transport whose caches are invalidated on retry.
         on_retry: Optional upload-accounting hook run before the retry delay.
+        first_error: Failure of the first attempt already made in a Publish batch.
         attempts: Maximum mutation attempts.
         delay: Retry delay in seconds.
 
     Returns:
-        ``None`` after the action succeeds.
+        The result of the successful attempt.
     """
 
     for attempt in range(1, attempts + 1):
         try:
+            if attempt == 1 and first_error is not None:
+                raise first_error
             if attempt > 1:
                 transport.invalidate_connection()
                 _connect_with_retry(transport, attempts=1, delay=0, ensure_root=False)
-            action()
-            return
+            return action()
         except Exception as exc:
             if attempt >= attempts:
                 raise DeployError(f"{label} failed after {attempts} attempt(s): {exc}") from exc
@@ -1146,6 +1254,7 @@ def _retry_ftp_mutation(
                 on_retry()
             if delay:
                 time.sleep(delay)
+    raise ValueError("FTP retry attempts must be positive")
 
 
 def _ftp_remote_record_hash(

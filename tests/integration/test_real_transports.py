@@ -252,10 +252,17 @@ def test_real_ftp_hybrid_probe_adoption_mirror_state_loss_and_cleanup(
 
     root, port = ftp_server
     _create_hybrid_local_view(git_project)
+    # Several same-parent batches share two FTP sessions during Publish.
+    chunk_names = [f"chunk-{i}.js" for i in range(8)]
+    for name in chunk_names:
+        (git_project / ".deploy/frontend-root/assets" / name).write_bytes(name.encode())
     config_path = write_config(
         git_project,
         f'''
 project_id = "github.com/acme/ftp-hybrid"
+
+[deploy]
+ftp_connections = 2
 
 [[outputs]]
 name = "frontend-root"
@@ -343,6 +350,8 @@ remote_root = "/public_html/ftp-hybrid"
     finally:
         first.close()
     assert (remote_root / "assets/app.js").read_text(encoding="utf-8") == "hybrid app\n"
+    for name in chunk_names:
+        assert (remote_root / "assets" / name).read_bytes() == name.encode()
     assert not (remote_root / "assets/legacy.js").exists()
     assert (remote_root / "assets/empty/nested").is_dir()
     assert (remote_root / "index.php").read_text(encoding="utf-8") == "backend"

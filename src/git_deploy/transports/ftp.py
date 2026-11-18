@@ -404,6 +404,29 @@ class FTPTransport(Transport):
             current = component if current == "." else f"{current}/{component}"
         return kind
 
+    def child_types(self, parent: str, names: set[str]) -> dict[str, RemotePathType]:
+        """Return types of requested, present siblings from one directory snapshot.
+
+        Parent components use the same MLSD type checks as lstat. The mixed
+        deployment root permits unrelated unsupported entries, while a managed
+        directory retains strict name/type validation for its entire listing.
+        """
+        if parent == ".":
+            # lstat uses the cached root name/type index for each exact name.
+            return {
+                name: kind for name in names
+                if (kind := self.lstat(name)) is not RemotePathType.MISSING
+            }
+        parent_type = self.lstat(parent)
+        if parent_type is RemotePathType.MISSING:
+            return {}
+        if parent_type is not RemotePathType.DIRECTORY:
+            raise DeployError(f"FTP path parent is not a directory: {parent}")
+        return {
+            entry.path: entry.kind for entry in self.list_directory_typed(parent)
+            if entry.path in names
+        }
+
     def list_directory_typed(
         self,
         remote_path: str,

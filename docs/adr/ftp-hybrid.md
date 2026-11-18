@@ -42,6 +42,8 @@ FTP In-place 对 Mirror Directory 内每个文件单独 Stage/Publish，因此 L
 
 每个业务上传文件的内容证明默认发生在 **Stage STOR 之后的整文件 RETR SHA256**（含 Publish 重试时的 restage）。Publish 执行已 Probe 的 Rename Replace，检查 Stage 源路径已被消费、最终路径类型为 File；默认 **不再对最终路径做整文件 RETR**（`CONTENT PROOF: STAGE-VERIFIED RENAME-TRUSTED`）。设置 `deploy.ftp_verify_final = true` 时在 Rename 后再做一次 Final RETR SHA256。Pending Marker 与 Ownership 等小元数据仍使用 `publish_verified_bytes`（Stage RETR + Final RETR）。
 
+Publish 将同一父目录的业务文件分批交给 FTP 会话，每批最多 32 个。每个文件仍单独改名。批末重新读取暂存目录和目标目录，逐项确认暂存文件已消失、最终路径为普通文件，再计入发布进度。改名回执丢失或某项核验失败时，按该文件剩余的重试次数重新连接并核实，必要时重新暂存和回读。所有批次核验成功后才推进 `FILES_PUBLISHED` 和 Prune。
+
 ## 并行 FTP 会话
 
 `deploy.ftp_connections`（**默认 1**，范围 1–16）控制 Hybrid **Stage** 与 **Publish** 阶段各自使用的并行控制会话数。默认串行以兼容共享主机与单连接限额；并行为显式 opt-in。实现先建立全部 sibling 会话再启动 Worker；sibling 建连失败时安全降级到已成功的会话数（至少 primary），并输出 WARNING 与 effective connections。每个 worker 持有独立 `FTPTransport`（独立控制连接与 PASV 数据连接），继承主会话的 UTF-8/Banner 契约；主连接不关闭。仍是单发布器进程内并行，不允许多机器并发发布。普通 Source/Incremental 队列、目录 MKD、Prune、Ownership/Pending 元数据仍走主连接串行路径。
