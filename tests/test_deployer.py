@@ -708,6 +708,7 @@ def test_ftp_recovery_state_save_failure_does_not_cleanup_pending(
 
 def test_run_ftp_hybrid_file_jobs_uses_parallel_worker_transports(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Parallel Stage/Publish opens sibling sessions and fans work across them."""
 
@@ -750,13 +751,18 @@ def test_run_ftp_hybrid_file_jobs_uses_parallel_worker_transports(
         with lock:
             seen.setdefault(id(transport), set()).add(upload.path)
 
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+    progress = ProgressReporter()
+    progress.start_phase("PUBLISH", len(uploads))
     deployer_module._run_ftp_hybrid_file_jobs(
         uploads,
         primary,
         connections=4,
+        progress=progress,
         job=job,
     )
 
+    assert "0%\nFTP Hybrid effective connections: 4\n" in capsys.readouterr().err
     assert len(opened) == 3
     assert sum(len(paths) for paths in seen.values()) == 8
     assert id(primary) in seen
@@ -792,6 +798,7 @@ def test_run_ftp_hybrid_file_jobs_serial_when_connections_is_one() -> None:
         uploads,
         primary,
         connections=1,
+        progress=ProgressReporter(),
         job=job,
     )
     assert effective == 1
@@ -844,6 +851,7 @@ def test_run_ftp_hybrid_file_jobs_establishes_pool_before_work(
         uploads,
         primary,
         connections=3,
+        progress=ProgressReporter(),
         job=job,
     )
     assert effective == 3
@@ -894,17 +902,21 @@ def test_run_ftp_hybrid_file_jobs_degrades_when_sibling_connect_fails(
         jobs += 1
         assert transport is primary
 
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+    progress = ProgressReporter()
+    progress.start_phase("STAGE", len(uploads))
     effective = deployer_module._run_ftp_hybrid_file_jobs(
         uploads,
         primary,
         connections=4,
+        progress=progress,
         job=job,
     )
     assert attempts == 1
     assert effective == 1
     assert jobs == 2
     err = capsys.readouterr().err
-    assert "WARNING" in err
+    assert "0%\nWARNING: FTP Hybrid could not open parallel session" in err
     assert "continuing with 1" in err
 
 
@@ -950,6 +962,7 @@ def test_run_ftp_hybrid_file_jobs_propagates_keyboard_interrupt_on_first_sibling
             uploads,
             primary,
             connections=4,
+            progress=ProgressReporter(),
             job=job,
         )
     assert jobs == 0
@@ -1013,6 +1026,7 @@ def test_run_ftp_hybrid_file_jobs_closes_siblings_on_later_keyboard_interrupt(
             uploads,
             primary,
             connections=4,
+            progress=ProgressReporter(),
             job=job,
         )
     assert jobs == 0

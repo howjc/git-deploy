@@ -598,6 +598,7 @@ def _execute_ftp_hybrid_plan(
                 ftp_plan.uploads,
                 transport,
                 connections=config.deploy.ftp_connections,
+                progress=progress,
                 job=stage_one,
             )
             progress.finish_phase()
@@ -633,6 +634,7 @@ def _execute_ftp_hybrid_plan(
                 _ftp_publish_batches(ftp_plan.uploads, config.deploy.ftp_connections),
                 transport,
                 connections=config.deploy.ftp_connections,
+                progress=progress,
                 job=publish_batch,
             )
             progress.finish_phase()
@@ -791,6 +793,7 @@ def _run_ftp_hybrid_file_jobs(
     primary: FTPTransport,
     *,
     connections: int,
+    progress: ProgressReporter,
     job: Callable[[_T, FTPTransport], None],
 ) -> int:
     """Run Stage or Publish jobs over one or more FTP control sessions.
@@ -804,6 +807,7 @@ def _run_ftp_hybrid_file_jobs(
         uploads: Frozen Stage operations or same-directory Publish batches.
         primary: Already connected primary Hybrid transport (not closed here).
         connections: Desired parallel FTP sessions (clamped to job count, max 16).
+        progress: Active phase reporter that keeps connection notices on separate lines.
         job: Action for one queue item on its worker-owned transport.
 
     Returns:
@@ -830,11 +834,10 @@ def _run_ftp_hybrid_file_jobs(
         try:
             sibling = _open_ftp_hybrid_worker(primary)
         except Exception as exc:
-            print(
+            progress.note(
                 "WARNING: FTP Hybrid could not open parallel session "
                 f"{index + 1}/{desired} ({exc}); continuing with {len(pool)} "
-                "connection(s)",
-                file=sys.stderr,
+                "connection(s)"
             )
             break
         except BaseException:
@@ -850,10 +853,9 @@ def _run_ftp_hybrid_file_jobs(
 
     workers = len(pool)
     if workers > 1:
-        print(
+        progress.note(
             f"FTP Hybrid effective connections: {workers}"
-            + (f" (requested {desired})" if workers != desired else ""),
-            file=sys.stderr,
+            + (f" (requested {desired})" if workers != desired else "")
         )
     if workers == 1:
         # Degraded to serial after sibling failures — still no remote work yet.
